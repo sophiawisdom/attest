@@ -56,7 +56,10 @@ impl ResolvesServerCert for CertResolver {
                 // IP identifiers are validated with the reverse-DNS name as
                 // SNI (RFC 8738), or none at all.
                 let ok = match hello.server_name() {
-                    Some(sni) => sni.eq_ignore_ascii_case(name) || sni.eq_ignore_ascii_case(&reverse_dns(name)),
+                    Some(sni) => {
+                        sni.eq_ignore_ascii_case(name)
+                            || sni.eq_ignore_ascii_case(&reverse_dns(name))
+                    }
                     None => name.parse::<std::net::IpAddr>().is_ok(),
                 };
                 if ok {
@@ -92,16 +95,21 @@ impl ServerIdentity {
             cert_sha256: attest_core::sha256_hex(cert.der()),
             issuer: "self-signed",
         };
-        let ck = Arc::new(CertifiedKey::new(vec![cert.der().clone()], signing_key.clone()));
+        let ck = Arc::new(CertifiedKey::new(
+            vec![cert.der().clone()],
+            signing_key.clone(),
+        ));
         let resolver = Arc::new(CertResolver {
             main: RwLock::new((ck, snapshot)),
             challenge: RwLock::new(None),
         });
 
-        let mut server_config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()?
-            .with_no_client_auth()
-            .with_cert_resolver(resolver.clone());
+        let mut server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_cert_resolver(resolver.clone());
         // Server preference: HTTP/1.1 first, so a client that offers both
         // gets HTTP; ACME validators offer only acme-tls/1 and still get it.
         server_config.alpn_protocols = vec![b"http/1.1".to_vec(), ACME_ALPN.to_vec()];
@@ -129,13 +137,16 @@ impl ServerIdentity {
     pub fn csr_der(&self, names: &[String]) -> Result<Vec<u8>> {
         let mut params = rcgen::CertificateParams::new(names.to_vec()).context("csr params")?;
         params.distinguished_name = rcgen::DistinguishedName::new();
-        let csr = params.serialize_request(&self.key).context("serializing csr")?;
+        let csr = params
+            .serialize_request(&self.key)
+            .context("serializing csr")?;
         Ok(csr.der().to_vec())
     }
 
     /// Present a TLS-ALPN-01 challenge certificate for `name` to ACME clients.
     pub fn set_challenge(&self, name: &str, key_auth_digest: &[u8]) -> Result<()> {
-        let mut params = rcgen::CertificateParams::new(vec![name.to_string()]).context("challenge params")?;
+        let mut params =
+            rcgen::CertificateParams::new(vec![name.to_string()]).context("challenge params")?;
         params
             .custom_extensions
             .push(rcgen::CustomExtension::new_acme_identifier(key_auth_digest));
@@ -271,9 +282,19 @@ fn reverse_dns(name: &str) -> String {
 mod tests {
     #[test]
     fn ip_names_become_ip_sans() {
-        let p = rcgen::CertificateParams::new(vec!["16.147.102.127".to_string(), "example.com".to_string()]).unwrap();
-        assert!(matches!(p.subject_alt_names[0], rcgen::SanType::IpAddress(_)));
+        let p = rcgen::CertificateParams::new(vec![
+            "16.147.102.127".to_string(),
+            "example.com".to_string(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            p.subject_alt_names[0],
+            rcgen::SanType::IpAddress(_)
+        ));
         assert!(matches!(p.subject_alt_names[1], rcgen::SanType::DnsName(_)));
-        assert_eq!(super::reverse_dns("16.147.102.127"), "127.102.147.16.in-addr.arpa");
+        assert_eq!(
+            super::reverse_dns("16.147.102.127"),
+            "127.102.147.16.in-addr.arpa"
+        );
     }
 }

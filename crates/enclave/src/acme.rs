@@ -8,8 +8,8 @@ use crate::tls::ServerIdentity;
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use instant_acme::{
-    Account, AuthorizationStatus, BodyWrapper, BytesResponse, ChallengeType, HttpClient, Identifier, NewAccount,
-    NewOrder, OrderStatus, RetryPolicy,
+    Account, AuthorizationStatus, BodyWrapper, BytesResponse, ChallengeType, HttpClient,
+    Identifier, NewAccount, NewOrder, OrderStatus, RetryPolicy,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -35,28 +35,63 @@ impl HttpClient for NetHttp {
         Box::pin(async move {
             let (parts, body) = req.into_parts();
             let err = |m: String| instant_acme::Error::Other(m.into());
-            let host = parts.uri.host().ok_or_else(|| err("acme url has no host".into()))?.to_string();
+            let host = parts
+                .uri
+                .host()
+                .ok_or_else(|| err("acme url has no host".into()))?
+                .to_string();
             if parts.uri.scheme_str() != Some("https") {
                 return Err(err("acme url must be https".into()));
             }
-            let pq = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
-            let body = http_body_util::BodyExt::collect(body).await.map(|c| c.to_bytes().to_vec()).unwrap_or_default();
+            let pq = parts
+                .uri
+                .path_and_query()
+                .map(|p| p.as_str())
+                .unwrap_or("/")
+                .to_string();
+            let body = http_body_util::BodyExt::collect(body)
+                .await
+                .map(|c| c.to_bytes().to_vec())
+                .unwrap_or_default();
             let headers: Vec<(String, String)> = parts
                 .headers
                 .iter()
-                .map(|(k, v)| (k.to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned()))
+                .map(|(k, v)| {
+                    (
+                        k.to_string(),
+                        String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                    )
+                })
                 .collect();
-            let refs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            let refs: Vec<(&str, &str)> = headers
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
             let resp = net
-                .request_full(parts.method.as_str(), true, &host, 443, &pq, &refs, body, Duration::from_secs(60))
+                .request_full(
+                    parts.method.as_str(),
+                    true,
+                    &host,
+                    443,
+                    &pq,
+                    &refs,
+                    body,
+                    Duration::from_secs(60),
+                )
                 .await
                 .map_err(|e| err(format!("acme http: {e:#}")))?;
             let mut b = http::Response::builder().status(resp.status);
             for (k, v) in &resp.headers {
                 b = b.header(k, v);
             }
-            let (rparts, ()) = b.body(()).map_err(|e| err(format!("acme response: {e}")))?.into_parts();
-            Ok(BytesResponse { parts: rparts, body: Box::new(Bytes::from(resp.body)) })
+            let (rparts, ()) = b
+                .body(())
+                .map_err(|e| err(format!("acme response: {e}")))?
+                .into_parts();
+            Ok(BytesResponse {
+                parts: rparts,
+                body: Box::new(Bytes::from(resp.body)),
+            })
         })
     }
 }
@@ -71,12 +106,16 @@ async fn wait_for_dns(net: &Net, tls: &ServerIdentity, name: &str) {
             Ok(spki) if spki == tls.spki_sha256 => return,
             Ok(_) => {
                 if !logged {
-                    crate::log(&format!("acme: {name} reaches a different server; waiting for DNS to point here"));
+                    crate::log(&format!(
+                        "acme: {name} reaches a different server; waiting for DNS to point here"
+                    ));
                 }
             }
             Err(e) => {
                 if !logged {
-                    crate::log(&format!("acme: cannot reach {name} yet ({e:#}); waiting for DNS"));
+                    crate::log(&format!(
+                        "acme: cannot reach {name} yet ({e:#}); waiting for DNS"
+                    ));
                 }
             }
         }
@@ -87,7 +126,9 @@ async fn wait_for_dns(net: &Net, tls: &ServerIdentity, name: &str) {
 
 pub async fn run(net: Net, tls: Arc<ServerIdentity>, name: String, directory: String) {
     wait_for_dns(&net, &tls, &name).await;
-    crate::log(&format!("acme: {name} points at this enclave; requesting a certificate"));
+    crate::log(&format!(
+        "acme: {name} points at this enclave; requesting a certificate"
+    ));
     let mut backoff = Duration::from_secs(60);
     let mut account: Option<Account> = None;
     loop {
@@ -108,13 +149,23 @@ pub async fn run(net: Net, tls: Arc<ServerIdentity>, name: String, directory: St
     }
 }
 
-async fn obtain(net: &Net, tls: &ServerIdentity, name: &str, directory: &str, account: &mut Option<Account>) -> Result<()> {
+async fn obtain(
+    net: &Net,
+    tls: &ServerIdentity,
+    name: &str,
+    directory: &str,
+    account: &mut Option<Account>,
+) -> Result<()> {
     // One ACME account per boot, kept across retries so failing validations
     // do not also burn new-account rate limits.
     if account.is_none() {
         let (acct, _creds) = Account::builder_with_http(Box::new(NetHttp { net: net.clone() }))
             .create(
-                &NewAccount { contact: &[], terms_of_service_agreed: true, only_return_existing: false },
+                &NewAccount {
+                    contact: &[],
+                    terms_of_service_agreed: true,
+                    only_return_existing: false,
+                },
                 directory.to_string(),
                 None,
             )
@@ -148,14 +199,20 @@ async fn obtain(net: &Net, tls: &ServerIdentity, name: &str, directory: &str, ac
         tls.set_challenge(name, digest.as_ref())?;
         challenge.set_ready().await.context("set_ready")?;
     }
-    let status = order.poll_ready(&RetryPolicy::default()).await.context("polling order")?;
+    let status = order
+        .poll_ready(&RetryPolicy::default())
+        .await
+        .context("polling order")?;
     tls.clear_challenge();
     if status != OrderStatus::Ready {
         bail!("order status {status:?}");
     }
     let csr = tls.csr_der(&[name.to_string()])?;
     order.finalize_csr(&csr).await.context("finalize")?;
-    let chain = order.poll_certificate(&RetryPolicy::default()).await.context("polling certificate")?;
+    let chain = order
+        .poll_certificate(&RetryPolicy::default())
+        .await
+        .context("polling certificate")?;
     tls.install_chain_pem(&chain)?;
     Ok(())
 }

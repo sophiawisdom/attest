@@ -30,7 +30,14 @@ is written for an agent to follow, and takes one script.
 ## Flow
 
 1. The auditor proposes a question: `POST /api/sessions/ID/question`
-   `{"text": "...", "max_steps": 150, "allow_fine_tuned": false}`.
+   `{"text": "...", "max_steps": 150, "allow_fine_tuned": false, "answer_format": ...}`.
+   `answer_format` bounds what can come back, and the enclave enforces it:
+   `{"kind": "yes_no"}` (yes, no or inconclusive, nothing else),
+   `{"kind": "choice", "options": ["a", "b", ...]}` (exactly one option), or
+   `{"kind": "text", "max_bytes": 4000}` (the default: verdict plus a summary
+   of at most that many bytes). With the two strict formats the certificate
+   also rounds the model-influenced activity numbers and times, and the
+   auditor doesn't see when a run finishes, only the auditee's decision.
 2. The auditee accepts or rejects it: `POST /api/sessions/ID/question/decision`
    `{"version": 1, "accept": true, "note": "optional"}`. A rejected or
    answered question can be revised (step 1 again). Each revision is a new
@@ -38,7 +45,10 @@ is written for an agent to follow, and takes one script.
 3. The auditee uploads code: `PUT /api/sessions/ID/code` with a tar archive
    body (regular files only; no links). `attest upload LINK DIR` from the
    repository's CLI sends git-tracked files and checks the enclave first. The
-   response includes `tree_sha256`, a hash of every (path, content) pair.
+   response includes `tree_sha256`, a hash of every (path, content) pair, and
+   `commitment_sha256`, a salted hash of the tree. Before a result is
+   released the auditor sees only the commitment, not the tree hash, file
+   count or size; each released certificate reveals the salt and tree.
 4. The auditee confirms the affidavit: `POST /api/sessions/ID/affidavit`
    `{"organization": "...", "repo_url": "...", "git_commit": "...", "tree_sha256": "..."}`.
    The statement says the upload is the production code at that commit, and

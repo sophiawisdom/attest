@@ -84,8 +84,6 @@ struct HostConfig {
     /// The server's public IP, for an IP-address certificate when there's no domain.
     public_ip: Option<String>,
     max_code_mib: Option<usize>,
-    /// Decrypted-file cache size in the enclave.
-    cache_mib: Option<usize>,
     /// Shown on the landing page as "run by ...". Unverified.
     operator: Option<String>,
 }
@@ -150,13 +148,19 @@ async fn read_host_config(args: &Args) -> Result<HostConfig> {
         let mut last = String::new();
         for _ in 0..60 {
             let attempt = async {
-                let mut s = tokio::time::timeout(Duration::from_secs(5), tokio_vsock::VsockStream::connect(addr))
-                    .await
-                    .map_err(|_| anyhow!("timeout"))??;
+                let mut s = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    tokio_vsock::VsockStream::connect(addr),
+                )
+                .await
+                .map_err(|_| anyhow!("timeout"))??;
                 let mut buf = Vec::new();
-                tokio::time::timeout(Duration::from_secs(5), (&mut s).take(1 << 20).read_to_end(&mut buf))
-                    .await
-                    .map_err(|_| anyhow!("timeout"))??;
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    (&mut s).take(1 << 20).read_to_end(&mut buf),
+                )
+                .await
+                .map_err(|_| anyhow!("timeout"))??;
                 anyhow::Ok(serde_json::from_slice::<HostConfig>(&buf).context("host config JSON")?)
             };
             match attempt.await {
@@ -187,12 +191,28 @@ async fn main() -> Result<()> {
     start_log_forwarding(args.dev);
     let attester = nsm::Attester::new(args.dev)?;
     let cfg = read_host_config(&args).await?;
-    log(&format!("config: domain={:?} public_ip={:?} email_from={:?}", cfg.domain, cfg.public_ip, cfg.email_from));
+    log(&format!(
+        "config: domain={:?} public_ip={:?} email_from={:?}",
+        cfg.domain, cfg.public_ip, cfg.email_from
+    ));
     let domain = cfg.domain.clone().filter(|_| !args.dev);
     // The name to get a certificate for: the domain, or else the public IP
     // (Let's Encrypt issues short-lived certificates for IP addresses).
-    let cert_name = domain.clone().or_else(|| cfg.public_ip.clone().filter(|ip| ip.parse::<std::net::IpAddr>().is_ok())).filter(|_| !args.dev);
-    let tls = if args.dev { None } else { Some(Arc::new(tls::ServerIdentity::generate(cert_name.as_slice())?)) };
+    let cert_name = domain
+        .clone()
+        .or_else(|| {
+            cfg.public_ip
+                .clone()
+                .filter(|ip| ip.parse::<std::net::IpAddr>().is_ok())
+        })
+        .filter(|_| !args.dev);
+    let tls = if args.dev {
+        None
+    } else {
+        Some(Arc::new(tls::ServerIdentity::generate(
+            cert_name.as_slice(),
+        )?))
+    };
 
     // Inside Nitro the kernel RNG is fed by the NSM hardware RNG.
     let signing = SigningKey::generate(&mut rand::rngs::OsRng);
@@ -225,23 +245,39 @@ async fn main() -> Result<()> {
         },
     };
     let info_json = serde_json::to_string(&info)?;
-    let boot_doc = attester.attest(&sha256(info_json.as_bytes()), &signing.verifying_key().to_bytes(), None)?;
+    let boot_doc = attester.attest(
+        &sha256(info_json.as_bytes()),
+        &signing.verifying_key().to_bytes(),
+        None,
+    )?;
     let net = net::Net::new(args.dev, args.dev_tunnel.clone())?;
     // Egress allowlist: everything this enclave may ever connect to.
     for p in [Provider::Openai, Provider::Anthropic, Provider::Openrouter] {
         net.allow(llm::endpoint(p).0);
     }
-    let acme_dir = cfg.acme_directory.clone().unwrap_or_else(|| LETS_ENCRYPT.into());
-    if let Some(h) = url::Url::parse(&acme_dir).ok().and_then(|u| u.host_str().map(String::from)) {
+    let acme_dir = cfg
+        .acme_directory
+        .clone()
+        .unwrap_or_else(|| LETS_ENCRYPT.into());
+    if let Some(h) = url::Url::parse(&acme_dir)
+        .ok()
+        .and_then(|u| u.host_str().map(String::from))
+    {
         net.allow(&h);
     }
     if let Some(n) = &cert_name {
         net.allow(n); // the DNS self-check before requesting a certificate
     }
     if cfg.email_from.is_some() {
-        net.allow(&format!("email.{}.amazonaws.com", cfg.ses_region.clone().unwrap_or_else(|| "us-west-2".into())));
+        net.allow(&format!(
+            "email.{}.amazonaws.com",
+            cfg.ses_region.clone().unwrap_or_else(|| "us-west-2".into())
+        ));
     }
-    log(&format!("egress allowlist: {}", net.allowed_hosts().join(", ")));
+    log(&format!(
+        "egress allowlist: {}",
+        net.allowed_hosts().join(", ")
+    ));
     let ctx = Arc::new(Ctx {
         dev: args.dev,
         net: net.clone(),
@@ -257,13 +293,18 @@ async fn main() -> Result<()> {
         public_name: domain.clone().or(cfg.public_ip.clone()),
         max_code_bytes: cfg.max_code_mib.unwrap_or(1024) << 20,
         blobs: blobs::BlobClient::new(args.dev, args.dev_blobs.clone()),
-        cache: Arc::new(blobs::Cache::new(cfg.cache_mib.unwrap_or(2048) << 20)),
+        // Fixed in the image: a host-chosen size would let the host shape
+        // which reads miss and reach it.
+        cache: Arc::new(blobs::Cache::new(256 << 20)),
         upload_slots: tokio::sync::Semaphore::new(2),
         sandbox: Arc::new(std::sync::OnceLock::new()),
         slots: tokio::sync::Semaphore::new(args.concurrency),
         store: sessions::Store::default(),
     });
-    let app = Arc::new(App { ctx: ctx.clone(), attester });
+    let app = Arc::new(App {
+        ctx: ctx.clone(),
+        attester,
+    });
     tokio::spawn(measure_blob_store(ctx.blobs.clone()));
     if !args.dev {
         jail::spawn_probe();
@@ -276,13 +317,19 @@ async fn main() -> Result<()> {
             match sandbox::Sandbox::load(std::path::Path::new(&dir)) {
                 Ok(sb) => {
                     let _ = slot.set(Arc::new(sb));
-                    log(&format!("python sandbox ready ({:.1} s to compile)", t.elapsed().as_secs_f64()));
+                    log(&format!(
+                        "python sandbox ready ({:.1} s to compile)",
+                        t.elapsed().as_secs_f64()
+                    ));
                 }
                 Err(e) => log(&format!("python sandbox unavailable: {e:#}")),
             }
         });
     }
-    log(&format!("boot {} mode={} commit={}", ctx.info.boot_id, ctx.info.mode, ctx.info.source_commit));
+    log(&format!(
+        "boot {} mode={} commit={}",
+        ctx.info.boot_id, ctx.info.mode, ctx.info.source_commit
+    ));
 
     if let (Some(t), Some(d)) = (&tls, &cert_name) {
         tokio::spawn(acme::run(net, t.clone(), d.clone(), acme_dir));
@@ -322,14 +369,19 @@ async fn measure_blob_store(store: blobs::BlobClient) {
         pid[23] ^= i.wrapping_add(1);
         let chunk = data[..2 << 20].to_vec();
         async move {
-            store.put(&pid, &chunk).await.is_ok() && matches!(store.get(&pid).await, Ok(Some(d)) if d.len() == chunk.len())
+            store.put(&pid, &chunk).await.is_ok()
+                && matches!(store.get(&pid).await, Ok(Some(d)) if d.len() == chunk.len())
         }
     }))
     .await;
     let par = t3.elapsed();
     let par_ok = parallel.iter().all(|x| *x);
     let _ = store.delete_session(&id[..8].try_into().unwrap()).await;
-    log(&format!("blob store: 8 parallel 2 MiB put+get {:.0} ms ({:.0} MB/s each way), ok={par_ok}", par.as_secs_f64() * 1e3, 16.0 / par.as_secs_f64() * 2.0 / 2.0));
+    log(&format!(
+        "blob store: 8 parallel 2 MiB put+get {:.0} ms ({:.0} MB/s each way), ok={par_ok}",
+        par.as_secs_f64() * 1e3,
+        16.0 / par.as_secs_f64() * 2.0 / 2.0
+    ));
     log(&format!(
         "blob store: 16 MiB put {:.0} ms ({:.0} MB/s), get {:.0} ms ({:.0} MB/s), small request {:.2} ms, verified={ok}",
         put.as_secs_f64() * 1e3, mb / put.as_secs_f64(), get.as_secs_f64() * 1e3, mb / get.as_secs_f64(), rtt.as_secs_f64() * 1e3
@@ -355,14 +407,23 @@ async fn serve(args: Args, app: Arc<App>, tls: Option<Arc<tls::ServerIdentity>>)
     {
         let tls = tls.ok_or_else(|| anyhow!("no TLS identity"))?;
         let acceptor = tokio_rustls::TlsAcceptor::from(tls.server_config());
-        let l = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_ANY, LISTEN_VSOCK_PORT))
-            .context("binding vsock")?;
-        log(&format!("listening on vsock port {LISTEN_VSOCK_PORT} (TLS)"));
+        let l = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(
+            tokio_vsock::VMADDR_CID_ANY,
+            LISTEN_VSOCK_PORT,
+        ))
+        .context("binding vsock")?;
+        log(&format!(
+            "listening on vsock port {LISTEN_VSOCK_PORT} (TLS)"
+        ));
         loop {
             let (s, _) = l.accept().await?;
             let (app, acceptor) = (app.clone(), acceptor.clone());
             tokio::spawn(async move {
-                let Ok(Ok(stream)) = tokio::time::timeout(Duration::from_secs(20), acceptor.accept(s)).await else { return };
+                let Ok(Ok(stream)) =
+                    tokio::time::timeout(Duration::from_secs(20), acceptor.accept(s)).await
+                else {
+                    return;
+                };
                 // ACME validation connections only need the handshake.
                 if stream.get_ref().1.alpn_protocol() == Some(tls::ACME_ALPN) {
                     return;
@@ -378,12 +439,17 @@ async fn serve(args: Args, app: Arc<App>, tls: Option<Arc<tls::ServerIdentity>>)
     }
 }
 
-async fn serve_http<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>(app: Arc<App>, s: S) {
+async fn serve_http<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>(
+    app: Arc<App>,
+    s: S,
+) {
     let svc = hyper::service::service_fn(move |req| {
         let app = app.clone();
         async move { Ok::<_, std::convert::Infallible>(handle(app, req).await) }
     });
-    let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(s), svc).await;
+    let _ = hyper::server::conn::http1::Builder::new()
+        .serve_connection(TokioIo::new(s), svc)
+        .await;
 }
 
 // ------------------------------------------------------------------ HTTP
@@ -407,7 +473,11 @@ fn respond(status: StatusCode, ctype: &str, body: impl Into<Bytes>) -> Resp {
 }
 
 fn json_resp(status: StatusCode, v: &Value) -> Resp {
-    respond(status, "application/json", serde_json::to_vec(v).unwrap_or_default())
+    respond(
+        status,
+        "application/json",
+        serde_json::to_vec(v).unwrap_or_default(),
+    )
 }
 
 struct ApiError(StatusCode, String);
@@ -419,19 +489,32 @@ impl From<anyhow::Error> for ApiError {
 }
 
 fn query(req: &Request<hyper::body::Incoming>) -> HashMap<String, String> {
-    req.uri().query().map(|q| url::form_urlencoded::parse(q.as_bytes()).into_owned().collect()).unwrap_or_default()
+    req.uri()
+        .query()
+        .map(|q| {
+            url::form_urlencoded::parse(q.as_bytes())
+                .into_owned()
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn body_json(req: Request<hyper::body::Incoming>) -> Result<Value, ApiError> {
     let b = http_body_util::Limited::new(req.into_body(), 1 << 20)
         .collect()
         .await
-        .map_err(|_| ApiError(StatusCode::PAYLOAD_TOO_LARGE, "request body too large".into()))?
+        .map_err(|_| {
+            ApiError(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body too large".into(),
+            )
+        })?
         .to_bytes();
     if b.is_empty() {
         return Ok(Value::Null);
     }
-    serde_json::from_slice(&b).map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("body is not JSON: {e}")))
+    serde_json::from_slice(&b)
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("body is not JSON: {e}")))
 }
 
 async fn handle(app: Arc<App>, req: Request<hyper::body::Incoming>) -> Resp {
@@ -439,14 +522,28 @@ async fn handle(app: Arc<App>, req: Request<hyper::body::Incoming>) -> Resp {
     let method = req.method().as_str().to_string();
     let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
     let r: Result<Resp, ApiError> = match (method.as_str(), parts.as_slice()) {
-        ("GET", [""]) | ("GET", ["s", _]) => Ok(respond(StatusCode::OK, "text/html; charset=utf-8", INDEX_HTML)),
-        ("GET", ["agents.md"]) | ("GET", ["llms.txt"]) => Ok(respond(StatusCode::OK, "text/markdown; charset=utf-8", AGENTS_MD)),
+        ("GET", [""]) | ("GET", ["s", _]) => Ok(respond(
+            StatusCode::OK,
+            "text/html; charset=utf-8",
+            INDEX_HTML,
+        )),
+        ("GET", ["agents.md"]) | ("GET", ["llms.txt"]) => Ok(respond(
+            StatusCode::OK,
+            "text/markdown; charset=utf-8",
+            AGENTS_MD,
+        )),
         ("GET", ["healthz"]) => Ok(json_resp(StatusCode::OK, &json!({"ok": true}))),
         ("GET", ["api", "attestation"]) => attestation(&app, &query(&req)),
-        ("GET", ["api", "info"]) => Ok(json_resp(StatusCode::OK, &serde_json::to_value(&app.ctx.info).unwrap_or_default())),
+        ("GET", ["api", "info"]) => Ok(json_resp(
+            StatusCode::OK,
+            &serde_json::to_value(&app.ctx.info).unwrap_or_default(),
+        )),
         ("POST", ["api", "sessions"]) => create_session(&app, &req),
         (_, ["api", "sessions", id, rest @ ..]) => session_route(&app, id, rest, req).await,
-        _ => Err(ApiError(StatusCode::NOT_FOUND, format!("not found: {method} {path} (see /agents.md)"))),
+        _ => Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("not found: {method} {path} (see /agents.md)"),
+        )),
     };
     r.unwrap_or_else(|ApiError(s, m)| json_resp(s, &json!({"error": m})))
 }
@@ -460,20 +557,34 @@ fn attestation(app: &App, q: &HashMap<String, String>) -> Result<Resp, ApiError>
             }
             let ctx = &app.ctx;
             app.attester
-                .attest(&sha256(ctx.info_json.as_bytes()), &ctx.signing.verifying_key().to_bytes(), Some(&nonce))?
+                .attest(
+                    &sha256(ctx.info_json.as_bytes()),
+                    &ctx.signing.verifying_key().to_bytes(),
+                    Some(&nonce),
+                )?
                 .map(|d| base64::engine::general_purpose::STANDARD.encode(d))
         }
         None => app.ctx.boot_doc_b64.clone(),
     };
-    let r = AttestationResponse { enclave_info_json: app.ctx.info_json.clone(), document_b64: doc };
-    Ok(json_resp(StatusCode::OK, &serde_json::to_value(r).unwrap_or_default()))
+    let r = AttestationResponse {
+        enclave_info_json: app.ctx.info_json.clone(),
+        document_b64: doc,
+    };
+    Ok(json_resp(
+        StatusCode::OK,
+        &serde_json::to_value(r).unwrap_or_default(),
+    ))
 }
 
 fn base_url(app: &App, req: &Request<hyper::body::Incoming>) -> String {
     match &app.ctx.public_name {
         Some(d) => format!("https://{d}"),
         None => {
-            let host = req.headers().get("host").and_then(|h| h.to_str().ok()).unwrap_or("127.0.0.1:8080");
+            let host = req
+                .headers()
+                .get("host")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("127.0.0.1:8080");
             format!("{}://{host}", if app.ctx.dev { "http" } else { "https" })
         }
     }
@@ -499,12 +610,28 @@ fn create_session(app: &App, req: &Request<hyper::body::Incoming>) -> Result<Res
 /// Stream an uploaded tar into a sealed bundle: body frames go through a
 /// bounded channel to a blocking parser, so at most a few frames and one
 /// file are in memory at a time.
-async fn ingest_upload(ctx: &Arc<Ctx>, session_id: &str, mut body: hyper::body::Incoming) -> Result<bundle::Bundle, ApiError> {
+async fn ingest_upload(
+    ctx: &Arc<Ctx>,
+    session_id: &str,
+    mut body: hyper::body::Incoming,
+) -> Result<bundle::Bundle, ApiError> {
     let max = ctx.max_code_bytes as u64;
     let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(16);
     let (store, cache, sid) = (ctx.blobs.clone(), ctx.cache.clone(), session_id.to_string());
     let rt = tokio::runtime::Handle::current();
-    let job = tokio::task::spawn_blocking(move || bundle::Bundle::ingest(ChannelReader { rx, buf: Bytes::new() }, &sid, store, cache, rt, max));
+    let job = tokio::task::spawn_blocking(move || {
+        bundle::Bundle::ingest(
+            ChannelReader {
+                rx,
+                buf: Bytes::new(),
+            },
+            &sid,
+            store,
+            cache,
+            rt,
+            max,
+        )
+    });
     let mut received = 0u64;
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|e| anyhow!("upload interrupted: {e}"))?;
@@ -512,7 +639,10 @@ async fn ingest_upload(ctx: &Arc<Ctx>, session_id: &str, mut body: hyper::body::
             received += data.len() as u64;
             // The tar has headers and padding on top of file contents.
             if received > max + max / 8 + (16 << 20) {
-                return Err(ApiError(StatusCode::PAYLOAD_TOO_LARGE, format!("the archive is larger than {} MiB", max >> 20)));
+                return Err(ApiError(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("the archive is larger than {} MiB", max >> 20),
+                ));
             }
             if tx.send(data).await.is_err() {
                 break; // the parser stopped early (error); its result says why
@@ -552,10 +682,23 @@ fn bearer(req: &Request<hyper::body::Incoming>) -> Option<String> {
         .map(|t| t.trim().to_string())
 }
 
-async fn session_route(app: &Arc<App>, id: &str, rest: &[&str], req: Request<hyper::body::Incoming>) -> Result<Resp, ApiError> {
+async fn session_route(
+    app: &Arc<App>,
+    id: &str,
+    rest: &[&str],
+    req: Request<hyper::body::Incoming>,
+) -> Result<Resp, ApiError> {
     let ctx = &app.ctx;
-    let token = bearer(&req).ok_or_else(|| ApiError(StatusCode::UNAUTHORIZED, "send the token from your link as 'Authorization: Bearer <token>'".into()))?;
-    let (s, role) = ctx.store.auth(id, &token).map_err(|e| ApiError(StatusCode::NOT_FOUND, e.to_string()))?;
+    let token = bearer(&req).ok_or_else(|| {
+        ApiError(
+            StatusCode::UNAUTHORIZED,
+            "send the token from your link as 'Authorization: Bearer <token>'".into(),
+        )
+    })?;
+    let (s, role) = ctx
+        .store
+        .auth(id, &token)
+        .map_err(|e| ApiError(StatusCode::NOT_FOUND, e.to_string()))?;
     s.touch(ctx, role);
     let method = req.method().as_str().to_string();
     let q = query(&req);
@@ -564,21 +707,31 @@ async fn session_route(app: &Arc<App>, id: &str, rest: &[&str], req: Request<hyp
         ("GET", []) => {
             // Long-poll: ?version=N&wait=25 returns once the session changes past N.
             if let Some(v) = q.get("version").and_then(|v| v.parse::<u64>().ok()) {
-                let wait = q.get("wait").and_then(|w| w.parse::<u64>().ok()).unwrap_or(0).min(30);
+                let wait = q
+                    .get("wait")
+                    .and_then(|w| w.parse::<u64>().ok())
+                    .unwrap_or(0)
+                    .min(30);
                 if wait > 0 {
-                    sessions::wait_for_change(&s, v, Duration::from_secs(wait)).await;
+                    sessions::wait_for_change(&s, role, v, Duration::from_secs(wait)).await;
                 }
             }
             let since = q.get("since").and_then(|v| v.parse().ok()).unwrap_or(0);
             ok(s.view(ctx, role, since))
         }
         ("POST", ["question"]) => ok(s.propose_question(ctx, role, &body_json(req).await?)?),
-        ("POST", ["question", "decision"]) => ok(s.decide_question(ctx, role, &body_json(req).await?)?),
+        ("POST", ["question", "decision"]) => {
+            ok(s.decide_question(ctx, role, &body_json(req).await?)?)
+        }
         ("PUT", ["code"]) => {
             if role != attest_core::Role::Auditee {
                 return Err(anyhow!("only the auditee uploads code").into());
             }
-            let _slot = ctx.upload_slots.acquire().await.map_err(|_| anyhow!("shutting down"))?;
+            let _slot = ctx
+                .upload_slots
+                .acquire()
+                .await
+                .map_err(|_| anyhow!("shutting down"))?;
             let bundle = ingest_upload(ctx, &s.id, req.into_body()).await?;
             ok(s.set_code(ctx, role, bundle)?)
         }
@@ -592,11 +745,22 @@ async fn session_route(app: &Arc<App>, id: &str, rest: &[&str], req: Request<hyp
             let after = q.get("after").and_then(|v| v.parse().ok()).unwrap_or(0);
             ok(s.trace(role, rid, after)?)
         }
-        ("POST", ["runs", rid, "release"]) => ok(s.decide_release(ctx, role, rid, &body_json(req).await?)?),
-        ("POST", ["runs", rid, "followup"]) => ok(s.followup(ctx, role, rid, &body_json(req).await?)?),
-        ("GET", ["runs", rid, "certificate"]) => ok(serde_json::to_value(s.certificate(role, rid)?).map_err(anyhow::Error::from)?),
+        ("POST", ["runs", rid, "release"]) => {
+            ok(s.decide_release(ctx, role, rid, &body_json(req).await?)?)
+        }
+        ("POST", ["runs", rid, "followup"]) => {
+            ok(s.followup(ctx, role, rid, &body_json(req).await?)?)
+        }
+        ("GET", ["runs", rid, "certificate"]) => {
+            ok(serde_json::to_value(s.certificate(role, rid)?).map_err(anyhow::Error::from)?)
+        }
         ("POST", ["notify"]) => ok(s.set_notify(ctx, role, &body_json(req).await?)?),
-        _ => Err(ApiError(StatusCode::NOT_FOUND, format!("not found: {method} /api/sessions/{id}/{} (see /agents.md)", rest.join("/")))),
+        _ => Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!(
+                "not found: {method} /api/sessions/{id}/{} (see /agents.md)",
+                rest.join("/")
+            ),
+        )),
     }
 }
-

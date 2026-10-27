@@ -18,6 +18,42 @@ pub fn endpoint(p: Provider) -> (&'static str, &'static str) {
     }
 }
 
+/// Refuse model identifiers that bring provider-side network access with
+/// them (web search, browsing, research agents) or let the provider pick
+/// the model (aliases, presets, auto-routing).
+pub fn vet_model(p: Provider, model: &str) -> anyhow::Result<()> {
+    let m = model.to_ascii_lowercase();
+    anyhow::ensure!(
+        !m.is_empty()
+            && m.len() < 200
+            && m.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_./:".contains(c)),
+        "invalid model name"
+    );
+    anyhow::ensure!(
+        !m.starts_with('~') && !m.starts_with('@'),
+        "model aliases and presets are not allowed; name an exact model"
+    );
+    let fine_tune = p == Provider::Openai && m.starts_with("ft:");
+    anyhow::ensure!(
+        !m.contains(':') || fine_tune,
+        "model variants (\":online\" and other suffixes) are not allowed; name the base model"
+    );
+    for bad in [
+        "search",
+        "research",
+        "online",
+        "sonar",
+        "computer-use",
+        "browse",
+        "openrouter/auto",
+        "agent",
+    ] {
+        anyhow::ensure!(!m.contains(bad), "models with built-in web or agent access ({bad}) are not allowed: the provider would reach the network on the model's behalf");
+    }
+    Ok(())
+}
+
 pub fn is_fine_tuned(p: Provider, model: &str) -> bool {
     match p {
         Provider::Openai | Provider::Mock => model.starts_with("ft:"),
@@ -62,24 +98,51 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(net: Net, provider: Provider, model: String, api_key: String, openrouter_zdr: bool, mock: Option<String>) -> Result<Self> {
+    pub fn new(
+        net: Net,
+        provider: Provider,
+        model: String,
+        api_key: String,
+        openrouter_zdr: bool,
+        mock: Option<String>,
+    ) -> Result<Self> {
         let mock = match (provider, mock) {
             (Provider::Mock, Some(m)) => {
-                let (h, p) = m.rsplit_once(':').ok_or_else(|| anyhow!("mock endpoint must be host:port"))?;
+                let (h, p) = m
+                    .rsplit_once(':')
+                    .ok_or_else(|| anyhow!("mock endpoint must be host:port"))?;
                 Some((h.to_string(), p.parse()?))
             }
             (Provider::Mock, None) => bail!("mock provider needs mock_endpoint"),
             _ => None,
         };
-        Ok(Self { provider, model, api_key, openrouter_zdr, mock, net })
+        Ok(Self {
+            provider,
+            model,
+            api_key,
+            openrouter_zdr,
+            mock,
+            net,
+        })
     }
 
-    pub async fn complete(&self, system: &str, turns: &[Turn], tools: &[(&str, &str, Value)]) -> Result<Reply> {
+    pub async fn complete(
+        &self,
+        system: &str,
+        turns: &[Turn],
+        tools: &[(&str, &str, Value)],
+    ) -> Result<Reply> {
         let body = match self.provider {
             Provider::Anthropic => anthropic_body(&self.model, system, turns, tools),
-            _ => openai_body(&self.model, system, turns, tools, self.provider == Provider::Openrouter && self.openrouter_zdr),
+            _ => openai_body(
+                &self.model,
+                system,
+                turns,
+                tools,
+                self.provider == Provider::Openrouter && self.openrouter_zdr,
+            ),
         };
-        let body = serde_json::to_vec(&body)?;
+        let body = pad_json(serde_json::to_vec(&body)?);
         let mut attempt = 0;
         loop {
             attempt += 1;
@@ -114,21 +177,67 @@ impl Client {
         let timeout = Duration::from_secs(600);
         match self.provider {
             Provider::Anthropic => {
-                let h = [("x-api-key", self.api_key.as_str()), ("anthropic-version", "2023-06-01")];
-                self.net.request(true, host, 443, path, &h, body, timeout).await
+                let h = [
+                    ("x-api-key", self.api_key.as_str()),
+                    ("anthropic-version", "2023-06-01"),
+                ];
+                self.net
+                    .request(true, host, 443, path, &h, body, timeout)
+                    .await
             }
             Provider::Mock => {
                 let (mh, mp) = self.mock.as_ref().unwrap();
-                self.net.request(false, mh, *mp, path, &[("authorization", &auth)], body, timeout).await
+                self.net
+                    .request(
+                        false,
+                        mh,
+                        *mp,
+                        path,
+                        &[("authorization", &auth)],
+                        body,
+                        timeout,
+                    )
+                    .await
             }
-            _ => self.net.request(true, host, 443, path, &[("authorization", &auth)], body, timeout).await,
+            _ => {
+                self.net
+                    .request(
+                        true,
+                        host,
+                        443,
+                        path,
+                        &[("authorization", &auth)],
+                        body,
+                        timeout,
+                    )
+                    .await
+            }
         }
     }
 }
 
+/// Pad a JSON body with trailing spaces up to a size bucket. The parent
+/// sees each request's size; buckets are at least 64 KiB and grow by 1.25x,
+/// so what one tool result or reply adds to the conversation mostly stays
+/// inside a bucket.
+pub fn pad_json(mut body: Vec<u8>) -> Vec<u8> {
+    let mut bucket: usize = 64 << 10;
+    while bucket < body.len() {
+        bucket = (bucket + bucket / 4).div_ceil(4096) * 4096;
+    }
+    body.resize(bucket, b' ');
+    body
+}
+
 // ------------------------------------------------------------------ OpenAI
 
-fn openai_body(model: &str, system: &str, turns: &[Turn], tools: &[(&str, &str, Value)], zdr: bool) -> Value {
+fn openai_body(
+    model: &str,
+    system: &str,
+    turns: &[Turn],
+    tools: &[(&str, &str, Value)],
+    zdr: bool,
+) -> Value {
     let mut messages = vec![json!({"role": "system", "content": system})];
     for t in turns {
         match t {
@@ -164,7 +273,10 @@ fn parse_openai(resp: &HttpResponse) -> Result<Reply> {
             let args_s = c["function"]["arguments"].as_str().unwrap_or("{}");
             calls.push(ToolCall {
                 id: c["id"].as_str().unwrap_or_default().to_string(),
-                name: c["function"]["name"].as_str().unwrap_or_default().to_string(),
+                name: c["function"]["name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
                 args: serde_json::from_str(args_s).unwrap_or(Value::Null),
             });
         }
@@ -188,17 +300,26 @@ fn parse_openai(resp: &HttpResponse) -> Result<Reply> {
 
 // ------------------------------------------------------------------ Anthropic
 
-fn anthropic_body(model: &str, system: &str, turns: &[Turn], tools: &[(&str, &str, Value)]) -> Value {
+fn anthropic_body(
+    model: &str,
+    system: &str,
+    turns: &[Turn],
+    tools: &[(&str, &str, Value)],
+) -> Value {
     // Consecutive user turns (tool results, then a follow-up message) are
     // merged into one user message of content blocks.
     let mut messages: Vec<Value> = Vec::new();
     for t in turns {
         let (role, blocks): (&str, Vec<Value>) = match t {
             Turn::User(s) => ("user", vec![json!({"type": "text", "text": s})]),
-            Turn::Assistant { raw, .. } => ("assistant", raw.as_array().cloned().unwrap_or_default()),
+            Turn::Assistant { raw, .. } => {
+                ("assistant", raw.as_array().cloned().unwrap_or_default())
+            }
             Turn::ToolResults(rs) => (
                 "user",
-                rs.iter().map(|(id, c)| json!({"type": "tool_result", "tool_use_id": id, "content": c})).collect(),
+                rs.iter()
+                    .map(|(id, c)| json!({"type": "tool_result", "tool_use_id": id, "content": c}))
+                    .collect(),
             ),
         };
         match messages.last_mut() {
@@ -208,13 +329,19 @@ fn anthropic_body(model: &str, system: &str, turns: &[Turn], tools: &[(&str, &st
             _ => messages.push(json!({"role": role, "content": blocks})),
         }
     }
-    let tools: Vec<Value> = tools.iter().map(|(n, d, p)| json!({"name": n, "description": d, "input_schema": p})).collect();
+    let tools: Vec<Value> = tools
+        .iter()
+        .map(|(n, d, p)| json!({"name": n, "description": d, "input_schema": p}))
+        .collect();
     json!({"model": model, "system": system, "messages": messages, "tools": tools, "max_tokens": 16000})
 }
 
 fn parse_anthropic(resp: &HttpResponse) -> Result<Reply> {
     let v: Value = serde_json::from_slice(&resp.body).context("provider response JSON")?;
-    let content = v["content"].as_array().cloned().ok_or_else(|| anyhow!("response has no content"))?;
+    let content = v["content"]
+        .as_array()
+        .cloned()
+        .ok_or_else(|| anyhow!("response has no content"))?;
     let mut text = String::new();
     let mut calls = Vec::new();
     for b in &content {
@@ -237,7 +364,9 @@ fn parse_anthropic(resp: &HttpResponse) -> Result<Reply> {
         key_owner: resp.header("anthropic-organization-id").map(String::from),
         input_tokens: v["usage"]["input_tokens"].as_u64().unwrap_or(0)
             + v["usage"]["cache_read_input_tokens"].as_u64().unwrap_or(0)
-            + v["usage"]["cache_creation_input_tokens"].as_u64().unwrap_or(0),
+            + v["usage"]["cache_creation_input_tokens"]
+                .as_u64()
+                .unwrap_or(0),
         output_tokens: v["usage"]["output_tokens"].as_u64().unwrap_or(0),
     })
 }

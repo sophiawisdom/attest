@@ -31,9 +31,10 @@ pub async fn agent_loop(
     sandbox: Option<std::sync::Arc<crate::sandbox::Sandbox>>,
     mut turns: Vec<Turn>,
     max_steps: u32,
+    format: &AnswerFormat,
     progress: &(dyn Fn(Vec<Value>) + Send + Sync),
 ) -> AgentOutput {
-    let schemas = tool_schemas();
+    let schemas = tool_schemas(format);
     let mut tools = Tools::new(bundle, sandbox);
     let mut activity = Activity::default();
     let mut response_models = BTreeSet::new();
@@ -75,16 +76,21 @@ pub async fn agent_loop(
             "tool_calls": reply.calls.iter().map(|c| json!({"id": c.id, "name": c.name, "args": c.args})).collect::<Vec<_>>(),
             "model": reply.model,
         })];
-        turns.push(Turn::Assistant { raw: reply.raw_message.clone() });
+        turns.push(Turn::Assistant {
+            raw: reply.raw_message.clone(),
+        });
 
         if reply.calls.is_empty() {
             nudges += 1;
             if nudges > MAX_NUDGES {
                 progress(events);
-                outcome = Outcome::Error { message: "the model stopped without submitting a verdict".into() };
+                outcome = Outcome::Error {
+                    message: "the model stopped without submitting a verdict".into(),
+                };
                 break;
             }
-            let nudge = "Continue investigating with the tools. When you are done, call submit_verdict.";
+            let nudge =
+                "Continue investigating with the tools. When you are done, call submit_verdict.";
             events.push(json!({"type": "harness", "content": nudge}));
             progress(events);
             turns.push(Turn::User(nudge.into()));
@@ -95,7 +101,7 @@ pub async fn agent_loop(
         for call in &reply.calls {
             activity.tool_calls += 1;
             let out = if call.name == "submit_verdict" {
-                match parse_verdict(&call.args) {
+                match parse_verdict(&call.args, format) {
                     Ok(v) => {
                         verdict = Some(v);
                         "verdict recorded".to_string()
@@ -105,7 +111,9 @@ pub async fn agent_loop(
             } else {
                 tools.call(&call.name, &call.args).await
             };
-            events.push(json!({"type": "tool_result", "id": call.id, "name": call.name, "content": out}));
+            events.push(
+                json!({"type": "tool_result", "id": call.id, "name": call.name, "content": out}),
+            );
             results.push((call.id.clone(), out));
         }
         progress(events);
@@ -126,7 +134,9 @@ pub async fn agent_loop(
     activity.grep_calls = tools.counts.grep;
     activity.python_calls = tools.counts.python;
     let files_read = tools.files_read.clone();
-    progress(vec![json!({"type": "files_read", "paths": files_read.keys().collect::<Vec<_>>()})]);
+    progress(vec![
+        json!({"type": "files_read", "paths": files_read.keys().collect::<Vec<_>>()}),
+    ]);
     AgentOutput {
         turns,
         verdict,
@@ -139,17 +149,32 @@ pub async fn agent_loop(
     }
 }
 
-fn parse_verdict(args: &Value) -> anyhow::Result<Verdict> {
+pub fn parse_verdict(args: &Value, format: &AnswerFormat) -> anyhow::Result<Verdict> {
+    if let AnswerFormat::Choice { .. } = format {
+        let v = Verdict {
+            answer: Answer::Inconclusive,
+            confidence: 0.0,
+            summary: String::new(),
+            clarification_request: None,
+            choice: args["choice"].as_str().map(String::from),
+        };
+        return format.enforce(v).map_err(|e| anyhow::anyhow!(e));
+    }
     let answer = match args["answer"].as_str() {
         Some("yes") => Answer::Yes,
         Some("no") => Answer::No,
         Some("inconclusive") => Answer::Inconclusive,
         Some("needs_clarification") => Answer::NeedsClarification,
-        other => anyhow::bail!("answer must be yes, no, inconclusive or needs_clarification (got {other:?})"),
+        other => anyhow::bail!(
+            "answer must be yes, no, inconclusive or needs_clarification (got {other:?})"
+        ),
     };
     let confidence = args["confidence"].as_f64().unwrap_or(0.0).clamp(0.0, 1.0);
-    let summary: String = args["summary"].as_str().unwrap_or_default().chars().take(20_000).collect();
-    anyhow::ensure!(!summary.trim().is_empty(), "summary is required");
+    let summary: String = args["summary"].as_str().unwrap_or_default().to_string();
+    anyhow::ensure!(
+        format.is_strict() || !summary.trim().is_empty(),
+        "summary is required"
+    );
     let clarification_request: Option<String> = args["clarification_request"]
         .as_str()
         .map(|s| s.chars().take(5_000).collect::<String>())
@@ -157,5 +182,13 @@ fn parse_verdict(args: &Value) -> anyhow::Result<Verdict> {
     if answer == Answer::NeedsClarification && clarification_request.is_none() {
         anyhow::bail!("needs_clarification requires clarification_request");
     }
-    Ok(Verdict { answer, confidence, summary, clarification_request })
+    format
+        .enforce(Verdict {
+            answer,
+            confidence,
+            summary,
+            clarification_request,
+            choice: None,
+        })
+        .map_err(|e| anyhow::anyhow!(e))
 }

@@ -41,15 +41,21 @@ impl Signed {
             .context("signature hex")?
             .try_into()
             .map_err(|_| anyhow!("signature must be 64 bytes"))?;
-        key.verify(&message(&self.domain, &self.body), &ed25519_dalek::Signature::from_bytes(&sig))
-            .map_err(|_| anyhow!("{domain}: signature does not verify"))?;
+        key.verify(
+            &message(&self.domain, &self.body),
+            &ed25519_dalek::Signature::from_bytes(&sig),
+        )
+        .map_err(|_| anyhow!("{domain}: signature does not verify"))?;
         serde_json::from_str(&self.body).with_context(|| format!("{domain}: body"))
     }
 
     /// Like `open`, but also require a specific signer.
     pub fn open_by<T: DeserializeOwned>(&self, domain: &str, signer_hex: &str) -> Result<T> {
         if !self.public_key.eq_ignore_ascii_case(signer_hex) {
-            bail!("{domain}: signed by {}, expected {signer_hex}", self.public_key);
+            bail!(
+                "{domain}: signed by {}, expected {signer_hex}",
+                self.public_key
+            );
         }
         self.open(domain)
     }

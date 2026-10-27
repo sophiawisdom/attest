@@ -167,6 +167,9 @@ pub struct Verdict {
     pub summary: String,
     /// With `needs_clarification`: what the auditor should change.
     pub clarification_request: Option<String>,
+    /// For a `choice` answer format: the chosen option.
+    #[serde(default)]
+    pub choice: Option<String>,
 }
 
 /// Everything the enclave discloses about how a verdict was produced. It
@@ -207,6 +210,129 @@ pub struct QuestionRecord {
     pub allow_fine_tuned: bool,
     pub asked_at_ms: u64,
     pub accepted_at_ms: u64,
+    /// What the answer may contain. Enforced by the enclave.
+    #[serde(default)]
+    pub answer_format: AnswerFormat,
+}
+
+/// The shape of what can reach the auditor, agreed with the question. The
+/// enclave refuses verdicts outside it, which bounds how much any model or
+/// question could ever carry out of the enclave through the result.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AnswerFormat {
+    /// yes / no / inconclusive. No summary, confidence or other text.
+    YesNo,
+    /// Exactly one of these options. No other text.
+    Choice { options: Vec<String> },
+    /// The usual verdict, with the summary capped at `max_bytes` (UTF-8).
+    Text { max_bytes: u32 },
+}
+
+pub const DEFAULT_SUMMARY_BYTES: u32 = 4000;
+pub const MAX_SUMMARY_BYTES: u32 = 20_000;
+
+impl Default for AnswerFormat {
+    fn default() -> Self {
+        AnswerFormat::Text {
+            max_bytes: DEFAULT_SUMMARY_BYTES,
+        }
+    }
+}
+
+impl AnswerFormat {
+    /// Whether this format allows only a fixed, small set of results.
+    pub fn is_strict(&self) -> bool {
+        !matches!(self, AnswerFormat::Text { .. })
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            AnswerFormat::YesNo => "yes, no or inconclusive only".into(),
+            AnswerFormat::Choice { options } => format!("exactly one of: {}", options.join(" | ")),
+            AnswerFormat::Text { max_bytes } => {
+                format!("a verdict and a summary of at most {max_bytes} bytes")
+            }
+        }
+    }
+
+    /// Check a verdict against the format; strict formats keep only the answer.
+    pub fn enforce(&self, mut v: Verdict) -> Result<Verdict, String> {
+        match self {
+            AnswerFormat::YesNo => {
+                if !matches!(v.answer, Answer::Yes | Answer::No | Answer::Inconclusive) {
+                    return Err("answer must be yes, no or inconclusive".into());
+                }
+                Ok(Verdict {
+                    answer: v.answer,
+                    confidence: 0.0,
+                    summary: String::new(),
+                    clarification_request: None,
+                    choice: None,
+                })
+            }
+            AnswerFormat::Choice { options } => {
+                let c = v
+                    .choice
+                    .take()
+                    .ok_or("choice is required: one of the options")?;
+                if !options.contains(&c) {
+                    return Err(format!(
+                        "choice must be exactly one of: {}",
+                        options.join(" | ")
+                    ));
+                }
+                Ok(Verdict {
+                    answer: Answer::Inconclusive,
+                    confidence: 0.0,
+                    summary: String::new(),
+                    clarification_request: None,
+                    choice: Some(c),
+                })
+            }
+            AnswerFormat::Text { max_bytes } => {
+                let len = v.summary.len()
+                    + v.clarification_request
+                        .as_ref()
+                        .map(|c| c.len())
+                        .unwrap_or(0);
+                if len > *max_bytes as usize {
+                    return Err(format!("summary (plus any clarification request) must be at most {max_bytes} bytes; it is {len}"));
+                }
+                v.choice = None;
+                Ok(v)
+            }
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            AnswerFormat::YesNo => Ok(()),
+            AnswerFormat::Choice { options } => {
+                if options.len() < 2 || options.len() > 32 {
+                    return Err("give between 2 and 32 options".into());
+                }
+                if options.iter().any(|o| o.trim().is_empty() || o.len() > 200) {
+                    return Err("options must be non-empty and at most 200 bytes".into());
+                }
+                let mut u = options.clone();
+                u.sort();
+                u.dedup();
+                if u.len() != options.len() {
+                    return Err("options must be distinct".into());
+                }
+                Ok(())
+            }
+            AnswerFormat::Text { max_bytes } => {
+                if *max_bytes < 1 || *max_bytes > MAX_SUMMARY_BYTES {
+                    return Err(format!(
+                        "max_bytes must be between 1 and {MAX_SUMMARY_BYTES}"
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -236,6 +362,18 @@ pub struct CodeInfo {
     pub text_file_count: u64,
     pub total_bytes: u64,
     pub uploaded_at_ms: u64,
+    /// A hiding commitment to the tree: `code_commitment(salt, tree)`. The
+    /// auditor sees only this before release, so they can't test guesses
+    /// of the code against the tree hash; the certificate reveals the salt.
+    #[serde(default)]
+    pub commitment_sha256: String,
+    #[serde(default)]
+    pub commitment_salt: String,
+}
+
+/// sha256 of a domain tag, the 32-byte salt and the tree hash (both hex).
+pub fn code_commitment(salt_hex: &str, tree_sha256: &str) -> String {
+    crate::sha256_hex(format!("attest-code-commitment/1\n{salt_hex}\n{tree_sha256}").as_bytes())
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -258,6 +396,10 @@ pub struct ModelInfo {
     /// "builtin" (attest's own tool loop) or a jailed harness like "codex 0.164.0".
     #[serde(default)]
     pub agent: String,
+    /// Whose provider account (API key) was used. An auditor's account may
+    /// log everything the model saw; the auditee must have accepted that.
+    #[serde(default)]
+    pub key_from: Option<Role>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]

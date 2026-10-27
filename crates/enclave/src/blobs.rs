@@ -40,22 +40,38 @@ pub struct BlobClient {
 
 impl BlobClient {
     pub fn new(dev: bool, dev_addr: String) -> Self {
-        Self { dev, dev_addr, memory: None }
+        Self {
+            dev,
+            dev_addr,
+            memory: None,
+        }
     }
 
     #[cfg(test)]
     pub fn memory() -> Self {
-        Self { dev: true, dev_addr: String::new(), memory: Some(Arc::default()) }
+        Self {
+            dev: true,
+            dev_addr: String::new(),
+            memory: Some(Arc::default()),
+        }
     }
 
     async fn connect(&self) -> Result<Box<dyn crate::net::Io>> {
         if self.dev {
-            return Ok(Box::new(tokio::net::TcpStream::connect(&self.dev_addr).await.with_context(|| format!("dev blob store at {}", self.dev_addr))?));
+            return Ok(Box::new(
+                tokio::net::TcpStream::connect(&self.dev_addr)
+                    .await
+                    .with_context(|| format!("dev blob store at {}", self.dev_addr))?,
+            ));
         }
         #[cfg(target_os = "linux")]
         {
             let addr = tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_HOST, BLOB_VSOCK_PORT);
-            Ok(Box::new(tokio_vsock::VsockStream::connect(addr).await.context("parent blob store")?))
+            Ok(Box::new(
+                tokio_vsock::VsockStream::connect(addr)
+                    .await
+                    .context("parent blob store")?,
+            ))
         }
         #[cfg(not(target_os = "linux"))]
         bail!("vsock requires linux")
@@ -98,7 +114,9 @@ impl BlobClient {
                 _ => bail!("blob store error: {}", String::from_utf8_lossy(&buf)),
             }
         };
-        tokio::time::timeout(Duration::from_secs(120), fut).await.map_err(|_| anyhow!("blob store timed out"))?
+        tokio::time::timeout(Duration::from_secs(120), fut)
+            .await
+            .map_err(|_| anyhow!("blob store timed out"))?
     }
 
     pub async fn put(&self, id: &BlobId, data: &[u8]) -> Result<()> {
@@ -127,7 +145,11 @@ impl Sealer {
         let mut tag = [0u8; 8];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key);
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut tag);
-        Self { tag, cipher: ChaCha20Poly1305::new(Key::from_slice(&key)), session_id: session_id.to_string() }
+        Self {
+            tag,
+            cipher: ChaCha20Poly1305::new(Key::from_slice(&key)),
+            session_id: session_id.to_string(),
+        }
     }
 
     fn aad(&self, path: &str, digest: &[u8; 32]) -> Vec<u8> {
@@ -153,7 +175,13 @@ impl Sealer {
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
         let ct = self
             .cipher
-            .encrypt(Nonce::from_slice(&nonce), Payload { msg: plain, aad: &self.aad(path, digest) })
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: plain,
+                    aad: &self.aad(path, digest),
+                },
+            )
             .map_err(|_| anyhow!("encryption failed"))?;
         let mut out = Vec::with_capacity(12 + ct.len());
         out.extend_from_slice(&nonce);
@@ -165,13 +193,30 @@ impl Sealer {
         ensure!(sealed.len() >= 12 + 16, "sealed file too short");
         let plain = self
             .cipher
-            .decrypt(Nonce::from_slice(&sealed[..12]), Payload { msg: &sealed[12..], aad: &self.aad(path, digest) })
-            .map_err(|_| anyhow!("stored copy of {path} failed authentication (tampered or swapped by the host)"))?;
+            .decrypt(
+                Nonce::from_slice(&sealed[..12]),
+                Payload {
+                    msg: &sealed[12..],
+                    aad: &self.aad(path, digest),
+                },
+            )
+            .map_err(|_| {
+                anyhow!(
+                    "stored copy of {path} failed authentication (tampered or swapped by the host)"
+                )
+            })?;
         ensure!(plain.len() >= 4, "stored copy of {path} is malformed");
         let declared = u32::from_le_bytes(plain[..4].try_into().unwrap()) as usize;
-        ensure!(declared <= MAX_FILE_BYTES, "stored copy of {path} is too large");
-        let plain = lz4_flex::decompress_size_prepended(&plain).map_err(|_| anyhow!("stored copy of {path} is malformed"))?;
-        ensure!(&attest_core::sha256(&plain) == digest, "stored copy of {path} has the wrong content");
+        ensure!(
+            declared <= MAX_FILE_BYTES,
+            "stored copy of {path} is too large"
+        );
+        let plain = lz4_flex::decompress_size_prepended(&plain)
+            .map_err(|_| anyhow!("stored copy of {path} is malformed"))?;
+        ensure!(
+            &attest_core::sha256(&plain) == digest,
+            "stored copy of {path} has the wrong content"
+        );
         Ok(plain)
     }
 }
@@ -184,7 +229,10 @@ pub struct Cache {
 
 impl Cache {
     pub fn new(budget: usize) -> Self {
-        Self { budget, inner: Mutex::new((HashMap::new(), VecDeque::new(), 0)) }
+        Self {
+            budget,
+            inner: Mutex::new((HashMap::new(), VecDeque::new(), 0)),
+        }
     }
 
     pub fn get(&self, id: &BlobId) -> Option<Arc<Vec<u8>>> {

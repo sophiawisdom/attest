@@ -21,7 +21,9 @@ const PROXY_PORT: u16 = 8080;
 
 pub fn available() -> Vec<String> {
     let mut v = vec!["builtin".to_string()];
-    if cfg!(target_os = "linux") && std::path::Path::new(&format!("{IMAGE_ROOT}/usr/bin/codex")).exists() {
+    if cfg!(target_os = "linux")
+        && std::path::Path::new(&format!("{IMAGE_ROOT}/usr/bin/codex")).exists()
+    {
         v.push(format!("codex {CODEX_VERSION}"));
     }
     v
@@ -31,15 +33,25 @@ pub fn supports(agent: &str, provider: Provider) -> anyhow::Result<()> {
     match agent {
         "builtin" => Ok(()),
         "codex" => {
-            anyhow::ensure!(available().iter().any(|a| a.starts_with("codex")), "this server does not have the codex harness");
-            anyhow::ensure!(matches!(provider, Provider::Openai | Provider::Openrouter), "codex needs an OpenAI-compatible provider (openai or openrouter)");
+            anyhow::ensure!(
+                available().iter().any(|a| a.starts_with("codex")),
+                "this server does not have the codex harness"
+            );
+            anyhow::ensure!(
+                matches!(provider, Provider::Openai | Provider::Openrouter),
+                "codex needs an OpenAI-compatible provider (openai or openrouter)"
+            );
             Ok(())
         }
         other => anyhow::bail!("unknown agent {other:?} (builtin, codex)"),
     }
 }
 
-pub fn codex_prompt(question: &str, previous: Option<(&Verdict, &str)>) -> String {
+pub fn codex_prompt(
+    question: &str,
+    format: &AnswerFormat,
+    previous: Option<(&Verdict, &str)>,
+) -> String {
     let mut p = format!(
         "{}\n\nYou are running as a command-line coding agent with a shell. The repository is at /repo (read-only, your working directory). /work and /tmp are writable scratch space, 20 MB each. There is no network access except to your model; do not try to install anything.\n\nQuestion from the auditor:\n<question>\n{question}\n</question>\n",
         attest_core::harness::SYSTEM_PROMPT.split("\n\nTools:").next().unwrap_or("")
@@ -52,30 +64,21 @@ pub fn codex_prompt(question: &str, previous: Option<(&Verdict, &str)>) -> Strin
             v.summary
         ));
     }
-    p.push_str(
-        "\nWhen you are done, write your verdict as JSON to /work/verdict.json with exactly these keys: \"answer\" (one of \"yes\", \"no\", \"inconclusive\", \"needs_clarification\"), \"confidence\" (0 to 1), \"summary\" (for the auditor, per the rules above), and \"clarification_request\" (a string, only with needs_clarification). Then stop.",
-    );
+    p.push_str(&format!("\nAnswer format agreed with the auditee: {}. The enclave rejects any verdict outside it.\n", format.describe()));
+    p.push_str(match format {
+        AnswerFormat::YesNo => "\nWhen you are done, write your verdict as JSON to /work/verdict.json: {\"answer\": \"yes\" | \"no\" | \"inconclusive\"} and nothing else. Then stop.",
+        AnswerFormat::Choice { .. } => "\nWhen you are done, write your verdict as JSON to /work/verdict.json: {\"choice\": \"<exactly one of the options>\"} and nothing else. Then stop.",
+        AnswerFormat::Text { .. } => "\nWhen you are done, write your verdict as JSON to /work/verdict.json with exactly these keys: \"answer\" (one of \"yes\", \"no\", \"inconclusive\", \"needs_clarification\"), \"confidence\" (0 to 1), \"summary\" (for the auditor, per the rules above, within the byte limit), and \"clarification_request\" (a string, only with needs_clarification). Then stop.",
+    });
     p
 }
 
-fn parse_verdict(text: &str) -> Option<Verdict> {
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    let v: Value = serde_json::from_str(&text[start..=end]).ok()?;
-    let answer = match v["answer"].as_str()? {
-        "yes" => Answer::Yes,
-        "no" => Answer::No,
-        "inconclusive" => Answer::Inconclusive,
-        "needs_clarification" => Answer::NeedsClarification,
-        _ => return None,
-    };
-    let summary: String = v["summary"].as_str()?.chars().take(20_000).collect();
-    Some(Verdict {
-        answer,
-        confidence: v["confidence"].as_f64().unwrap_or(0.0).clamp(0.0, 1.0),
-        summary,
-        clarification_request: v["clarification_request"].as_str().filter(|s| !s.trim().is_empty()).map(|s| s.chars().take(5000).collect()),
-    })
+fn parse_verdict(text: &str, format: &AnswerFormat) -> Result<Verdict, String> {
+    let start = text.find('{').ok_or("no JSON verdict")?;
+    let end = text.rfind('}').ok_or("no JSON verdict")?;
+    let v: Value = serde_json::from_str(&text[start..=end])
+        .map_err(|_| "verdict is not valid JSON".to_string())?;
+    crate::run::parse_verdict(&v, format).map_err(|e| e.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -87,6 +90,7 @@ pub async fn run_codex(
     model: &str,
     api_key: &str,
     prompt: String,
+    format: &AnswerFormat,
     timeout: Duration,
     progress: Arc<dyn Fn(Vec<Value>) + Send + Sync>,
 ) -> AgentOutput {
@@ -102,7 +106,9 @@ pub async fn run_codex(
     };
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (net, run_id, bundle, provider, model, api_key, prompt, timeout, progress);
+        let _ = (
+            net, run_id, bundle, provider, model, api_key, prompt, format, timeout, progress,
+        );
         return fail("the codex harness needs a Linux enclave".into());
     }
     #[cfg(target_os = "linux")]
@@ -111,12 +117,23 @@ pub async fn run_codex(
         let scratch = format!("/jails/{run_id}");
         let _ = std::fs::create_dir_all(&scratch);
         let socket = format!("{scratch}/proxy.sock");
-        let proxy = match ModelProxy::start(net, provider, model.to_string(), api_key.to_string(), &socket, Arc::new(move |e| p2(vec![e]))).await {
+        let proxy = match ModelProxy::start(
+            net,
+            provider,
+            model.to_string(),
+            api_key.to_string(),
+            &socket,
+            Arc::new(move |e| p2(vec![e])),
+        )
+        .await
+        {
             Ok(p) => p,
             Err(e) => return fail(format!("model proxy: {e:#}")),
         };
         let repo = format!("{scratch}/repo");
-        progress(vec![json!({"type": "harness", "content": format!("Preparing the repository for codex {CODEX_VERSION} ({} files)...", bundle.info.file_count)})]);
+        progress(vec![
+            json!({"type": "harness", "content": format!("Preparing the repository for codex {CODEX_VERSION} ({} files)...", bundle.info.file_count)}),
+        ]);
         if let Err(e) = crate::jail::materialize(bundle, &repo).await {
             crate::jail::unmount(&repo);
             return fail(format!("preparing the repository: {e:#}"));
@@ -129,13 +146,22 @@ pub async fn run_codex(
             image_root: IMAGE_ROOT.into(),
             scratch: scratch.clone(),
             argv: vec![
-                "/usr/bin/codex".into(), "exec".into(), "--skip-git-repo-check".into(),
-                "--dangerously-bypass-approvals-and-sandbox".into(), "--color".into(), "never".into(),
-                "-m".into(), model.into(),
-                "-c".into(), "model_provider=\"attest\"".into(),
-                "-c".into(), provider_cfg,
-                "-c".into(), "check_for_update_on_startup=false".into(),
-                "--output-last-message".into(), "/work/last-message.txt".into(),
+                "/usr/bin/codex".into(),
+                "exec".into(),
+                "--skip-git-repo-check".into(),
+                "--dangerously-bypass-approvals-and-sandbox".into(),
+                "--color".into(),
+                "never".into(),
+                "-m".into(),
+                model.into(),
+                "-c".into(),
+                "model_provider=\"attest\"".into(),
+                "-c".into(),
+                provider_cfg,
+                "-c".into(),
+                "check_for_update_on_startup=false".into(),
+                "--output-last-message".into(),
+                "/work/last-message.txt".into(),
                 prompt,
             ],
             env: vec![
@@ -175,14 +201,32 @@ pub async fn run_codex(
             ..Default::default()
         };
         activity.tool_calls = usage.calls.saturating_sub(1);
-        progress(vec![json!({"type": "files_read", "paths": files_read.keys().collect::<Vec<_>>()})]);
+        progress(vec![
+            json!({"type": "files_read", "paths": files_read.keys().collect::<Vec<_>>()}),
+        ]);
         let (verdict, outcome) = match out {
             Ok((exit, files)) => {
-                let v = files.get("verdict.json").and_then(|t| parse_verdict(t)).or_else(|| files.get("last-message.txt").and_then(|t| parse_verdict(t)));
-                match (&v, exit) {
-                    (Some(_), _) => (v, Outcome::Completed),
-                    (None, 0) => (None, Outcome::Error { message: "codex finished without writing a verdict".into() }),
-                    (None, c) => (None, Outcome::Error { message: format!("codex exited with status {c}") }),
+                let parsed = match files.get("verdict.json") {
+                    Some(t) => parse_verdict(t, format),
+                    None => files
+                        .get("last-message.txt")
+                        .map(|t| parse_verdict(t, format))
+                        .unwrap_or(Err("no verdict file".into())),
+                };
+                match (parsed, exit) {
+                    (Ok(v), _) => (Some(v), Outcome::Completed),
+                    (Err(why), 0) => (
+                        None,
+                        Outcome::Error {
+                            message: format!("codex did not produce a valid verdict: {why}"),
+                        },
+                    ),
+                    (Err(_), c) => (
+                        None,
+                        Outcome::Error {
+                            message: format!("codex exited with status {c}"),
+                        },
+                    ),
                 }
             }
             Err(e) => (None, Outcome::Error { message: e }),
@@ -202,7 +246,11 @@ pub async fn run_codex(
 
 /// Run the jail executor, streaming its log into the trace.
 #[cfg(target_os = "linux")]
-async fn run_jailed(spec: &crate::jail::Spec, timeout: Duration, progress: Arc<dyn Fn(Vec<Value>) + Send + Sync>) -> Result<(i32, BTreeMap<String, String>), String> {
+async fn run_jailed(
+    spec: &crate::jail::Spec,
+    timeout: Duration,
+    progress: Arc<dyn Fn(Vec<Value>) + Send + Sync>,
+) -> Result<(i32, BTreeMap<String, String>), String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut child = tokio::process::Command::new(exe)
@@ -228,12 +276,16 @@ async fn run_jailed(spec: &crate::jail::Spec, timeout: Duration, progress: Arc<d
             budget = budget.saturating_sub(l.len());
             batch.push(l);
             if batch.len() >= 20 {
-                p2(vec![json!({"type": "harness_log", "content": batch.join("\n")})]);
+                p2(vec![
+                    json!({"type": "harness_log", "content": batch.join("\n")}),
+                ]);
                 batch.clear();
             }
         }
         if !batch.is_empty() {
-            p2(vec![json!({"type": "harness_log", "content": batch.join("\n")})]);
+            p2(vec![
+                json!({"type": "harness_log", "content": batch.join("\n")}),
+            ]);
         }
     });
     let mut stdout = BufReader::new(child.stdout.take().unwrap()).lines();
@@ -252,15 +304,26 @@ async fn run_jailed(spec: &crate::jail::Spec, timeout: Duration, progress: Arc<d
         res
     })
     .await;
-    let _ = log_task.await;
+    if r.is_err() {
+        // Kill first; the jail's processes die with it (parent-death signal).
+        let _ = child.kill().await;
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(10), log_task).await;
     match r {
-        Err(_) => {
-            let _ = child.kill().await;
-            Err(format!("codex did not finish within {} minutes", timeout.as_secs() / 60))
-        }
+        Err(_) => Err(format!(
+            "codex did not finish within {} minutes",
+            timeout.as_secs() / 60
+        )),
         Ok(None) => Err("the jail ended without a result".into()),
         Ok(Some(v)) => {
-            let files = v["files"].as_object().map(|m| m.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect()).unwrap_or_default();
+            let files = v["files"]
+                .as_object()
+                .map(|m| {
+                    m.iter()
+                        .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
             Ok((v["exit"].as_i64().unwrap_or(-1) as i32, files))
         }
     }
@@ -272,8 +335,32 @@ mod tests {
 
     #[test]
     fn verdict_parsing() {
-        let v = parse_verdict("done.\n{\"answer\": \"no\", \"confidence\": 0.7, \"summary\": \"s\"}\n").unwrap();
+        let text = AnswerFormat::default();
+        let v = parse_verdict(
+            "done.\n{\"answer\": \"no\", \"confidence\": 0.7, \"summary\": \"s\"}\n",
+            &text,
+        )
+        .unwrap();
         assert_eq!(v.answer, Answer::No);
-        assert!(parse_verdict("{\"answer\": \"maybe\", \"summary\": \"s\"}").is_none());
+        assert!(parse_verdict("{\"answer\": \"maybe\", \"summary\": \"s\"}", &text).is_err());
+        let yn = parse_verdict(
+            "{\"answer\": \"yes\", \"summary\": \"secret code here\"}",
+            &AnswerFormat::YesNo,
+        )
+        .unwrap();
+        assert!(yn.summary.is_empty(), "strict formats drop text");
+        let ch = AnswerFormat::Choice {
+            options: vec!["a".into(), "b".into()],
+        };
+        assert_eq!(
+            parse_verdict("{\"choice\": \"b\"}", &ch)
+                .unwrap()
+                .choice
+                .as_deref(),
+            Some("b")
+        );
+        assert!(parse_verdict("{\"choice\": \"c\"}", &ch).is_err());
+        let short = AnswerFormat::Text { max_bytes: 5 };
+        assert!(parse_verdict("{\"answer\": \"no\", \"summary\": \"too long\"}", &short).is_err());
     }
 }

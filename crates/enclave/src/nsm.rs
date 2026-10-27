@@ -31,7 +31,12 @@ impl Attester {
     }
 
     /// Attestation document over (user_data, public_key, nonce). None in dev mode.
-    pub fn attest(&self, user_data: &[u8], public_key: &[u8], nonce: Option<&[u8]>) -> Result<Option<Vec<u8>>> {
+    pub fn attest(
+        &self,
+        user_data: &[u8],
+        public_key: &[u8],
+        nonce: Option<&[u8]>,
+    ) -> Result<Option<Vec<u8>>> {
         #[cfg(target_os = "linux")]
         {
             use aws_nitro_enclaves_nsm_api::api::{Request, Response};

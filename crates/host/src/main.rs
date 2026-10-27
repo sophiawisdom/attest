@@ -88,7 +88,9 @@ async fn main() -> Result<()> {
 }
 
 async fn forward_server(args: Args) -> Result<()> {
-    let l = TcpListener::bind(&args.listen).await.with_context(|| format!("binding {}", args.listen))?;
+    let l = TcpListener::bind(&args.listen)
+        .await
+        .with_context(|| format!("binding {}", args.listen))?;
     log(&format!("forwarding {} -> enclave", args.listen));
     loop {
         let (mut client, peer) = l.accept().await?;
@@ -96,7 +98,12 @@ async fn forward_server(args: Args) -> Result<()> {
         tokio::spawn(async move {
             #[cfg(target_os = "linux")]
             {
-                match tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(args.enclave_cid, args.enclave_port)).await {
+                match tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(
+                    args.enclave_cid,
+                    args.enclave_port,
+                ))
+                .await
+                {
                     Ok(mut e) => {
                         let _ = tokio::io::copy_bidirectional(&mut client, &mut e).await;
                     }
@@ -114,8 +121,20 @@ async fn forward_server(args: Args) -> Result<()> {
 
 fn public(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v) => !(v.is_private() || v.is_loopback() || v.is_link_local() || v.is_unspecified() || v.is_broadcast() || v.octets()[0] == 100 && (v.octets()[1] & 0xc0) == 64),
-        IpAddr::V6(v) => !(v.is_loopback() || v.is_unspecified() || (v.segments()[0] & 0xfe00) == 0xfc00 || (v.segments()[0] & 0xffc0) == 0xfe80),
+        IpAddr::V4(v) => {
+            !(v.is_private()
+                || v.is_loopback()
+                || v.is_link_local()
+                || v.is_unspecified()
+                || v.is_broadcast()
+                || v.octets()[0] == 100 && (v.octets()[1] & 0xc0) == 64)
+        }
+        IpAddr::V6(v) => {
+            !(v.is_loopback()
+                || v.is_unspecified()
+                || (v.segments()[0] & 0xfe00) == 0xfc00
+                || (v.segments()[0] & 0xffc0) == 0xfe80)
+        }
     }
 }
 
@@ -123,19 +142,32 @@ async fn handle_tunnel<S: Io>(args: Args, s: S) -> Result<()> {
     let mut r = BufReader::new(s);
     let mut line = String::new();
     r.read_line(&mut line).await?;
-    let target = line.trim().strip_prefix("CONNECT ").context("expected CONNECT")?.to_string();
+    let target = line
+        .trim()
+        .strip_prefix("CONNECT ")
+        .context("expected CONNECT")?
+        .to_string();
     let (host, port) = target.rsplit_once(':').context("expected host:port")?;
     let port: u16 = port.parse()?;
-    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port)).await.map(|a| a.collect()).unwrap_or_default();
-    let ok_addr = addrs.into_iter().find(|a| (port == 443 && public(a.ip())) || (args.dev && a.ip().is_loopback()));
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map(|a| a.collect())
+        .unwrap_or_default();
+    let ok_addr = addrs
+        .into_iter()
+        .find(|a| (port == 443 && public(a.ip())) || (args.dev && a.ip().is_loopback()));
     let Some(addr) = ok_addr else {
-        r.get_mut().write_all(b"ERR destination not allowed\n").await?;
+        r.get_mut()
+            .write_all(b"ERR destination not allowed\n")
+            .await?;
         bail!("refused tunnel to {target}");
     };
     let mut up = match TcpStream::connect(addr).await {
         Ok(u) => u,
         Err(e) => {
-            r.get_mut().write_all(format!("ERR {e}\n").as_bytes()).await?;
+            r.get_mut()
+                .write_all(format!("ERR {e}\n").as_bytes())
+                .await?;
             return Err(e.into());
         }
     };
@@ -161,7 +193,10 @@ async fn tunnel_server(args: Args) -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        let l = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_ANY, args.tunnel_port))?;
+        let l = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(
+            tokio_vsock::VMADDR_CID_ANY,
+            args.tunnel_port,
+        ))?;
         log(&format!("tunnel on vsock {}", args.tunnel_port));
         loop {
             let (s, _) = l.accept().await?;
@@ -187,7 +222,10 @@ async fn config_server(args: Args) -> Result<()> {
     serde_json_check(&body)?;
     #[cfg(target_os = "linux")]
     {
-        let l = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_ANY, args.config_port))?;
+        let l = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(
+            tokio_vsock::VMADDR_CID_ANY,
+            args.config_port,
+        ))?;
         log(&format!("config on vsock {}", args.config_port));
         loop {
             let (mut s, _) = l.accept().await?;
@@ -199,7 +237,8 @@ async fn config_server(args: Args) -> Result<()> {
                 // Keep the socket open until the enclave closes it, so it
                 // can finish reading.
                 let mut sink = [0u8; 64];
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(30), s.read(&mut sink)).await;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(30), s.read(&mut sink))
+                    .await;
             });
         }
     }
@@ -228,7 +267,8 @@ struct Blobs {
 
 impl Blobs {
     fn path(&self, id: &[u8]) -> std::path::PathBuf {
-        self.dir.join(id.iter().map(|b| format!("{b:02x}")).collect::<String>())
+        self.dir
+            .join(id.iter().map(|b| format!("{b:02x}")).collect::<String>())
     }
 }
 
@@ -296,7 +336,11 @@ async fn blob_server(args: Args) -> Result<()> {
         std::fs::remove_dir_all(&dir).with_context(|| format!("clearing {}", dir.display()))?;
     }
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let b = std::sync::Arc::new(Blobs { dir, quota: args.blob_quota_gib << 30, used: std::sync::Mutex::new(0) });
+    let b = std::sync::Arc::new(Blobs {
+        dir,
+        quota: args.blob_quota_gib << 30,
+        used: std::sync::Mutex::new(0),
+    });
     if args.dev {
         let l = TcpListener::bind(&args.dev_blobs).await?;
         log(&format!("dev blob store on {}", args.dev_blobs));
@@ -312,7 +356,10 @@ async fn blob_server(args: Args) -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        let l = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_ANY, 5005))?;
+        let l = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(
+            tokio_vsock::VMADDR_CID_ANY,
+            5005,
+        ))?;
         log("blob store on vsock 5005");
         loop {
             let (s, _) = l.accept().await?;
@@ -334,13 +381,20 @@ async fn blob_server(args: Args) -> Result<()> {
 async fn log_server() -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        let l = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_ANY, 5004))?;
+        let l = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(
+            tokio_vsock::VMADDR_CID_ANY,
+            5004,
+        ))?;
         loop {
             let (s, _) = l.accept().await?;
             tokio::spawn(async move {
                 let mut lines = BufReader::new(s).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    let line: String = line.chars().filter(|c| !c.is_control()).take(2000).collect();
+                    let line: String = line
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .take(2000)
+                        .collect();
                     eprintln!("{line}");
                 }
             });
@@ -355,7 +409,11 @@ async fn log_server() -> Result<()> {
 /// One plain-HTTP request to the instance metadata service.
 async fn imds(method: &str, path: &str, headers: &[(&str, &str)]) -> Result<String> {
     use tokio::io::AsyncReadExt;
-    let mut s = tokio::time::timeout(std::time::Duration::from_secs(3), TcpStream::connect("169.254.169.254:80")).await??;
+    let mut s = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        TcpStream::connect("169.254.169.254:80"),
+    )
+    .await??;
     let mut req = format!("{method} {path} HTTP/1.0\r\nHost: 169.254.169.254\r\n");
     for (k, v) in headers {
         req.push_str(&format!("{k}: {v}\r\n"));
@@ -363,7 +421,11 @@ async fn imds(method: &str, path: &str, headers: &[(&str, &str)]) -> Result<Stri
     req.push_str("\r\n");
     s.write_all(req.as_bytes()).await?;
     let mut buf = Vec::new();
-    tokio::time::timeout(std::time::Duration::from_secs(3), (&mut s).take(64 * 1024).read_to_end(&mut buf)).await??;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        (&mut s).take(64 * 1024).read_to_end(&mut buf),
+    )
+    .await??;
     let text = String::from_utf8_lossy(&buf).into_owned();
     let (head, body) = text.split_once("\r\n\r\n").context("bad IMDS response")?;
     if !head.starts_with("HTTP/1.0 200") && !head.starts_with("HTTP/1.1 200") {
@@ -373,14 +435,35 @@ async fn imds(method: &str, path: &str, headers: &[(&str, &str)]) -> Result<Stri
 }
 
 async fn role_credentials() -> Result<Vec<u8>> {
-    let token = imds("PUT", "/latest/api/token", &[("X-aws-ec2-metadata-token-ttl-seconds", "60")]).await?;
+    let token = imds(
+        "PUT",
+        "/latest/api/token",
+        &[("X-aws-ec2-metadata-token-ttl-seconds", "60")],
+    )
+    .await?;
     let h = [("X-aws-ec2-metadata-token", token.trim())];
     let role = imds("GET", "/latest/meta-data/iam/security-credentials/", &h).await?;
-    let role = role.lines().next().context("no instance role attached")?.trim().to_string();
-    if role.is_empty() || !role.chars().all(|c| c.is_ascii_alphanumeric() || "_+=,.@-".contains(c)) {
+    let role = role
+        .lines()
+        .next()
+        .context("no instance role attached")?
+        .trim()
+        .to_string();
+    if role.is_empty()
+        || !role
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_+=,.@-".contains(c))
+    {
         bail!("invalid role name");
     }
-    let v: serde_json::Value = serde_json::from_str(&imds("GET", &format!("/latest/meta-data/iam/security-credentials/{role}"), &h).await?)?;
+    let v: serde_json::Value = serde_json::from_str(
+        &imds(
+            "GET",
+            &format!("/latest/meta-data/iam/security-credentials/{role}"),
+            &h,
+        )
+        .await?,
+    )?;
     let out = serde_json::json!({
         "access_key_id": v["AccessKeyId"],
         "secret_access_key": v["SecretAccessKey"],
@@ -394,7 +477,10 @@ async fn role_credentials() -> Result<Vec<u8>> {
 async fn credentials_server(args: Args) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        let l = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_ANY, args.credentials_port))?;
+        let l = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(
+            tokio_vsock::VMADDR_CID_ANY,
+            args.credentials_port,
+        ))?;
         log(&format!("credentials on vsock {}", args.credentials_port));
         loop {
             let (mut s, _) = l.accept().await?;

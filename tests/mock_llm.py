@@ -26,6 +26,8 @@ def respond(messages):
             "answer": "needs_clarification", "confidence": 0.2,
             "summary": "The repository has no single training pipeline.",
             "clarification_request": "Name the training entry point you mean, or ask about all of them."})]
+    if "CHOICE" in question:
+        return "", [tool_call(f"{uid}_ch", "submit_verdict", {"choice": "option b"})]
     if "PYTHON" in question:
         if n == 0:
             code = ("import os\nsrc = open('/repo/trainer/train.py').read()\n"

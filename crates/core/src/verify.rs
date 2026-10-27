@@ -40,8 +40,14 @@ pub fn verify_enclave(
             if !policy.allow_dev {
                 bail!("enclave is in dev mode: nothing is attested (dev-mode enclaves are only accepted when explicitly allowed)");
             }
-            warnings.push("DEV MODE: no hardware attestation. Nothing about this enclave is proven.".into());
-            return Ok(VerifiedEnclave { info, doc: None, warnings });
+            warnings.push(
+                "DEV MODE: no hardware attestation. Nothing about this enclave is proven.".into(),
+            );
+            return Ok(VerifiedEnclave {
+                info,
+                doc: None,
+                warnings,
+            });
         }
         "nitro" => {}
         m => bail!("unknown enclave mode {m:?}"),
@@ -50,11 +56,17 @@ pub fn verify_enclave(
     let bytes = base64::engine::general_purpose::STANDARD.decode(doc_b64)?;
     let doc = nitro::verify_document(&bytes)?;
 
-    let user_data = doc.user_data.as_ref().ok_or_else(|| anyhow!("attestation document has no user_data"))?;
+    let user_data = doc
+        .user_data
+        .as_ref()
+        .ok_or_else(|| anyhow!("attestation document has no user_data"))?;
     if user_data.as_ref() != crate::sha256(info_json.as_bytes()).as_slice() {
         bail!("attestation document does not commit to this enclave info");
     }
-    let pk = doc.public_key.as_ref().ok_or_else(|| anyhow!("attestation document has no public_key"))?;
+    let pk = doc
+        .public_key
+        .as_ref()
+        .ok_or_else(|| anyhow!("attestation document has no public_key"))?;
     if hex::encode(pk.as_ref()) != info.signing_public_key.to_ascii_lowercase() {
         bail!("attestation document public_key is not the enclave signing key");
     }
@@ -65,7 +77,9 @@ pub fn verify_enclave(
     }
     let zero = |i| doc.pcr_hex(i).chars().all(|c| c == '0');
     if zero(0) && zero(1) && zero(2) {
-        bail!("PCR0-2 are zero: enclave is running in debug mode, its memory is readable by the host");
+        bail!(
+            "PCR0-2 are zero: enclave is running in debug mode, its memory is readable by the host"
+        );
     }
     if info.harness.system_prompt_sha256 != crate::harness::system_prompt_sha256() {
         warnings.push(format!(
@@ -84,7 +98,11 @@ pub fn verify_enclave(
              Provide pcrs.json from a reproducible build, or explicitly accept any Nitro enclave"
         ),
     }
-    Ok(VerifiedEnclave { info, doc: Some(doc), warnings })
+    Ok(VerifiedEnclave {
+        info,
+        doc: Some(doc),
+        warnings,
+    })
 }
 
 pub struct VerifiedCertificate {
@@ -93,12 +111,25 @@ pub struct VerifiedCertificate {
     pub warnings: Vec<String>,
 }
 
-pub fn verify_certificate(cert: &Certificate, policy: &EnclavePolicy) -> Result<VerifiedCertificate> {
-    let enclave = verify_enclave(&cert.enclave_info_json, cert.boot_document_b64.as_deref(), None, policy)?;
-    let body: CertificateBody = cert.signed.open_by(DOMAIN_CERTIFICATE, &enclave.info.signing_public_key)?;
+pub fn verify_certificate(
+    cert: &Certificate,
+    policy: &EnclavePolicy,
+) -> Result<VerifiedCertificate> {
+    let enclave = verify_enclave(
+        &cert.enclave_info_json,
+        cert.boot_document_b64.as_deref(),
+        None,
+        policy,
+    )?;
+    let body: CertificateBody = cert
+        .signed
+        .open_by(DOMAIN_CERTIFICATE, &enclave.info.signing_public_key)?;
     let m = &body.manifest;
     if m.boot_id != enclave.info.boot_id {
         bail!("manifest boot id does not match the enclave that signed it");
+    }
+    if m.code.commitment_sha256 != code_commitment(&m.code.commitment_salt, &m.code.tree_sha256) {
+        bail!("the code commitment shown before release does not open to this tree");
     }
     if crate::sha256_hex(m.question.text.as_bytes()) != m.question.text_sha256 {
         bail!("manifest question text hash mismatch");
@@ -111,7 +142,11 @@ pub fn verify_certificate(cert: &Certificate, policy: &EnclavePolicy) -> Result<
         }
     }
     let warnings = manifest_warnings(m);
-    Ok(VerifiedCertificate { enclave, body, warnings })
+    Ok(VerifiedCertificate {
+        enclave,
+        body,
+        warnings,
+    })
 }
 
 fn categories(c: &ScanCounts) -> String {
@@ -131,8 +166,14 @@ pub fn manifest_warnings(m: &Manifest) -> Vec<String> {
         Outcome::StepLimit => w.push("the agent hit its step limit before answering".into()),
         Outcome::Error { message } => w.push(format!("the run failed: {message}")),
     }
+    if m.model.key_from == Some(Role::Auditor) {
+        w.push("the auditor's own provider account was used: it may have logged everything the model saw (the auditee accepted this)".into());
+    }
     if m.model.fine_tuned {
-        w.push(format!("model {} is a fine-tune (the question allowed it)", m.model.requested_model));
+        w.push(format!(
+            "model {} is a fine-tune (the question allowed it)",
+            m.model.requested_model
+        ));
     }
     let org = m.affidavit.organization.to_ascii_lowercase();
     let provider_org = match m.model.provider {
@@ -151,11 +192,21 @@ pub fn manifest_warnings(m: &Manifest) -> Vec<String> {
     if m.model.provider == Provider::Openrouter {
         w.push(format!(
             "routed through OpenRouter (zero data retention {}); upstream providers: {}",
-            if m.model.openrouter_zdr == Some(true) { "requested" } else { "not requested" },
-            if m.model.upstream_providers.is_empty() { "unreported".into() } else { m.model.upstream_providers.join(", ") }
+            if m.model.openrouter_zdr == Some(true) {
+                "requested"
+            } else {
+                "not requested"
+            },
+            if m.model.upstream_providers.is_empty() {
+                "unreported".into()
+            } else {
+                m.model.upstream_providers.join(", ")
+            }
         ));
     }
-    if m.model.response_models.iter().any(|r| !r.starts_with(&m.model.requested_model) && !m.model.requested_model.starts_with(r.as_str())) {
+    if m.model.response_models.iter().any(|r| {
+        !r.starts_with(&m.model.requested_model) && !m.model.requested_model.starts_with(r.as_str())
+    }) {
         w.push(format!(
             "provider reported model(s) {} for requested {}",
             m.model.response_models.join(", "),
@@ -164,9 +215,16 @@ pub fn manifest_warnings(m: &Manifest) -> Vec<String> {
     }
     let h = &m.history;
     if h.prior_runs_in_session > 0 {
-        w.push(format!("{} earlier run(s) in this session", h.prior_runs_in_session));
+        w.push(format!(
+            "{} earlier run(s) in this session",
+            h.prior_runs_in_session
+        ));
     }
-    let other_trees = h.prior_code_trees_in_session.iter().filter(|c| *c != &m.code.tree_sha256).count();
+    let other_trees = h
+        .prior_code_trees_in_session
+        .iter()
+        .filter(|c| *c != &m.code.tree_sha256)
+        .count();
     if other_trees > 0 {
         w.push(format!("the code changed between runs: {other_trees} other version(s) were used earlier in this session"));
     }
@@ -192,7 +250,9 @@ pub fn manifest_warnings(m: &Manifest) -> Vec<String> {
     }
     let blinded = m.auditor_messages.iter().filter(|x| x.blinded).count();
     if blinded > 0 {
-        w.push(format!("{blinded} blinded auditor message(s) the auditee could not read"));
+        w.push(format!(
+            "{blinded} blinded auditor message(s) the auditee could not read"
+        ));
     }
     w
 }

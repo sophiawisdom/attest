@@ -20,7 +20,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 #[derive(Parser)]
-#[command(name = "attest", about = "Attested LLM code audits. See /agents.md on the server for the protocol.")]
+#[command(
+    name = "attest",
+    about = "Attested LLM code audits. See /agents.md on the server for the protocol."
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -42,10 +45,16 @@ struct PolicyArgs {
 impl PolicyArgs {
     fn policy(&self) -> Result<EnclavePolicy> {
         let expected = match &self.pcrs {
-            Some(p) => Some(ExpectedPcrs::from_json(&std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?)?),
+            Some(p) => Some(ExpectedPcrs::from_json(
+                &std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?,
+            )?),
             None => None,
         };
-        Ok(EnclavePolicy { expected, allow_dev: self.allow_dev, skip_measurement: self.skip_measurement })
+        Ok(EnclavePolicy {
+            expected,
+            allow_dev: self.allow_dev,
+            skip_measurement: self.skip_measurement,
+        })
     }
 }
 
@@ -102,18 +111,47 @@ struct Capture {
 }
 
 impl ServerCertVerifier for Capture {
-    fn verify_server_cert(&self, end: &CertificateDer<'_>, _: &[CertificateDer<'_>], _: &ServerName<'_>, _: &[u8], _: UnixTime) -> Result<ServerCertVerified, rustls::Error> {
+    fn verify_server_cert(
+        &self,
+        end: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
         *self.cert.lock().unwrap() = Some(end.to_vec());
         Ok(ServerCertVerified::assertion())
     }
-    fn verify_tls12_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(m, c, d, &self.provider.signature_verification_algorithms)
+    fn verify_tls12_signature(
+        &self,
+        m: &[u8],
+        c: &CertificateDer<'_>,
+        d: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            m,
+            c,
+            d,
+            &self.provider.signature_verification_algorithms,
+        )
     }
-    fn verify_tls13_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(m, c, d, &self.provider.signature_verification_algorithms)
+    fn verify_tls13_signature(
+        &self,
+        m: &[u8],
+        c: &CertificateDer<'_>,
+        d: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            m,
+            c,
+            d,
+            &self.provider.signature_verification_algorithms,
+        )
     }
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.provider.signature_verification_algorithms.supported_schemes()
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -127,10 +165,15 @@ struct Conn {
 
 impl Conn {
     async fn open(base: &url::Url) -> Result<Self> {
-        let host = base.host_str().ok_or_else(|| anyhow!("URL has no host"))?.to_string();
+        let host = base
+            .host_str()
+            .ok_or_else(|| anyhow!("URL has no host"))?
+            .to_string();
         let https = base.scheme() == "https";
         let port = base.port_or_known_default().unwrap_or(443);
-        let tcp = tokio::net::TcpStream::connect((host.as_str(), port)).await.with_context(|| format!("connecting to {host}:{port}"))?;
+        let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
+            .await
+            .with_context(|| format!("connecting to {host}:{port}"))?;
         let host_header = match base.port() {
             Some(p) => format!("{host}:{p}"),
             None => host.clone(),
@@ -138,10 +181,17 @@ impl Conn {
         if !https {
             let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp)).await?;
             tokio::spawn(conn);
-            return Ok(Self { sender, host: host_header, spki_sha256: None });
+            return Ok(Self {
+                sender,
+                host: host_header,
+                spki_sha256: None,
+            });
         }
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let capture = Arc::new(Capture { provider: provider.clone(), cert: Mutex::new(None) });
+        let capture = Arc::new(Capture {
+            provider: provider.clone(),
+            cert: Mutex::new(None),
+        });
         let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()?
             .dangerous()
@@ -149,15 +199,36 @@ impl Conn {
             .with_no_client_auth();
         cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
         let name = ServerName::try_from(host.clone())?;
-        let tls = tokio_rustls::TlsConnector::from(Arc::new(cfg)).connect(name, tcp).await.context("TLS handshake")?;
-        let cert = capture.cert.lock().unwrap().clone().ok_or_else(|| anyhow!("server sent no certificate"))?;
+        let tls = tokio_rustls::TlsConnector::from(Arc::new(cfg))
+            .connect(name, tcp)
+            .await
+            .context("TLS handshake")?;
+        let cert = capture
+            .cert
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow!("server sent no certificate"))?;
         let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls)).await?;
         tokio::spawn(conn);
-        Ok(Self { sender, host: host_header, spki_sha256: Some(spki_sha256_of_cert(&cert)?) })
+        Ok(Self {
+            sender,
+            host: host_header,
+            spki_sha256: Some(spki_sha256_of_cert(&cert)?),
+        })
     }
 
-    async fn call(&mut self, method: &str, path: &str, token: Option<&str>, body: Option<(Vec<u8>, &str)>) -> Result<Value> {
-        let mut req = hyper::Request::builder().method(method).uri(path).header("host", &self.host);
+    async fn call(
+        &mut self,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: Option<(Vec<u8>, &str)>,
+    ) -> Result<Value> {
+        let mut req = hyper::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", &self.host);
         if let Some(t) = token {
             req = req.header("authorization", format!("Bearer {t}"));
         }
@@ -171,9 +242,14 @@ impl Conn {
         let resp = self.sender.send_request(req.body(body)?).await?;
         let status = resp.status();
         let bytes = resp.into_body().collect().await?.to_bytes();
-        let v: Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({"error": String::from_utf8_lossy(&bytes)}));
+        let v: Value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| json!({"error": String::from_utf8_lossy(&bytes)}));
         if !status.is_success() {
-            bail!("{method} {path}: HTTP {}: {}", status.as_u16(), v["error"].as_str().unwrap_or("error"));
+            bail!(
+                "{method} {path}: HTTP {}: {}",
+                status.as_u16(),
+                v["error"].as_str().unwrap_or("error")
+            );
         }
         Ok(v)
     }
@@ -181,12 +257,31 @@ impl Conn {
     /// Fresh attestation, checked against the policy, and bound to this TLS session.
     async fn attest(&mut self, policy: &EnclavePolicy) -> Result<VerifiedEnclave> {
         let nonce: [u8; 32] = rand::random();
-        let v = self.call("GET", &format!("/api/attestation?nonce={}", hex::encode(nonce)), None, None).await?;
+        let v = self
+            .call(
+                "GET",
+                &format!("/api/attestation?nonce={}", hex::encode(nonce)),
+                None,
+                None,
+            )
+            .await?;
         let a: AttestationResponse = serde_json::from_value(v)?;
-        let ve = verify_enclave(&a.enclave_info_json, a.document_b64.as_deref(), Some(&nonce), policy)?;
+        let ve = verify_enclave(
+            &a.enclave_info_json,
+            a.document_b64.as_deref(),
+            Some(&nonce),
+            policy,
+        )?;
         if ve.info.mode == "nitro" {
-            let want = ve.info.tls_spki_sha256.as_deref().ok_or_else(|| anyhow!("enclave did not commit to a TLS key"))?;
-            let got = self.spki_sha256.as_deref().ok_or_else(|| anyhow!("a Nitro enclave must be reached over https"))?;
+            let want = ve
+                .info
+                .tls_spki_sha256
+                .as_deref()
+                .ok_or_else(|| anyhow!("enclave did not commit to a TLS key"))?;
+            let got = self
+                .spki_sha256
+                .as_deref()
+                .ok_or_else(|| anyhow!("a Nitro enclave must be reached over https"))?;
             if want != got {
                 bail!("TLS does not terminate in the attested enclave (server key {got}, attested {want}): something is in between");
             }
@@ -202,11 +297,17 @@ fn print_enclave(v: &VerifiedEnclave) {
         None => println!("DEV MODE: nothing is attested"),
     }
     println!("source    {} @ {}", i.source_repo, i.source_commit);
-    println!("boot      {} ({} ms since epoch)", i.boot_id, i.booted_at_ms);
+    println!(
+        "boot      {} ({} ms since epoch)",
+        i.boot_id, i.booted_at_ms
+    );
     if let Some(s) = &i.tls_spki_sha256 {
         println!("TLS key   {s} (this connection terminates inside the enclave)");
     }
-    println!("harness   {} prompt {}", i.harness.version, i.harness.system_prompt_sha256);
+    println!(
+        "harness   {} prompt {}",
+        i.harness.version, i.harness.system_prompt_sha256
+    );
     for w in &v.warnings {
         println!("warning   {w}");
     }
@@ -222,16 +323,37 @@ async fn main() -> Result<()> {
             let mut c = Conn::open(&base).await?;
             let v = c.attest(&policy.policy()?).await?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&json!({"info": v.info, "pcr0": v.doc.as_ref().map(|d| d.pcr_hex(0)), "warnings": v.warnings}))?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &json!({"info": v.info, "pcr0": v.doc.as_ref().map(|d| d.pcr_hex(0)), "warnings": v.warnings})
+                    )?
+                );
             } else {
                 print_enclave(&v);
             }
         }
 
-        Cmd::Upload { link, dir, org, repo_url, git_commit, allow_dirty, policy } => {
+        Cmd::Upload {
+            link,
+            dir,
+            org,
+            repo_url,
+            git_commit,
+            allow_dirty,
+            policy,
+        } => {
             let u = url::Url::parse(&link).context("link")?;
-            let token = u.fragment().filter(|t| !t.is_empty()).ok_or_else(|| anyhow!("the link has no token after #"))?.to_string();
-            let sid = u.path().strip_prefix("/s/").ok_or_else(|| anyhow!("not a session link (expected /s/ID#TOKEN)"))?.to_string();
+            let token = u
+                .fragment()
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| anyhow!("the link has no token after #"))?
+                .to_string();
+            let sid = u
+                .path()
+                .strip_prefix("/s/")
+                .ok_or_else(|| anyhow!("not a session link (expected /s/ID#TOKEN)"))?
+                .to_string();
             let git = bundle::git_info(&dir);
             if git.dirty && !allow_dirty {
                 bail!("{} has uncommitted changes to tracked files; commit them or pass --allow-dirty", dir.display());
@@ -243,14 +365,30 @@ async fn main() -> Result<()> {
             let mut c = Conn::open(&u).await?;
             let v = c.attest(&policy.policy()?).await?;
             print_enclave(&v);
-            let view = c.call("GET", &format!("/api/sessions/{sid}"), Some(&token), None).await?;
+            let view = c
+                .call("GET", &format!("/api/sessions/{sid}"), Some(&token), None)
+                .await?;
             if view["role"] != "auditee" {
                 bail!("this is not an auditee link");
             }
-            eprintln!("uploading {} files, {} bytes, tree {tree}", files.len(), total);
-            let r = c.call("PUT", &format!("/api/sessions/{sid}/code"), Some(&token), Some((tar, "application/x-tar"))).await?;
+            eprintln!(
+                "uploading {} files, {} bytes, tree {tree}",
+                files.len(),
+                total
+            );
+            let r = c
+                .call(
+                    "PUT",
+                    &format!("/api/sessions/{sid}/code"),
+                    Some(&token),
+                    Some((tar, "application/x-tar")),
+                )
+                .await?;
             if r["tree_sha256"] != json!(tree) {
-                bail!("the enclave computed tree {} but the local tree is {tree}", r["tree_sha256"]);
+                bail!(
+                    "the enclave computed tree {} but the local tree is {tree}",
+                    r["tree_sha256"]
+                );
             }
             println!("uploaded: tree {tree} ({} files)", files.len());
             match org {
@@ -261,33 +399,85 @@ async fn main() -> Result<()> {
                         "git_commit": git_commit.or(git.head),
                         "tree_sha256": tree,
                     });
-                    let a = c.call("POST", &format!("/api/sessions/{sid}/affidavit"), Some(&token), Some((serde_json::to_vec(&body)?, "application/json"))).await?;
-                    println!("affidavit confirmed:\n  {}", a["statement"].as_str().unwrap_or(""));
+                    let a = c
+                        .call(
+                            "POST",
+                            &format!("/api/sessions/{sid}/affidavit"),
+                            Some(&token),
+                            Some((serde_json::to_vec(&body)?, "application/json")),
+                        )
+                        .await?;
+                    println!(
+                        "affidavit confirmed:\n  {}",
+                        a["statement"].as_str().unwrap_or("")
+                    );
                 }
-                None => println!("next: confirm the affidavit in the web page, or rerun with --org \"Your Org\""),
+                None => println!(
+                    "next: confirm the affidavit in the web page, or rerun with --org \"Your Org\""
+                ),
             }
         }
 
-        Cmd::Verify { certificate, policy, json } => {
-            let cert: Certificate = serde_json::from_str(&std::fs::read_to_string(&certificate)?).context("certificate JSON")?;
+        Cmd::Verify {
+            certificate,
+            policy,
+            json,
+        } => {
+            let cert: Certificate = serde_json::from_str(&std::fs::read_to_string(&certificate)?)
+                .context("certificate JSON")?;
             let v = verify_certificate(&cert, &policy.policy()?)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&json!({"body": v.body, "flags": v.warnings, "enclave_warnings": v.enclave.warnings}))?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &json!({"body": v.body, "flags": v.warnings, "enclave_warnings": v.enclave.warnings})
+                    )?
+                );
                 return Ok(());
             }
             print_enclave(&v.enclave);
             let m = &v.body.manifest;
             println!();
-            println!("session   {} run {} (#{})", m.session_id, m.run_id, m.run_number);
+            println!(
+                "session   {} run {} (#{})",
+                m.session_id, m.run_id, m.run_number
+            );
             println!("question  v{}: {}", m.question.version, m.question.text);
-            println!("auditee   {} — {} @ {}", m.affidavit.organization, m.affidavit.repo_url.as_deref().unwrap_or("-"), m.affidavit.git_commit.as_deref().unwrap_or("-"));
-            println!("code      {} files, {} bytes, tree {}", m.code.file_count, m.code.total_bytes, m.code.tree_sha256);
-            println!("model     {} via {} (chosen by {:?}; reported {}; key owner {})", m.model.requested_model, m.model.endpoint, m.model.proposed_by,
-                if m.model.response_models.is_empty() { "-".into() } else { m.model.response_models.join(", ") }, m.model.key_owner.as_deref().unwrap_or("not reported"));
-            println!("activity  {} model calls, {} files read, {}+{} tokens", m.activity.llm_calls, m.activity.files_read, m.activity.input_tokens, m.activity.output_tokens);
+            println!(
+                "auditee   {} — {} @ {}",
+                m.affidavit.organization,
+                m.affidavit.repo_url.as_deref().unwrap_or("-"),
+                m.affidavit.git_commit.as_deref().unwrap_or("-")
+            );
+            println!(
+                "code      {} files, {} bytes, tree {}",
+                m.code.file_count, m.code.total_bytes, m.code.tree_sha256
+            );
+            println!(
+                "model     {} via {} (chosen by {:?}; reported {}; key owner {})",
+                m.model.requested_model,
+                m.model.endpoint,
+                m.model.proposed_by,
+                if m.model.response_models.is_empty() {
+                    "-".into()
+                } else {
+                    m.model.response_models.join(", ")
+                },
+                m.model.key_owner.as_deref().unwrap_or("not reported")
+            );
+            println!(
+                "activity  {} model calls, {} files read, {}+{} tokens",
+                m.activity.llm_calls,
+                m.activity.files_read,
+                m.activity.input_tokens,
+                m.activity.output_tokens
+            );
             match &v.body.verdict {
                 Some(vd) => {
-                    println!("\nverdict: {:?} (confidence {:.2})\n{}", vd.answer, vd.confidence, vd.summary);
+                    println!(
+                        "\nverdict: {:?} (confidence {:.2})\n{}",
+                        vd.answer, vd.confidence, vd.summary
+                    );
                     if let Some(c) = &vd.clarification_request {
                         println!("clarification requested: {c}");
                     }

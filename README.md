@@ -73,3 +73,14 @@ sandbox mode, so only confirmed addresses get mail. Agents poll instead. See
   code is disclosed, not prevented. If the auditee operates the model
   endpoint, it controls which model answered. The certificate says so.
 - The model provider receives the code under the key owner's terms.
+- The parent instance sees the size and timing of every encrypted model
+  request and response. The enclave narrows this: the whole repository is
+  loaded into enclave memory before a run (so the host learns nothing from
+  which files are read), requests are padded to size buckets (64 KiB and up,
+  1.25x apart), and a jailed harness gets at most 300 model calls. Response
+  sizes come from the provider and can't be padded, so a model steered to
+  vary its reply lengths could signal a few bits per call to whoever runs the
+  parent. If that matters, the auditee should run the enclave themselves
+  (`deploy/self-host.sh`): then the parent is theirs.
+- Before release the auditor sees only a salted commitment to the code, not
+  its tree hash, size or file count; each released certificate opens it.

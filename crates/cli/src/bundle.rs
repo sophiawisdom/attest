@@ -17,19 +17,33 @@ pub struct GitInfo {
 }
 
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git").arg("-C").arg(dir).args(args).output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 pub fn git_info(dir: &Path) -> GitInfo {
     let is_repo = git(dir, &["rev-parse", "--is-inside-work-tree"]).as_deref() == Some("true");
     if !is_repo {
-        return GitInfo { head: None, remote: None, dirty: false, is_repo };
+        return GitInfo {
+            head: None,
+            remote: None,
+            dirty: false,
+            is_repo,
+        };
     }
     GitInfo {
         head: git(dir, &["rev-parse", "HEAD"]),
         remote: git(dir, &["remote", "get-url", "origin"]).filter(|s| !s.is_empty()),
-        dirty: git(dir, &["status", "--porcelain", "--untracked-files=no"]).map(|s| !s.is_empty()).unwrap_or(false),
+        dirty: git(dir, &["status", "--porcelain", "--untracked-files=no"])
+            .map(|s| !s.is_empty())
+            .unwrap_or(false),
         is_repo,
     }
 }
@@ -39,7 +53,11 @@ pub fn git_info(dir: &Path) -> GitInfo {
 pub fn collect(dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
     let mut paths = Vec::new();
     if git_info(dir).is_repo {
-        let out = Command::new("git").arg("-C").arg(dir).args(["ls-files", "-z"]).output()?;
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["ls-files", "-z"])
+            .output()?;
         if !out.status.success() {
             bail!("git ls-files failed");
         }
@@ -47,10 +65,18 @@ pub fn collect(dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
             paths.push(String::from_utf8(p.to_vec()).context("non-UTF-8 path in repository")?);
         }
     } else {
-        for e in walkdir::WalkDir::new(dir).into_iter().filter_entry(|e| e.file_name() != ".git") {
+        for e in walkdir::WalkDir::new(dir)
+            .into_iter()
+            .filter_entry(|e| e.file_name() != ".git")
+        {
             let e = e?;
             if e.file_type().is_file() {
-                let rel = e.path().strip_prefix(dir)?.to_str().context("non-UTF-8 path")?.to_string();
+                let rel = e
+                    .path()
+                    .strip_prefix(dir)?
+                    .to_str()
+                    .context("non-UTF-8 path")?
+                    .to_string();
                 paths.push(rel);
             }
         }
@@ -71,11 +97,17 @@ pub fn collect(dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
             continue;
         }
         if meta.len() > MAX_FILE_BYTES {
-            eprintln!("note: leaving out {p} ({} MiB; the limit is 64 MiB per file)", meta.len() >> 20);
+            eprintln!(
+                "note: leaving out {p} ({} MiB; the limit is 64 MiB per file)",
+                meta.len() >> 20
+            );
             continue;
         }
         let norm = normalize_path(&p).with_context(|| format!("unusable path {p:?}"))?;
-        files.push((norm, std::fs::read(&full).with_context(|| format!("reading {}", full.display()))?));
+        files.push((
+            norm,
+            std::fs::read(&full).with_context(|| format!("reading {}", full.display()))?,
+        ));
     }
     if skipped > 0 {
         eprintln!("note: skipped {skipped} symlinks, submodules or missing files");

@@ -23,9 +23,9 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-
 /// sha256 hex of a DER certificate's SubjectPublicKeyInfo.
 pub fn spki_sha256_of_cert(der: &[u8]) -> anyhow::Result<String> {
-    let (_, cert) = x509_parser::parse_x509_certificate(der).map_err(|e| anyhow::anyhow!("certificate: {e}"))?;
+    let (_, cert) = x509_parser::parse_x509_certificate(der)
+        .map_err(|e| anyhow::anyhow!("certificate: {e}"))?;
     Ok(sha256_hex(cert.public_key().raw))
 }

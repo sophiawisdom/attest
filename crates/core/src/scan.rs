@@ -68,7 +68,10 @@ pub fn add_file(counts: &mut ScanCounts, text: &str) {
     }
     counts.files_with_matches += 1;
     for (name, n) in hits {
-        *counts.matches_by_category.entry(name.to_string()).or_default() += n;
+        *counts
+            .matches_by_category
+            .entry(name.to_string())
+            .or_default() += n;
     }
 }
 

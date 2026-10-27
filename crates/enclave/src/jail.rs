@@ -10,32 +10,90 @@ pub fn probe() -> String {
     use std::ffi::CString;
     let mut out: Vec<String> = Vec::new();
     let errno = || std::io::Error::last_os_error().to_string();
-    let mut ok = |name: &str, r: Result<String, String>| out.push(match r {
-        Ok(s) => format!("{name}=ok{}", if s.is_empty() { String::new() } else { format!("({s})") }),
-        Err(e) => format!("{name}=FAIL({e})"),
-    });
+    let mut ok = |name: &str, r: Result<String, String>| {
+        out.push(match r {
+            Ok(s) => format!(
+                "{name}=ok{}",
+                if s.is_empty() {
+                    String::new()
+                } else {
+                    format!("({s})")
+                }
+            ),
+            Err(e) => format!("{name}=FAIL({e})"),
+        })
+    };
     unsafe {
         let mut u: libc::utsname = std::mem::zeroed();
         libc::uname(&mut u);
-        let rel = std::ffi::CStr::from_ptr(u.release.as_ptr()).to_string_lossy().into_owned();
+        let rel = std::ffi::CStr::from_ptr(u.release.as_ptr())
+            .to_string_lossy()
+            .into_owned();
         ok("kernel", Ok(rel));
-        let flags = libc::CLONE_NEWNS | libc::CLONE_NEWNET | libc::CLONE_NEWIPC | libc::CLONE_NEWUTS | libc::CLONE_NEWPID;
-        ok("unshare", if libc::unshare(flags) == 0 { Ok(String::new()) } else { Err(errno()) });
+        let flags = libc::CLONE_NEWNS
+            | libc::CLONE_NEWNET
+            | libc::CLONE_NEWIPC
+            | libc::CLONE_NEWUTS
+            | libc::CLONE_NEWPID;
+        ok(
+            "unshare",
+            if libc::unshare(flags) == 0 {
+                Ok(String::new())
+            } else {
+                Err(errno())
+            },
+        );
         let root = CString::new("/").unwrap();
-        ok("mount_private", if libc::mount(std::ptr::null(), root.as_ptr(), std::ptr::null(), libc::MS_REC | libc::MS_PRIVATE, std::ptr::null()) == 0 { Ok(String::new()) } else { Err(errno()) });
+        ok(
+            "mount_private",
+            if libc::mount(
+                std::ptr::null(),
+                root.as_ptr(),
+                std::ptr::null(),
+                libc::MS_REC | libc::MS_PRIVATE,
+                std::ptr::null(),
+            ) == 0
+            {
+                Ok(String::new())
+            } else {
+                Err(errno())
+            },
+        );
         let dir = "/tmp/jail-probe";
         let _ = std::fs::create_dir_all(dir);
-        let (d, t, o) = (CString::new(dir).unwrap(), CString::new("tmpfs").unwrap(), CString::new("size=20m,mode=1777").unwrap());
-        let tmpfs = libc::mount(t.as_ptr(), d.as_ptr(), t.as_ptr(), 0, o.as_ptr() as *const _) == 0;
-        ok("tmpfs", if tmpfs { Ok(String::new()) } else { Err(errno()) });
+        let (d, t, o) = (
+            CString::new(dir).unwrap(),
+            CString::new("tmpfs").unwrap(),
+            CString::new("size=20m,mode=1777").unwrap(),
+        );
+        let tmpfs = libc::mount(
+            t.as_ptr(),
+            d.as_ptr(),
+            t.as_ptr(),
+            0,
+            o.as_ptr() as *const _,
+        ) == 0;
+        ok(
+            "tmpfs",
+            if tmpfs {
+                Ok(String::new())
+            } else {
+                Err(errno())
+            },
+        );
         if tmpfs {
             let big = vec![0u8; 21 << 20];
             let r = std::fs::write(format!("{dir}/big"), &big);
-            ok("tmpfs_cap", match r {
-                Err(e) if e.raw_os_error() == Some(libc::ENOSPC) => Ok("20 MiB enforced".into()),
-                Err(e) => Err(e.to_string()),
-                Ok(()) => Err("wrote 21 MiB into a 20 MiB tmpfs".into()),
-            });
+            ok(
+                "tmpfs_cap",
+                match r {
+                    Err(e) if e.raw_os_error() == Some(libc::ENOSPC) => {
+                        Ok("20 MiB enforced".into())
+                    }
+                    Err(e) => Err(e.to_string()),
+                    Ok(()) => Err("wrote 21 MiB into a 20 MiB tmpfs".into()),
+                },
+            );
         }
         // Loopback in the new network namespace.
         let s = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
@@ -44,21 +102,37 @@ pub fn probe() -> String {
             ifr.ifr_name[i] = *b as libc::c_char;
         }
         ifr.ifr_ifru.ifru_flags = (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
-        ok("loopback_up", if s >= 0 && libc::ioctl(s, libc::SIOCSIFFLAGS as _, &ifr) == 0 { Ok(String::new()) } else { Err(errno()) });
+        ok(
+            "loopback_up",
+            if s >= 0 && libc::ioctl(s, libc::SIOCSIFFLAGS as _, &ifr) == 0 {
+                Ok(String::new())
+            } else {
+                Err(errno())
+            },
+        );
         libc::close(s);
-        ok("no_new_privs", if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0 { Ok(String::new()) } else { Err(errno()) });
+        ok(
+            "no_new_privs",
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0 {
+                Ok(String::new())
+            } else {
+                Err(errno())
+            },
+        );
         // seccomp: refuse vsock sockets.
         let filter = seccompiler::SeccompFilter::new(
             vec![(
                 libc::SYS_socket,
-                vec![seccompiler::SeccompRule::new(vec![seccompiler::SeccompCondition::new(
-                    0,
-                    seccompiler::SeccompCmpArgLen::Dword,
-                    seccompiler::SeccompCmpOp::Eq,
-                    libc::AF_VSOCK as u64,
-                )
-                .unwrap()])
-                .unwrap()],
+                vec![
+                    seccompiler::SeccompRule::new(vec![seccompiler::SeccompCondition::new(
+                        0,
+                        seccompiler::SeccompCmpArgLen::Dword,
+                        seccompiler::SeccompCmpOp::Eq,
+                        libc::AF_VSOCK as u64,
+                    )
+                    .unwrap()])
+                    .unwrap(),
+                ],
             )]
             .into_iter()
             .collect(),
@@ -67,22 +141,46 @@ pub fn probe() -> String {
             seccompiler::TargetArch::aarch64,
         );
         let installed = filter
-            .and_then(|f| -> Result<seccompiler::BpfProgram, seccompiler::BackendError> { f.try_into() })
+            .and_then(
+                |f| -> Result<seccompiler::BpfProgram, seccompiler::BackendError> { f.try_into() },
+            )
             .map_err(|e| e.to_string())
             .and_then(|p| seccompiler::apply_filter(&p).map_err(|e| e.to_string()));
         ok("seccomp", installed.clone().map(|_| String::new()));
         if installed.is_ok() {
             let v = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0);
-            ok("vsock_blocked", if v < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) { Ok(String::new()) } else { Err(format!("socket returned {v}")) });
+            ok(
+                "vsock_blocked",
+                if v < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) {
+                    Ok(String::new())
+                } else {
+                    Err(format!("socket returned {v}"))
+                },
+            );
         }
         let dropped = libc::setgid(65534) == 0 && libc::setuid(65534) == 0;
-        ok("drop_privileges", if dropped { Ok(String::new()) } else { Err(errno()) });
+        ok(
+            "drop_privileges",
+            if dropped {
+                Ok(String::new())
+            } else {
+                Err(errno())
+            },
+        );
         let nsm = std::fs::File::open("/dev/nsm");
-        ok("nsm_unreadable_unprivileged", match nsm {
-            Err(e) if e.raw_os_error() == Some(libc::EACCES) || e.raw_os_error() == Some(libc::EPERM) => Ok(String::new()),
-            Err(e) => Ok(format!("open failed: {e}")),
-            Ok(_) => Err("unprivileged process can open /dev/nsm".into()),
-        });
+        ok(
+            "nsm_unreadable_unprivileged",
+            match nsm {
+                Err(e)
+                    if e.raw_os_error() == Some(libc::EACCES)
+                        || e.raw_os_error() == Some(libc::EPERM) =>
+                {
+                    Ok(String::new())
+                }
+                Err(e) => Ok(format!("open failed: {e}")),
+                Ok(_) => Err("unprivileged process can open /dev/nsm".into()),
+            },
+        );
     }
     out.join(" ")
 }
@@ -97,12 +195,23 @@ pub fn spawn_probe() {
     #[cfg(target_os = "linux")]
     {
         // Only root may open the attestation device; jailed processes run as nobody.
-        let _ = std::fs::set_permissions("/dev/nsm", std::os::unix::fs::PermissionsExt::from_mode(0o600));
+        let _ = std::fs::set_permissions(
+            "/dev/nsm",
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        );
     }
     std::thread::spawn(|| {
         let exe = std::env::current_exe().unwrap_or_else(|_| "/attest-enclave".into());
         match std::process::Command::new(exe).arg("--jail-probe").output() {
-            Ok(o) => crate::log(&format!("jail probe: {}{}", String::from_utf8_lossy(&o.stdout).trim(), if o.status.success() { "" } else { " (exit failure)" })),
+            Ok(o) => crate::log(&format!(
+                "jail probe: {}{}",
+                String::from_utf8_lossy(&o.stdout).trim(),
+                if o.status.success() {
+                    ""
+                } else {
+                    " (exit failure)"
+                }
+            )),
             Err(e) => crate::log(&format!("jail probe could not start: {e}")),
         }
     });
@@ -162,10 +271,30 @@ fn check(r: libc::c_int, what: &str) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-unsafe fn mount(src: &str, dst: &str, fstype: &str, flags: libc::c_ulong, data: &str) -> anyhow::Result<()> {
+unsafe fn mount(
+    src: &str,
+    dst: &str,
+    fstype: &str,
+    flags: libc::c_ulong,
+    data: &str,
+) -> anyhow::Result<()> {
     let (s, d, t, o) = (cstr(src), cstr(dst), cstr(fstype), cstr(data));
     check(
-        libc::mount(s.as_ptr(), d.as_ptr(), if fstype.is_empty() { std::ptr::null() } else { t.as_ptr() }, flags, if data.is_empty() { std::ptr::null() } else { o.as_ptr() as *const _ }),
+        libc::mount(
+            s.as_ptr(),
+            d.as_ptr(),
+            if fstype.is_empty() {
+                std::ptr::null()
+            } else {
+                t.as_ptr()
+            },
+            flags,
+            if data.is_empty() {
+                std::ptr::null()
+            } else {
+                o.as_ptr() as *const _
+            },
+        ),
         &format!("mount {dst}"),
     )
 }
@@ -174,7 +303,13 @@ unsafe fn mount(src: &str, dst: &str, fstype: &str, flags: libc::c_ulong, data: 
 unsafe fn bind(src: &str, dst: &str, read_only: bool) -> anyhow::Result<()> {
     mount(src, dst, "", libc::MS_BIND | libc::MS_REC, "")?;
     if read_only {
-        mount("", dst, "", libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV, "")?;
+        mount(
+            "",
+            dst,
+            "",
+            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV,
+            "",
+        )?;
     }
     Ok(())
 }
@@ -187,32 +322,82 @@ fn exec_inner(spec_json: &str) -> anyhow::Result<i32> {
     unsafe {
         // A new, empty network namespace: the only thing the jail can reach
         // is its own loopback, where one port is bridged to the model proxy.
-        check(libc::unshare(libc::CLONE_NEWNS | libc::CLONE_NEWPID | libc::CLONE_NEWIPC | libc::CLONE_NEWUTS | libc::CLONE_NEWNET), "unshare")?;
+        check(
+            libc::unshare(
+                libc::CLONE_NEWNS
+                    | libc::CLONE_NEWPID
+                    | libc::CLONE_NEWIPC
+                    | libc::CLONE_NEWUTS
+                    | libc::CLONE_NEWNET,
+            ),
+            "unshare",
+        )?;
         if !set_loopback_up() {
-            anyhow::bail!("bringing up the jail's loopback: {}", std::io::Error::last_os_error());
+            anyhow::bail!(
+                "bringing up the jail's loopback: {}",
+                std::io::Error::last_os_error()
+            );
         }
-        let bridge = std::net::TcpListener::bind(("127.0.0.1", spec.proxy_port)).context("jail proxy port")?;
+        let bridge = std::net::TcpListener::bind(("127.0.0.1", spec.proxy_port))
+            .context("jail proxy port")?;
         mount("", "/", "", libc::MS_REC | libc::MS_PRIVATE, "")?;
         std::fs::create_dir_all(&root)?;
-        mount("tmpfs", &root, "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, "size=16m,mode=0755")?;
-        for d in ["bin", "usr", "repo", "work", "tmp", "dev", "proc", "etc", ".old"] {
+        mount(
+            "tmpfs",
+            &root,
+            "tmpfs",
+            libc::MS_NOSUID | libc::MS_NODEV,
+            "size=16m,mode=0755",
+        )?;
+        for d in [
+            "bin", "usr", "repo", "work", "tmp", "dev", "proc", "etc", ".old",
+        ] {
             std::fs::create_dir_all(format!("{root}/{d}"))?;
         }
-        bind(&format!("{}/bin", spec.image_root), &format!("{root}/bin"), true)?;
-        bind(&format!("{}/usr", spec.image_root), &format!("{root}/usr"), true)?;
+        bind(
+            &format!("{}/bin", spec.image_root),
+            &format!("{root}/bin"),
+            true,
+        )?;
+        bind(
+            &format!("{}/usr", spec.image_root),
+            &format!("{root}/usr"),
+            true,
+        )?;
         // The repository: root-owned, mode 0444/0555, so the agent can read
         // but not change it, and reads still update access times.
         bind(&spec.repo, &format!("{root}/repo"), false)?;
         let opts = format!("size={}m,mode=1777", spec.work_mib);
-        mount("tmpfs", &format!("{root}/work"), "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, &opts)?;
-        mount("tmpfs", &format!("{root}/tmp"), "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, &opts)?;
-        mount("tmpfs", &format!("{root}/dev"), "tmpfs", libc::MS_NOSUID, "size=64k,mode=0755")?;
+        mount(
+            "tmpfs",
+            &format!("{root}/work"),
+            "tmpfs",
+            libc::MS_NOSUID | libc::MS_NODEV,
+            &opts,
+        )?;
+        mount(
+            "tmpfs",
+            &format!("{root}/tmp"),
+            "tmpfs",
+            libc::MS_NOSUID | libc::MS_NODEV,
+            &opts,
+        )?;
+        mount(
+            "tmpfs",
+            &format!("{root}/dev"),
+            "tmpfs",
+            libc::MS_NOSUID,
+            "size=64k,mode=0755",
+        )?;
         for dev in ["null", "zero", "urandom", "random"] {
             let p = format!("{root}/dev/{dev}");
             std::fs::write(&p, b"")?;
             bind(&format!("/dev/{dev}"), &p, false)?;
         }
-        std::fs::write(format!("{root}/etc/passwd"), "root:x:0:0::/:/bin/sh\nnobody:x:65534:65534::/work:/bin/sh\n")?;
+        std::fs::write(
+            format!("{root}/etc/passwd"),
+            "root:x:0:0::/:/bin/sh\nnobody:x:65534:65534::/work:/bin/sh\n",
+        )?;
         std::fs::write(format!("{root}/etc/group"), "root:x:0:\nnogroup:x:65534:\n")?;
         std::fs::write(format!("{root}/etc/hosts"), "127.0.0.1 localhost\n")?;
         let host = cstr("attest-jail");
@@ -234,7 +419,9 @@ fn exec_inner(spec_json: &str) -> anyhow::Result<i32> {
             for conn in bridge.incoming().flatten() {
                 let sock = sock.clone();
                 std::thread::spawn(move || {
-                    let Ok(up) = std::os::unix::net::UnixStream::connect(&sock) else { return };
+                    let Ok(up) = std::os::unix::net::UnixStream::connect(&sock) else {
+                        return;
+                    };
                     let (mut a, mut b) = (conn.try_clone().unwrap(), up.try_clone().unwrap());
                     let t = std::thread::spawn(move || {
                         let _ = std::io::copy(&mut a, &mut b);
@@ -249,47 +436,124 @@ fn exec_inner(spec_json: &str) -> anyhow::Result<i32> {
         });
         let mut status = 0;
         libc::waitpid(pid, &mut status, 0);
-        let code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 128 + libc::WTERMSIG(status) };
-        // Hand back requested files from /work (still mounted in this namespace).
+        let code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            128 + libc::WTERMSIG(status)
+        };
+        // Hand back requested files from /work (still mounted in this
+        // namespace). The agent controls /work, so: no root, no symlinks, no
+        // FIFOs or devices, bounded size.
+        libc::setgroups(0, std::ptr::null());
+        if libc::setgid(65534) != 0 || libc::setuid(65534) != 0 {
+            anyhow::bail!("dropping privileges before collecting results");
+        }
         let mut files = serde_json::Map::new();
         for f in &spec.collect {
-            if let Ok(b) = std::fs::read(format!("{root}/work/{f}")) {
-                files.insert(f.clone(), serde_json::Value::String(String::from_utf8_lossy(&b[..b.len().min(256 << 10)]).into_owned()));
+            if f.contains('/') {
+                continue;
+            }
+            if let Some(b) = read_regular_nofollow(&format!("{root}/work/{f}"), 256 << 10) {
+                files.insert(
+                    f.clone(),
+                    serde_json::Value::String(String::from_utf8_lossy(&b).into_owned()),
+                );
             }
         }
-        println!("{RESULT_MARKER}{}", serde_json::json!({"exit": code, "files": files}));
+        println!(
+            "{RESULT_MARKER}{}",
+            serde_json::json!({"exit": code, "files": files})
+        );
         Ok(code)
     }
 }
 
+/// Read a regular file without following a symlink at its final component.
+#[cfg(target_os = "linux")]
+fn read_regular_nofollow(path: &str, max: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::io::FromRawFd;
+    let p = cstr(path);
+    let fd = unsafe {
+        libc::open(
+            p.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+    let meta = f.metadata().ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    let mut buf = Vec::new();
+    (&mut f).take(max as u64).read_to_end(&mut buf).ok()?;
+    Some(buf)
+}
+
 #[cfg(target_os = "linux")]
 unsafe fn child(spec: &Spec, root: &str) -> anyhow::Result<std::convert::Infallible> {
-    // Die with our parent: if the server kills it, the whole namespace goes.
-    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-    mount("proc", &format!("{root}/proc"), "proc", libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, "")?;
+    let parent = libc::getppid();
+    mount(
+        "proc",
+        &format!("{root}/proc"),
+        "proc",
+        libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+        "",
+    )?;
     let (new, old) = (cstr(root), cstr(&format!("{root}/.old")));
-    check(libc::syscall(libc::SYS_pivot_root, new.as_ptr(), old.as_ptr()) as libc::c_int, "pivot_root")?;
+    check(
+        libc::syscall(libc::SYS_pivot_root, new.as_ptr(), old.as_ptr()) as libc::c_int,
+        "pivot_root",
+    )?;
     std::env::set_current_dir("/")?;
     let old_root = cstr("/.old");
-    check(libc::umount2(old_root.as_ptr(), libc::MNT_DETACH), "umount old root")?;
+    check(
+        libc::umount2(old_root.as_ptr(), libc::MNT_DETACH),
+        "umount old root",
+    )?;
     let _ = std::fs::remove_dir("/.old");
     // Remount the jail root read-only now that it's assembled.
-    mount("", "/", "", libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY, "")?;
+    mount(
+        "",
+        "/",
+        "",
+        libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+        "",
+    )?;
     std::env::set_current_dir(&spec.cwd)?;
     let lim = |r, v: u64| {
-        let l = libc::rlimit { rlim_cur: v, rlim_max: v };
+        let l = libc::rlimit {
+            rlim_cur: v,
+            rlim_max: v,
+        };
         libc::setrlimit(r, &l);
     };
     lim(libc::RLIMIT_NPROC, 512);
     lim(libc::RLIMIT_NOFILE, 4096);
     lim(libc::RLIMIT_CORE, 0);
-    check(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), "no_new_privs")?;
+    check(
+        libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0),
+        "no_new_privs",
+    )?;
     install_seccomp()?;
     check(libc::setgroups(0, std::ptr::null()), "setgroups")?;
     check(libc::setgid(65534), "setgid")?;
     check(libc::setuid(65534), "setuid")?;
+    // Die with our parent: if the server kills it, the whole namespace goes.
+    // (Set after the uid change, which clears it.)
+    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+    if libc::getppid() != parent {
+        libc::_exit(137);
+    }
     let argv: Vec<std::ffi::CString> = spec.argv.iter().map(|a| cstr(a)).collect();
-    let env: Vec<std::ffi::CString> = spec.env.iter().map(|(k, v)| cstr(&format!("{k}={v}"))).collect();
+    let env: Vec<std::ffi::CString> = spec
+        .env
+        .iter()
+        .map(|(k, v)| cstr(&format!("{k}={v}")))
+        .collect();
     let mut argv_p: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
     argv_p.push(std::ptr::null());
     let mut env_p: Vec<*const libc::c_char> = env.iter().map(|a| a.as_ptr()).collect();
@@ -304,24 +568,65 @@ unsafe fn child(spec: &Spec, root: &str) -> anyhow::Result<std::convert::Infalli
 /// jail's own loopback: its network namespace has nothing else.)
 #[cfg(target_os = "linux")]
 fn install_seccomp() -> anyhow::Result<()> {
-    use seccompiler::{SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule};
-    let mut rules: std::collections::BTreeMap<i64, Vec<SeccompRule>> = std::collections::BTreeMap::new();
-    let not = |f: i32| SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, f as u64).unwrap();
+    use seccompiler::{
+        SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule,
+    };
+    let mut rules: std::collections::BTreeMap<i64, Vec<SeccompRule>> =
+        std::collections::BTreeMap::new();
+    let not = |f: i32| {
+        SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, f as u64).unwrap()
+    };
     // Conditions in one rule are ANDed: refuse any family that is none of these.
-    rules.insert(libc::SYS_socket, vec![SeccompRule::new(vec![not(libc::AF_UNIX), not(libc::AF_INET), not(libc::AF_INET6)]).unwrap()]);
-    rules.insert(libc::SYS_socketpair, vec![SeccompRule::new(vec![not(libc::AF_UNIX)]).unwrap()]);
+    rules.insert(
+        libc::SYS_socket,
+        vec![SeccompRule::new(vec![
+            not(libc::AF_UNIX),
+            not(libc::AF_INET),
+            not(libc::AF_INET6),
+        ])
+        .unwrap()],
+    );
+    rules.insert(
+        libc::SYS_socketpair,
+        vec![SeccompRule::new(vec![not(libc::AF_UNIX)]).unwrap()],
+    );
     for sys in [
-        libc::SYS_ptrace, libc::SYS_process_vm_readv, libc::SYS_process_vm_writev, libc::SYS_mount, libc::SYS_umount2,
-        libc::SYS_pivot_root, libc::SYS_unshare, libc::SYS_setns, libc::SYS_kexec_load, libc::SYS_init_module,
-        libc::SYS_finit_module, libc::SYS_delete_module, libc::SYS_bpf, libc::SYS_perf_event_open, libc::SYS_keyctl,
-        libc::SYS_add_key, libc::SYS_request_key, libc::SYS_reboot, libc::SYS_swapon, libc::SYS_swapoff,
-        libc::SYS_userfaultfd, libc::SYS_open_by_handle_at, libc::SYS_name_to_handle_at,
+        libc::SYS_ptrace,
+        libc::SYS_process_vm_readv,
+        libc::SYS_process_vm_writev,
+        libc::SYS_mount,
+        libc::SYS_umount2,
+        libc::SYS_pivot_root,
+        libc::SYS_unshare,
+        libc::SYS_setns,
+        libc::SYS_kexec_load,
+        libc::SYS_init_module,
+        libc::SYS_finit_module,
+        libc::SYS_delete_module,
+        libc::SYS_bpf,
+        libc::SYS_perf_event_open,
+        libc::SYS_keyctl,
+        libc::SYS_add_key,
+        libc::SYS_request_key,
+        libc::SYS_reboot,
+        libc::SYS_swapon,
+        libc::SYS_swapoff,
+        libc::SYS_userfaultfd,
+        libc::SYS_open_by_handle_at,
+        libc::SYS_name_to_handle_at,
     ] {
         rules.insert(sys, vec![]);
     }
-    let f = SeccompFilter::new(rules, SeccompAction::Allow, SeccompAction::Errno(libc::EPERM as u32), seccompiler::TargetArch::aarch64)
-        .map_err(|e| anyhow::anyhow!("seccomp: {e}"))?;
-    let prog: seccompiler::BpfProgram = f.try_into().map_err(|e: seccompiler::BackendError| anyhow::anyhow!("seccomp: {e}"))?;
+    let f = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EPERM as u32),
+        seccompiler::TargetArch::aarch64,
+    )
+    .map_err(|e| anyhow::anyhow!("seccomp: {e}"))?;
+    let prog: seccompiler::BpfProgram = f
+        .try_into()
+        .map_err(|e: seccompiler::BackendError| anyhow::anyhow!("seccomp: {e}"))?;
     seccompiler::apply_filter(&prog).map_err(|e| anyhow::anyhow!("seccomp: {e}"))
 }
 
@@ -338,7 +643,15 @@ pub async fn materialize(bundle: &crate::bundle::Bundle, dir: &str) -> anyhow::R
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(dir)?;
     let size_mib = (bundle.info.total_bytes >> 20) + bundle.info.file_count / 64 + 64;
-    unsafe { mount("tmpfs", dir, "tmpfs", libc::MS_NOSUID | libc::MS_NODEV | libc::MS_STRICTATIME, &format!("size={size_mib}m,mode=0555"))? };
+    unsafe {
+        mount(
+            "tmpfs",
+            dir,
+            "tmpfs",
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_STRICTATIME,
+            &format!("size={size_mib}m,mode=0555"),
+        )?
+    };
     for d in bundle.dirs.iter().filter(|d| !d.is_empty()) {
         let p = format!("{dir}/{d}");
         std::fs::create_dir_all(&p)?;
@@ -362,7 +675,9 @@ pub fn accessed_since(dir: &str, since: std::time::SystemTime) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = vec![std::path::PathBuf::from(dir)];
     while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
         for e in rd.flatten() {
             let Ok(m) = e.metadata() else { continue };
             if m.is_dir() {

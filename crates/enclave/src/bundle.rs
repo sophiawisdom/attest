@@ -31,6 +31,26 @@ pub struct Bundle {
     sealer: Sealer,
     store: BlobClient,
     cache: Arc<Cache>,
+    /// While a run is going, every file is held here, so the host sees no
+    /// reads that depend on what the model looks at.
+    pinned: std::sync::Mutex<(
+        usize,
+        Option<Arc<std::collections::HashMap<String, Arc<Vec<u8>>>>>,
+    )>,
+    pin_load: tokio::sync::Mutex<()>,
+}
+
+/// Keeps a bundle's files in enclave memory until dropped.
+pub struct Pin(Arc<Bundle>);
+
+impl Drop for Pin {
+    fn drop(&mut self) {
+        let mut g = self.0.pinned.lock().unwrap();
+        g.0 -= 1;
+        if g.0 == 0 {
+            g.1 = None;
+        }
+    }
 }
 
 pub const MAX_FILES: usize = 500_000;
@@ -81,29 +101,67 @@ impl Bundle {
             if !kind.is_file() {
                 bail!("the archive contains a non-regular file (links are not allowed)");
             }
-            let raw = entry.path().context("tar path")?.to_string_lossy().into_owned();
-            let path = normalize_path(&raw).with_context(|| format!("unsafe path in archive: {raw:?}"))?;
+            let raw = entry
+                .path()
+                .context("tar path")?
+                .to_string_lossy()
+                .into_owned();
+            let path =
+                normalize_path(&raw).with_context(|| format!("unsafe path in archive: {raw:?}"))?;
             let size = entry.size();
-            ensure!(size as usize <= MAX_FILE_BYTES, "{path} is larger than {} MiB; leave it out", MAX_FILE_BYTES >> 20);
+            ensure!(
+                size as usize <= MAX_FILE_BYTES,
+                "{path} is larger than {} MiB; leave it out",
+                MAX_FILE_BYTES >> 20
+            );
             total += size;
-            ensure!(total <= max_total, "the code is larger than {} MiB", max_total >> 20);
+            ensure!(
+                total <= max_total,
+                "the code is larger than {} MiB",
+                max_total >> 20
+            );
             ensure!(files.len() < MAX_FILES, "more than {MAX_FILES} files");
             let mut bytes = Vec::with_capacity(size as usize);
-            (&mut entry).take(MAX_FILE_BYTES as u64 + 1).read_to_end(&mut bytes)?;
-            ensure!(bytes.len() as u64 == size, "{path}: truncated archive entry");
+            (&mut entry)
+                .take(MAX_FILE_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            ensure!(
+                bytes.len() as u64 == size,
+                "{path}: truncated archive entry"
+            );
             let digest = sha256(&bytes);
             let text = is_text(&bytes);
-            let scan = if text { scan::scan_text(&String::from_utf8_lossy(&bytes)) } else { vec![] };
+            let scan = if text {
+                scan::scan_text(&String::from_utf8_lossy(&bytes))
+            } else {
+                vec![]
+            };
             if !scan.is_empty() {
                 scan_total.files_with_matches += 1;
                 for (k, n) in &scan {
-                    *scan_total.matches_by_category.entry(k.to_string()).or_default() += n;
+                    *scan_total
+                        .matches_by_category
+                        .entry(k.to_string())
+                        .or_default() += n;
                 }
             }
             let (blob, sealed) = sealer.seal(&path, &digest, &bytes)?;
             drop(bytes);
-            rt.block_on(store.put(&blob, &sealed)).with_context(|| format!("storing {path}"))?;
-            if files.insert(path.clone(), Entry { blob, size, digest, text, scan }).is_some() {
+            rt.block_on(store.put(&blob, &sealed))
+                .with_context(|| format!("storing {path}"))?;
+            if files
+                .insert(
+                    path.clone(),
+                    Entry {
+                        blob,
+                        size,
+                        digest,
+                        text,
+                        scan,
+                    },
+                )
+                .is_some()
+            {
                 bail!("duplicate path in archive: {path}");
             }
         }
@@ -111,7 +169,13 @@ impl Bundle {
         Ok((files, scan_total))
     }
 
-    fn finish(files: BTreeMap<String, Entry>, scan_total: ScanCounts, sealer: Sealer, store: BlobClient, cache: Arc<Cache>) -> Self {
+    fn finish(
+        files: BTreeMap<String, Entry>,
+        scan_total: ScanCounts,
+        sealer: Sealer,
+        store: BlobClient,
+        cache: Arc<Cache>,
+    ) -> Self {
         let mut dirs = BTreeSet::new();
         dirs.insert(String::new());
         for p in files.keys() {
@@ -123,24 +187,96 @@ impl Bundle {
                 }
             }
         }
-        let digests: BTreeMap<String, [u8; 32]> = files.iter().map(|(k, f)| (k.clone(), f.digest)).collect();
+        let digests: BTreeMap<String, [u8; 32]> =
+            files.iter().map(|(k, f)| (k.clone(), f.digest)).collect();
+        let tree = tree_hash(&digests);
+        let mut salt = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut salt);
+        let salt = hex::encode(salt);
         let info = CodeInfo {
-            tree_sha256: tree_hash(&digests),
+            commitment_sha256: attest_core::code_commitment(&salt, &tree),
+            commitment_salt: salt,
+            tree_sha256: tree,
             file_count: files.len() as u64,
             text_file_count: files.values().filter(|f| f.text).count() as u64,
             total_bytes: files.values().map(|f| f.size).sum(),
             uploaded_at_ms: attest_core::now_ms(),
         };
-        Self { files, dirs, info, scan_total, sealer, store, cache }
+        Self {
+            files,
+            dirs,
+            info,
+            scan_total,
+            sealer,
+            store,
+            cache,
+            pinned: Default::default(),
+            pin_load: Default::default(),
+        }
+    }
+
+    /// Load every file into enclave memory, in path order and without the
+    /// shared cache, so the host sees the same reads whatever the run does
+    /// later. Reads go only to memory while the returned Pin lives.
+    pub async fn pin(self: &Arc<Self>) -> Result<Pin> {
+        let _loading = self.pin_load.lock().await;
+        {
+            let mut g = self.pinned.lock().unwrap();
+            if g.1.is_some() {
+                g.0 += 1;
+                return Ok(Pin(self.clone()));
+            }
+        }
+        use futures_util::StreamExt;
+        let mut all = std::collections::HashMap::with_capacity(self.files.len());
+        let jobs: Vec<(String, BlobId, [u8; 32])> = self
+            .files
+            .iter()
+            .map(|(p, e)| (p.clone(), e.blob, e.digest))
+            .collect();
+        let mut fetched = futures_util::stream::iter(jobs.into_iter().map(|(p, blob, digest)| {
+            let me = self.clone();
+            async move {
+                let sealed = me
+                    .store
+                    .get(&blob)
+                    .await?
+                    .with_context(|| format!("the host lost the stored copy of {p}"))?;
+                let plain = me.sealer.open(&p, &digest, &sealed)?;
+                Ok::<_, anyhow::Error>((p, Arc::new(plain)))
+            }
+        }))
+        .buffered(8);
+        while let Some(r) = fetched.next().await {
+            let (p, data) = r?;
+            all.insert(p, data);
+        }
+        let mut g = self.pinned.lock().unwrap();
+        g.0 += 1;
+        g.1 = Some(Arc::new(all));
+        Ok(Pin(self.clone()))
     }
 
     /// Fetch, authenticate and decrypt one file.
     pub async fn read(&self, path: &str) -> Result<Arc<Vec<u8>>> {
-        let e = self.files.get(path).with_context(|| format!("no such file: {path}"))?;
+        let e = self
+            .files
+            .get(path)
+            .with_context(|| format!("no such file: {path}"))?;
+        if let Some(all) = self.pinned.lock().unwrap().1.clone() {
+            return all
+                .get(path)
+                .cloned()
+                .with_context(|| format!("no such file: {path}"));
+        }
         if let Some(hit) = self.cache.get(&e.blob) {
             return Ok(hit);
         }
-        let sealed = self.store.get(&e.blob).await?.with_context(|| format!("the host lost the stored copy of {path}"))?;
+        let sealed = self
+            .store
+            .get(&e.blob)
+            .await?
+            .with_context(|| format!("the host lost the stored copy of {path}"))?;
         let plain = Arc::new(self.sealer.open(path, &e.digest, &sealed)?);
         self.cache.put(e.blob, plain.clone());
         Ok(plain)
@@ -213,18 +349,29 @@ const MAX_GREP_BYTES: u64 = 2 << 30;
 
 impl<'a> Tools<'a> {
     pub fn new(bundle: &'a Arc<Bundle>, sandbox: Option<Arc<crate::sandbox::Sandbox>>) -> Self {
-        Self { bundle, sandbox, files_read: BTreeMap::new(), counts: ToolCounts::default() }
+        Self {
+            bundle,
+            sandbox,
+            files_read: BTreeMap::new(),
+            counts: ToolCounts::default(),
+        }
     }
 
     async fn python(&mut self, code: &str) -> Result<String> {
         let sb = self.sandbox.clone().context("the python sandbox is still starting up; try again in a minute, or use the other tools")?;
         ensure!(!code.trim().is_empty(), "code is empty");
         let opened = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
-        let out = sb.run_python(self.bundle.clone(), code, opened.clone()).await;
-        self.files_read.extend(opened.lock().unwrap().iter().map(|(k, v)| (k.clone(), *v)));
+        let out = sb
+            .run_python(self.bundle.clone(), code, opened.clone())
+            .await;
+        self.files_read
+            .extend(opened.lock().unwrap().iter().map(|(k, v)| (k.clone(), *v)));
         let mut s = String::new();
         if out.timed_out {
-            s.push_str(&format!("[stopped: the {} s time limit was reached]\n", crate::sandbox::TIME_LIMIT.as_secs()));
+            s.push_str(&format!(
+                "[stopped: the {} s time limit was reached]\n",
+                crate::sandbox::TIME_LIMIT.as_secs()
+            ));
         }
         if let Some(e) = &out.error {
             let first: String = e.lines().take(3).collect::<Vec<_>>().join("\n");
@@ -259,11 +406,19 @@ impl<'a> Tools<'a> {
             }
             "find_files" => {
                 self.counts.find += 1;
-                self.find_files(args["pattern"].as_str().unwrap_or(""), args["max_results"].as_u64())
+                self.find_files(
+                    args["pattern"].as_str().unwrap_or(""),
+                    args["max_results"].as_u64(),
+                )
             }
             "read_file" => {
                 self.counts.read += 1;
-                self.read_file(args["path"].as_str().unwrap_or(""), args["start_line"].as_u64(), args["end_line"].as_u64()).await
+                self.read_file(
+                    args["path"].as_str().unwrap_or(""),
+                    args["start_line"].as_u64(),
+                    args["end_line"].as_u64(),
+                )
+                .await
             }
             "grep" => {
                 self.counts.grep += 1;
@@ -292,7 +447,11 @@ impl<'a> Tools<'a> {
         if !self.bundle.dirs.contains(&dir) {
             bail!("no such directory: {path:?}");
         }
-        let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
+        let prefix = if dir.is_empty() {
+            String::new()
+        } else {
+            format!("{dir}/")
+        };
         let mut out = BTreeSet::new();
         for d in self.bundle.dirs.range(prefix.clone()..) {
             if !d.starts_with(&prefix) {
@@ -309,7 +468,11 @@ impl<'a> Tools<'a> {
             }
             let rest = &p[prefix.len()..];
             if !rest.contains('/') {
-                out.insert(format!("{rest}  ({} bytes{})", f.size, if f.text { "" } else { ", binary" }));
+                out.insert(format!(
+                    "{rest}  ({} bytes{})",
+                    f.size,
+                    if f.text { "" } else { ", binary" }
+                ));
             }
         }
         let total = out.len();
@@ -321,19 +484,45 @@ impl<'a> Tools<'a> {
     }
 
     fn find_files(&self, pattern: &str, max: Option<u64>) -> Result<String> {
-        let re = RegexBuilder::new(pattern).size_limit(1 << 20).build().context("invalid regex")?;
+        let re = RegexBuilder::new(pattern)
+            .size_limit(1 << 20)
+            .build()
+            .context("invalid regex")?;
         let max = max.unwrap_or(200).min(1000) as usize;
-        let hits: Vec<&String> = self.bundle.files.keys().filter(|p| re.is_match(p)).collect();
-        let mut s = hits.iter().take(max).map(|p| p.as_str()).collect::<Vec<_>>().join("\n");
+        let hits: Vec<&String> = self
+            .bundle
+            .files
+            .keys()
+            .filter(|p| re.is_match(p))
+            .collect();
+        let mut s = hits
+            .iter()
+            .take(max)
+            .map(|p| p.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         if hits.len() > max {
             s.push_str(&format!("\n... {} more matches", hits.len() - max));
         }
-        Ok(if s.is_empty() { "no matching files".into() } else { s })
+        Ok(if s.is_empty() {
+            "no matching files".into()
+        } else {
+            s
+        })
     }
 
-    async fn read_file(&mut self, path: &str, start: Option<u64>, end: Option<u64>) -> Result<String> {
+    async fn read_file(
+        &mut self,
+        path: &str,
+        start: Option<u64>,
+        end: Option<u64>,
+    ) -> Result<String> {
         let path = normalize_path(path.trim()).with_context(|| format!("bad path {path:?}"))?;
-        let e = self.bundle.files.get(&path).with_context(|| format!("no such file: {path}"))?;
+        let e = self
+            .bundle
+            .files
+            .get(&path)
+            .with_context(|| format!("no such file: {path}"))?;
         if !e.text {
             return Ok(format!("{path} is a binary file ({} bytes)", e.size));
         }
@@ -343,7 +532,11 @@ impl<'a> Tools<'a> {
         let text = String::from_utf8_lossy(&bytes);
         let lines: Vec<&str> = text.lines().collect();
         let start = start.unwrap_or(1).max(1) as usize;
-        let end = end.map(|e| e as usize).unwrap_or(start + 499).min(lines.len()).min(start + 1999);
+        let end = end
+            .map(|e| e as usize)
+            .unwrap_or(start + 499)
+            .min(lines.len())
+            .min(start + 1999);
         if start > lines.len() {
             return Ok(format!("{path} has only {} lines", lines.len()));
         }
@@ -351,7 +544,10 @@ impl<'a> Tools<'a> {
         for (i, l) in lines[start - 1..end].iter().enumerate() {
             let line = format!("{:>6}\t{}\n", start + i, truncate_line(l, 2000));
             if out.len() + line.len() > MAX_OUTPUT {
-                out.push_str(&format!("... output truncated at line {}; request a smaller range\n", start + i));
+                out.push_str(&format!(
+                    "... output truncated at line {}; request a smaller range\n",
+                    start + i
+                ));
                 break;
             }
             out.push_str(&line);
@@ -359,8 +555,18 @@ impl<'a> Tools<'a> {
         Ok(out)
     }
 
-    async fn grep(&self, pattern: &str, prefix: Option<&str>, ci: bool, max: Option<u64>) -> Result<String> {
-        let re = RegexBuilder::new(pattern).case_insensitive(ci).size_limit(1 << 20).build().context("invalid regex")?;
+    async fn grep(
+        &self,
+        pattern: &str,
+        prefix: Option<&str>,
+        ci: bool,
+        max: Option<u64>,
+    ) -> Result<String> {
+        let re = RegexBuilder::new(pattern)
+            .case_insensitive(ci)
+            .size_limit(1 << 20)
+            .build()
+            .context("invalid regex")?;
         let max = max.unwrap_or(100).min(500) as usize;
         let prefix = prefix.map(clean_dir).unwrap_or_default();
         let mut out = Vec::new();
@@ -405,9 +611,16 @@ impl<'a> Tools<'a> {
                 }
             }
         }
-        let mut s = if out.is_empty() { "no matches".to_string() } else { out.join("\n") };
+        let mut s = if out.is_empty() {
+            "no matches".to_string()
+        } else {
+            out.join("\n")
+        };
         if total > out.len() {
-            s.push_str(&format!("\n... {} more matches in {files_matched} files total", total - out.len()));
+            s.push_str(&format!(
+                "\n... {} more matches in {files_matched} files total",
+                total - out.len()
+            ));
         }
         if stopped_early {
             s.push_str("\n(stopped after scanning 2 GiB; narrow the search with path_prefix)");
@@ -416,7 +629,35 @@ impl<'a> Tools<'a> {
     }
 }
 
-pub fn tool_schemas() -> Vec<(&'static str, &'static str, serde_json::Value)> {
+/// The verdict tool, narrowed to the agreed answer format.
+fn verdict_schema(format: &attest_core::AnswerFormat) -> serde_json::Value {
+    use attest_core::AnswerFormat;
+    use serde_json::json;
+    match format {
+        AnswerFormat::YesNo => json!({"type":"object","properties":{
+            "answer":{"type":"string","enum":["yes","no","inconclusive"]}
+        },"required":["answer"]}),
+        AnswerFormat::Choice { options } => json!({"type":"object","properties":{
+            "choice":{"type":"string","enum": options}
+        },"required":["choice"]}),
+        AnswerFormat::Text { max_bytes } => json!({"type":"object","properties":{
+            "answer":{"type":"string","enum":["yes","no","inconclusive","needs_clarification"]},
+            "confidence":{"type":"number","description":"0 to 1"},
+            "summary":{"type":"string","description": format!("For the auditor, at most {max_bytes} bytes. Answer the question and explain the basis at a high level. No code, secrets or file contents.")},
+            "clarification_request":{"type":"string","description":"Only with needs_clarification: what the auditor should change about the question (counts toward the byte limit)."}
+        },"required":["answer","confidence","summary"]}),
+    }
+}
+
+pub fn tool_schemas(
+    format: &attest_core::AnswerFormat,
+) -> Vec<(&'static str, &'static str, serde_json::Value)> {
+    let mut v = base_tool_schemas();
+    v.push(("submit_verdict", "Finish: record your verdict for the auditor (released only if the auditee approves). It must fit the agreed answer format.", verdict_schema(format)));
+    v
+}
+
+fn base_tool_schemas() -> Vec<(&'static str, &'static str, serde_json::Value)> {
     use serde_json::json;
     vec![
         ("list_dir", "List the files and subdirectories of a directory in the repository. Use \"\" for the root.",
@@ -429,13 +670,6 @@ pub fn tool_schemas() -> Vec<(&'static str, &'static str, serde_json::Value)> {
             json!({"type":"object","properties":{"pattern":{"type":"string"},"path_prefix":{"type":"string"},"case_insensitive":{"type":"boolean"},"max_results":{"type":"integer"}},"required":["pattern"]})),
         ("python", "Run a Python 3.15 script in a sandbox and get its printed output. The repository is read-only at /repo (e.g. open('/repo/src/main.py')); the standard library is available, third-party packages are not. No network, no subprocesses, no writing files. Limits per call: 60 s, 512 MiB, 30k characters of output. Use it to parse, count, cross-reference or search in ways the other tools can't.",
             json!({"type":"object","properties":{"code":{"type":"string","description":"Python source to run. print() what you want to see."}},"required":["code"]})),
-        ("submit_verdict", "Finish: record your verdict for the auditor (released only if the auditee approves).",
-            json!({"type":"object","properties":{
-                "answer":{"type":"string","enum":["yes","no","inconclusive","needs_clarification"]},
-                "confidence":{"type":"number","description":"0 to 1"},
-                "summary":{"type":"string","description":"For the auditor. Answer the question and explain the basis at a high level. No code, secrets or file contents."},
-                "clarification_request":{"type":"string","description":"Only with needs_clarification: what the auditor should change about the question."}
-            },"required":["answer","confidence","summary"]})),
     ]
 }
 
@@ -459,24 +693,47 @@ mod tests {
         let rt = tokio::runtime::Handle::current();
         let store = BlobClient::memory();
         let cache = Arc::new(Cache::new(1 << 20));
-        std::thread::spawn(move || Bundle::ingest(&t[..], "s", store, cache, rt, max)).join().unwrap()
+        std::thread::spawn(move || Bundle::ingest(&t[..], "s", store, cache, rt, max))
+            .join()
+            .unwrap()
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn tools_work() {
-        let b = Arc::new(ingest(tar_of(&[("src/a.rs", b"fn a() {}\n// TODO cot\n"), ("src/b/c.py", b"x = 1\n"), ("bin", b"\0\0")]), 1 << 30).unwrap());
+        let b = Arc::new(
+            ingest(
+                tar_of(&[
+                    ("src/a.rs", b"fn a() {}\n// TODO cot\n"),
+                    ("src/b/c.py", b"x = 1\n"),
+                    ("bin", b"\0\0"),
+                ]),
+                1 << 30,
+            )
+            .unwrap(),
+        );
         assert_eq!(b.info.file_count, 3);
         let mut tools = Tools::new(&b, None);
-        let l = tools.call("list_dir", &serde_json::json!({"path": "src"})).await;
+        let l = tools
+            .call("list_dir", &serde_json::json!({"path": "src"}))
+            .await;
         assert!(l.contains("b/") && l.contains("a.rs"), "{l}");
-        let g = tools.call("grep", &serde_json::json!({"pattern": "cot"})).await;
+        let g = tools
+            .call("grep", &serde_json::json!({"pattern": "cot"}))
+            .await;
         assert!(g.contains("src/a.rs:2:"), "{g}");
-        let r = tools.call("read_file", &serde_json::json!({"path": "src/a.rs"})).await;
+        let r = tools
+            .call("read_file", &serde_json::json!({"path": "src/a.rs"}))
+            .await;
         assert!(r.contains("fn a()"), "{r}");
         assert_eq!(tools.files_read.len(), 1);
-        let f = tools.call("find_files", &serde_json::json!({"pattern": "\\.py$"})).await;
+        let f = tools
+            .call("find_files", &serde_json::json!({"pattern": "\\.py$"}))
+            .await;
         assert_eq!(f, "src/b/c.py");
-        assert!(tools.call("read_file", &serde_json::json!({"path": "../etc/passwd"})).await.starts_with("error"));
+        assert!(tools
+            .call("read_file", &serde_json::json!({"path": "../etc/passwd"}))
+            .await
+            .starts_with("error"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

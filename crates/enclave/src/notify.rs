@@ -43,7 +43,9 @@ impl Limiter {
 
 /// Check or start confirmation of `email` and record the result on the session.
 pub async fn verify(ctx: Arc<Ctx>, session_id: String, role: Role, email: String) {
-    let (Some(cfg), Some(session)) = (ctx.email.clone(), ctx.store.get(&session_id)) else { return };
+    let (Some(cfg), Some(session)) = (ctx.email.clone(), ctx.store.get(&session_id)) else {
+        return;
+    };
     let status = if ctx.dev {
         crate::log(&format!("dev outbox: would ask SES to verify {email}"));
         "verified"
@@ -52,7 +54,9 @@ pub async fn verify(ctx: Arc<Ctx>, session_id: String, role: Role, email: String
             Ok(Some(s)) if s == "Success" => "verified",
             Ok(Some(s)) if s == "Pending" => "pending",
             Ok(_) if !ctx.email_limiter.allow() => "rate_limited",
-            Ok(_) => match crate::aws::request_verification(&ctx.net, ctx.dev, &cfg.region, &email).await {
+            Ok(_) => match crate::aws::request_verification(&ctx.net, ctx.dev, &cfg.region, &email)
+                .await
+            {
                 Ok(()) => "pending",
                 Err(e) => {
                     crate::log(&format!("ses verify: {e:#}"));
@@ -68,9 +72,21 @@ pub async fn verify(ctx: Arc<Ctx>, session_id: String, role: Role, email: String
     session.set_email_status(role, &email, status);
 }
 
-pub async fn deliver(ctx: Arc<Ctx>, session_id: String, role: Role, email: String, verified: bool, text: String) {
-    let (Some(cfg), Some(session)) = (ctx.email.clone(), ctx.store.get(&session_id)) else { return };
-    let server = ctx.public_name.clone().unwrap_or_else(|| "the attest server".into());
+pub async fn deliver(
+    ctx: Arc<Ctx>,
+    session_id: String,
+    role: Role,
+    email: String,
+    verified: bool,
+    text: String,
+) {
+    let (Some(cfg), Some(session)) = (ctx.email.clone(), ctx.store.get(&session_id)) else {
+        return;
+    };
+    let server = ctx
+        .public_name
+        .clone()
+        .unwrap_or_else(|| "the attest server".into());
     let subject = format!("attest: {}", text.chars().take(90).collect::<String>());
     let body = format!(
         "{text}\n\nSession {} on {server}. Open your session link to continue.\n\nYou are getting this because this address was entered and confirmed for notifications in an attest session.",
@@ -87,7 +103,17 @@ pub async fn deliver(ctx: Arc<Ctx>, session_id: String, role: Role, email: Strin
             _ => return,
         }
     }
-    if let Err(e) = crate::aws::send_email(&ctx.net, ctx.dev, &cfg.region, &cfg.from, &email, &subject, &body).await {
+    if let Err(e) = crate::aws::send_email(
+        &ctx.net,
+        ctx.dev,
+        &cfg.region,
+        &cfg.from,
+        &email,
+        &subject,
+        &body,
+    )
+    .await
+    {
         crate::log(&format!("email for session {}: {e:#}", &session.id[..8]));
     }
 }

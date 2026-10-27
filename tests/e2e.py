@@ -142,7 +142,9 @@ def run(work):
     out = subprocess.run([os.path.join(BIN, "attest"), "upload", link, repo, "--org", "Example Lab", "--allow-dev"], capture_output=True, text=True)
     check(out.returncode == 0 and "affidavit confirmed" in out.stdout, "attest upload sends code and confirms the affidavit")
     v = auditor.view()
-    check(v["code"]["file_count"] == 2 and v["affidavit"]["current"], "auditor sees code metadata and affidavit")
+    check(set(v["code"]) == {"commitment_sha256", "uploaded_at_ms"} and v["affidavit"]["current"] and "tree_sha256" not in v["affidavit"], "auditor sees only the code commitment and the affidavit")
+    check(v["code"]["commitment_sha256"] in v["affidavit"]["record"]["statement"], "affidavit names the commitment")
+    check(auditee.view()["code"]["file_count"] == 2, "auditee sees code metadata")
     blobs = os.listdir(os.path.join(work, "blobs"))
     raw = b"".join(open(os.path.join(work, "blobs", b), "rb").read() for b in blobs)
     check(len(blobs) == 2 and b"NOTE TO AUDITOR" not in raw and b"include_cot" not in raw, "code is stored on the host only as ciphertext")
@@ -152,7 +154,9 @@ def run(work):
     m = auditor.post("/models", {"provider": "mock", "model": "gpt-mock", "api_key": "test-key", "mock_endpoint": "127.0.0.1:19999"})
     check(m["status"] == "pending", "auditor's model needs approval")
     check("test-key" not in json.dumps(auditee.view()), "keys are never shown")
-    auditee.post(f"/models/{m['id']}/decision", {"approve": True})
+    check(call("POST", f"/api/sessions/{s['session_id']}/models/{m['id']}/decision", auditee.token, {"approve": True})[0] == 400, "approving the auditor's own key needs explicit acceptance")
+    auditee.post(f"/models/{m['id']}/decision", {"approve": True, "accept_auditor_account": True})
+    check(call("POST", f"/api/sessions/{s['session_id']}/models", auditor.token, {"provider": "openrouter", "model": "anthropic/claude-haiku-5.5:online"})[0] == 400, "web-search model variants are refused")
 
     v = auditee.wait_until(lambda v: v["runs"] and v["runs"][-1]["status"] == "awaiting_release", "run 1")
     r1 = v["runs"][-1]
@@ -197,6 +201,7 @@ def run(work):
     msg = body["manifest"]["auditor_messages"][0]
     check(msg["blinded"] and msg["text"] is None, "certificate records the blinded message by hash only")
     check(body["manifest"]["model"]["proposed_by"] == "auditor" and body["manifest"]["model"]["key_owner"] == "org-mock-auditor", "certificate records who chose the model and the key's org")
+    check(body["manifest"]["model"]["key_from"] == "auditor" and any("auditor's own provider account" in f for f in json.loads(out.stdout)["flags"]), "certificate flags that the auditor's account was used")
     check(body["manifest"]["history"]["prior_runs_in_session"] == 2, "certificate counts earlier runs")
     cert["signed"]["body"] = cert["signed"]["body"].replace('"yes"', '"no"')
     with open(path, "w") as fh:
@@ -233,6 +238,30 @@ def run(work):
     check("network blocked" in summary, "the sandbox has no network")
     check(v["runs"][-1]["manifest"]["activity"]["python_calls"] == 1 and v["runs"][-1]["manifest"]["activity"]["files_read"] >= 1, "certificate counts python calls and the files python opened")
 
+    print("answer formats")
+    def one_run(text, fmt):
+        s = ok("POST", "/api/sessions", body={})
+        a, o = Party(s["session_id"], s["auditee_token"]), Party(s["session_id"], s["auditor_token"])
+        o.post("/question", {"text": text, "answer_format": fmt})
+        a.post("/question/decision", {"version": 1, "accept": True})
+        subprocess.run([os.path.join(BIN, "attest"), "upload", f"{BASE}/s/{s['session_id']}#{s['auditee_token']}", repo, "--org", "X", "--allow-dev"], check=True, capture_output=True)
+        a.post("/models", {"provider": "mock", "model": "gpt-mock", "api_key": "test-key", "mock_endpoint": "127.0.0.1:19999"})
+        v = a.wait_until(lambda v: v["runs"] and v["runs"][-1]["status"] != "running", text)
+        ov = o.view()
+        hidden = ov["runs"][-1]["status"] == "running"
+        a.post(f"/runs/{v['runs'][-1]['id']}/release", {"release": True})
+        return o.view()["runs"][-1], hidden
+    r, hidden = one_run("Does trainer/train.py compute loss on chain-of-thought tokens?", {"kind": "yes_no"})
+    check(r["verdict"]["answer"] == "yes" and r["verdict"]["summary"] == "" and r["verdict"]["confidence"] == 0, "yes/no format: the auditor gets only the answer")
+    check(hidden, "yes/no format: the auditor can't see when the run finished")
+    a = r["manifest"]["activity"]
+    check(all(n == 0 or (n & (n - 1)) == 0 for n in [a["llm_calls"], a["tool_calls"], a["files_read"]]) and a["files_read_commitment"] == "", "yes/no format: activity is coarsened")
+    r, _ = one_run("CHOICE: which option?", {"kind": "choice", "options": ["option a", "option b"]})
+    check(r["verdict"]["choice"] == "option b" and r["verdict"]["summary"] == "", "choice format: the auditor gets only the option")
+    r, _ = one_run("Does trainer/train.py compute loss on chain-of-thought tokens?", {"kind": "text", "max_bytes": 20})
+    check(r.get("verdict") is None or len(r["verdict"]["summary"]) <= 20, "text format: summary over the byte limit is refused")
+    check(call("POST", f"/api/sessions/{s['session_id']}/question", auditor.token, {"text": "x", "answer_format": {"kind": "choice", "options": ["one"]}})[0] == 400, "invalid formats are refused")
+
     print("storage limits and tampering")
     big = os.path.join(work, "big")
     os.makedirs(big)
@@ -258,7 +287,7 @@ def run(work):
     a2.post("/models", {"provider": "mock", "model": "gpt-mock", "api_key": "test-key", "mock_endpoint": "127.0.0.1:19999"})
     v = a2.wait_until(lambda v: v["runs"] and v["runs"][-1]["status"] != "running", "tamper run")
     tr = ok("GET", f"/api/sessions/{s2['session_id']}/runs/{v['runs'][-1]['id']}/trace?after=0", a2.token)
-    check(any("failed authentication" in str(e.get("content", "")) for e in tr["entries"]), "a file altered by the host is detected, not read")
+    check("failed authentication" in json.dumps(v["runs"][-1].get("outcome")) or any("failed authentication" in str(e.get("content", "")) for e in tr["entries"]), "a file altered by the host is detected, not read")
 
 
 if __name__ == "__main__":

@@ -4,7 +4,14 @@
 pub const HARNESS_VERSION: &str = "attest-harness/3";
 pub const MAX_STEPS_CAP: u32 = 400;
 
-pub const TOOLS: &[&str] = &["list_dir", "find_files", "read_file", "grep", "python", "submit_verdict"];
+pub const TOOLS: &[&str] = &[
+    "list_dir",
+    "find_files",
+    "read_file",
+    "grep",
+    "python",
+    "submit_verdict",
+];
 
 pub const SYSTEM_PROMPT: &str = r#"Where you are: you are running inside an AWS Nitro Enclave, an isolated machine whose exact software is publicly measured and verifiable. Two parties use this service. The auditee owns a software repository and does not want to show it to anyone. The auditor wants an answer to a question about that repository. You are the only one besides the auditee who reads the code. Because of that, your environment is deliberately limited: you can see a read-only snapshot of the repository and nothing else, only through the tools listed below. You cannot reach the network, install anything, or execute the repository's own code; the python tool runs your scripts only. These limits are there for security; work within them rather than trying to get around them.
 
@@ -31,9 +38,15 @@ pub fn system_prompt_sha256() -> String {
     crate::sha256_hex(SYSTEM_PROMPT.as_bytes())
 }
 
-pub fn user_prompt(question: &str, file_count: u64, total_bytes: u64) -> String {
+pub fn user_prompt(
+    question: &str,
+    file_count: u64,
+    total_bytes: u64,
+    format: &crate::AnswerFormat,
+) -> String {
     format!(
-        "Question from the auditor:\n\n<question>\n{question}\n</question>\n\nThe repository snapshot has {file_count} files ({total_bytes} bytes). Start by exploring its layout."
+        "Question from the auditor:\n\n<question>\n{question}\n</question>\n\nAnswer format agreed with the auditee: {}. The enclave rejects any verdict outside it.\n\nThe repository snapshot has {file_count} files ({total_bytes} bytes). Start by exploring its layout.",
+        format.describe()
     )
 }
 
