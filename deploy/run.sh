@@ -20,7 +20,7 @@ NAME=attest
 
 # The host must be up first: the enclave reads its config at boot.
 sudo pkill -f "attest-host --enclave-cid" || true
-sudo nohup build/out/bin/attest-host --enclave-cid "$CID" --listen 0.0.0.0:443 --config "$CONFIG" >> attest-host.log 2>&1 &
+sudo nohup build/out/bin/attest-host --enclave-cid "$CID" --listen 0.0.0.0:443 --config "$CONFIG" >> "$HOME/attest-host.log" 2>&1 &
 sleep 2
 
 if nitro-cli describe-enclaves | grep -q "\"EnclaveName\": \"$NAME\""; then
@@ -29,4 +29,4 @@ fi
 # Never pass --debug-mode: it zeroes the PCRs and lets the parent read
 # enclave memory. Verifiers reject zero PCRs.
 nitro-cli run-enclave --enclave-name "$NAME" --eif-path "$EIF" --cpu-count "$CPUS" --memory "$MEM_MIB" --enclave-cid "$CID"
-echo "host log: $PWD/attest-host.log"
+echo "host log: $HOME/attest-host.log"
