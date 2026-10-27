@@ -78,8 +78,48 @@ struct HostConfig {
     operator: Option<String>,
 }
 
+const LOG_VSOCK_PORT: u32 = 5004;
+static LOG_TX: std::sync::OnceLock<tokio::sync::mpsc::Sender<String>> = std::sync::OnceLock::new();
+
+/// Operational log. Production enclaves have no console (and `eprintln!`
+/// panics when stderr is gone), so lines go to the parent over vsock, best
+/// effort. Never log code, keys, tokens or email addresses.
 pub fn log(msg: &str) {
-    eprintln!("[attest-enclave] {msg}");
+    use std::io::Write;
+    let line = format!("[attest-enclave] {msg}");
+    let _ = writeln!(std::io::stderr(), "{line}");
+    if let Some(tx) = LOG_TX.get() {
+        let _ = tx.try_send(line);
+    }
+}
+
+fn start_log_forwarding(dev: bool) {
+    if dev {
+        return;
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1000);
+    let _ = LOG_TX.set(tx);
+    tokio::spawn(async move {
+        #[cfg(target_os = "linux")]
+        {
+            use tokio::io::AsyncWriteExt;
+            let addr = tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_HOST, LOG_VSOCK_PORT);
+            let mut conn: Option<tokio_vsock::VsockStream> = None;
+            while let Some(line) = rx.recv().await {
+                if conn.is_none() {
+                    conn = tokio_vsock::VsockStream::connect(addr).await.ok();
+                }
+                if let Some(c) = conn.as_mut() {
+                    if c.write_all(format!("{line}\n").as_bytes()).await.is_err() {
+                        conn = None;
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        while rx.recv().await.is_some() {}
+        let _ = LOG_VSOCK_PORT;
+    });
 }
 
 async fn read_host_config(args: &Args) -> Result<HostConfig> {
@@ -119,6 +159,7 @@ async fn read_host_config(args: &Args) -> Result<HostConfig> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    start_log_forwarding(args.dev);
     let attester = nsm::Attester::new(args.dev)?;
     let cfg = read_host_config(&args).await?;
     log(&format!("config: domain={:?} public_ip={:?} email_from={:?}", cfg.domain, cfg.public_ip, cfg.email_from));

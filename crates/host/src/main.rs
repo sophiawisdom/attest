@@ -5,6 +5,7 @@
 //!   vsock 5001 CONNECT    -> TCP host:443          (enclave's outbound TLS)
 //!   vsock 5002            -> boot config JSON      (domain or public IP, email sender)
 //!   vsock 5003            -> instance role credentials from IMDSv2 (for SES)
+//!   vsock 5004            <- the enclave's operational log lines (printed here)
 //!
 //! Outbound tunnels may go to any public address on port 443 (webhooks can
 //! point anywhere); the enclave decides where it connects.
@@ -62,6 +63,7 @@ async fn main() -> Result<()> {
         tasks.spawn(async move { config_server(a).await });
         let a = args.clone();
         tasks.spawn(async move { credentials_server(a).await });
+        tasks.spawn(async move { log_server().await });
     }
     if !args.no_forward {
         let a = args.clone();
@@ -194,6 +196,28 @@ fn serde_json_check(b: &[u8]) -> Result<()> {
         bail!("config must be a JSON object");
     }
     Ok(())
+}
+
+/// Print the enclave's log lines (it has no console in production).
+async fn log_server() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let l = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_ANY, 5004))?;
+        loop {
+            let (s, _) = l.accept().await?;
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(s).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let line: String = line.chars().filter(|c| !c.is_control()).take(2000).collect();
+                    eprintln!("{line}");
+                }
+            });
+        }
+    }
+    #[allow(unreachable_code)]
+    {
+        bail!("vsock requires linux")
+    }
 }
 
 /// One plain-HTTP request to the instance metadata service.
