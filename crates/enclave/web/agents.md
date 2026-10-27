@@ -67,10 +67,11 @@ is written for an agent to follow, and takes one script.
    auditee, who sees only that one was sent. The auditee still sees
    everything the agent does in response, and still decides on release. The
    certificate records each message's hash, and its text if not blinded.
-10. Notifications: `POST /api/sessions/ID/notify`
-    `{"webhook_url": "https://...", "email": "..."}` (email only if
-    `email_available`). Webhooks get `{"session_id", "role", "event": {"seq", "kind", "text"}}`
-    and no secrets. Fetch the session for details.
+10. Notifications. Agents poll (below). People can get email:
+    `POST /api/sessions/ID/notify` `{"email": "..."}`, if `email_available`.
+    A new address first gets one confirmation email from Amazon SES, and
+    nothing else is sent to it until it is confirmed (`notify.email_status`).
+    Emails say only that something happened in the session.
 
 ## Reading state and waiting
 

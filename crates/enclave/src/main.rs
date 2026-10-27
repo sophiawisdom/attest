@@ -7,6 +7,8 @@
 //! measured image. See web/agents.md for the protocol.
 
 mod acme;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod aws;
 mod bundle;
 mod llm;
 mod net;
@@ -64,7 +66,12 @@ struct Args {
 struct HostConfig {
     domain: Option<String>,
     acme_directory: Option<String>,
-    email: Option<notify::EmailConfig>,
+    /// Sender for notification emails (must be verified in SES). No email without it.
+    email_from: Option<String>,
+    /// SES region (defaults to the instance's region, as the host reports it).
+    ses_region: Option<String>,
+    /// The server's public IP, for an IP-address certificate when there's no domain.
+    public_ip: Option<String>,
     max_code_mib: Option<usize>,
     max_total_code_mib: Option<usize>,
     /// Shown on the landing page as "run by ...". Unverified.
@@ -114,9 +121,12 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let attester = nsm::Attester::new(args.dev)?;
     let cfg = read_host_config(&args).await?;
-    log(&format!("config: domain={:?} email={}", cfg.domain, cfg.email.is_some()));
+    log(&format!("config: domain={:?} public_ip={:?} email_from={:?}", cfg.domain, cfg.public_ip, cfg.email_from));
     let domain = cfg.domain.clone().filter(|_| !args.dev);
-    let tls = if args.dev { None } else { Some(Arc::new(tls::ServerIdentity::generate(domain.as_slice())?)) };
+    // The name to get a certificate for: the domain, or else the public IP
+    // (Let's Encrypt issues short-lived certificates for IP addresses).
+    let cert_name = domain.clone().or_else(|| cfg.public_ip.clone().filter(|ip| ip.parse::<std::net::IpAddr>().is_ok())).filter(|_| !args.dev);
+    let tls = if args.dev { None } else { Some(Arc::new(tls::ServerIdentity::generate(cert_name.as_slice())?)) };
 
     // Inside Nitro the kernel RNG is fed by the NSM hardware RNG.
     let signing = SigningKey::generate(&mut rand::rngs::OsRng);
@@ -157,7 +167,12 @@ async fn main() -> Result<()> {
         info,
         info_json,
         signing,
-        email: cfg.email,
+        email: cfg.email_from.clone().map(|from| notify::EmailConfig {
+            from,
+            region: cfg.ses_region.clone().unwrap_or_else(|| "us-west-2".into()),
+        }),
+        email_limiter: notify::Limiter::default(),
+        public_name: domain.clone().or(cfg.public_ip.clone()),
         max_code_bytes: cfg.max_code_mib.unwrap_or(1024) << 20,
         max_total_code_bytes: cfg.max_total_code_mib.unwrap_or(4096) << 20,
         slots: tokio::sync::Semaphore::new(args.concurrency),
@@ -166,7 +181,7 @@ async fn main() -> Result<()> {
     let app = Arc::new(App { ctx: ctx.clone(), attester });
     log(&format!("boot {} mode={} commit={}", ctx.info.boot_id, ctx.info.mode, ctx.info.source_commit));
 
-    if let (Some(t), Some(d)) = (&tls, &domain) {
+    if let (Some(t), Some(d)) = (&tls, &cert_name) {
         tokio::spawn(acme::run(net, t.clone(), d.clone(), cfg.acme_directory.unwrap_or_else(|| LETS_ENCRYPT.into())));
     }
     serve(args, app, tls).await
@@ -306,7 +321,7 @@ fn attestation(app: &App, q: &HashMap<String, String>) -> Result<Resp, ApiError>
 }
 
 fn base_url(app: &App, req: &Request<hyper::body::Incoming>) -> String {
-    match &app.ctx.info.domain {
+    match &app.ctx.public_name {
         Some(d) => format!("https://{d}"),
         None => {
             let host = req.headers().get("host").and_then(|h| h.to_str().ok()).unwrap_or("127.0.0.1:8080");
@@ -392,7 +407,7 @@ async fn session_route(app: &Arc<App>, id: &str, rest: &[&str], req: Request<hyp
         ("POST", ["runs", rid, "release"]) => ok(s.decide_release(ctx, role, rid, &body_json(req).await?)?),
         ("POST", ["runs", rid, "followup"]) => ok(s.followup(ctx, role, rid, &body_json(req).await?)?),
         ("GET", ["runs", rid, "certificate"]) => ok(serde_json::to_value(s.certificate(role, rid)?).map_err(anyhow::Error::from)?),
-        ("POST", ["notify"]) => ok(s.set_notify(role, &body_json(req).await?, ctx.email.is_some())?),
+        ("POST", ["notify"]) => ok(s.set_notify(ctx, role, &body_json(req).await?)?),
         _ => Err(ApiError(StatusCode::NOT_FOUND, format!("not found: {method} /api/sessions/{id}/{} (see /agents.md)", rest.join("/")))),
     }
 }

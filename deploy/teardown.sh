@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Delete what deploy/self-host.sh created for --name: the instance, its
-# Elastic IP and security group. The key pair is kept unless --delete-key.
+# Elastic IP, security group and IAM role. The key pair is kept unless
+# --delete-key. A confirmed SES sender address is left as is.
 #
 #   deploy/teardown.sh --name attest [--delete-key]
 set -euo pipefail
@@ -33,5 +34,12 @@ if [ -n "${SG:-}" ]; then
 fi
 if [ "$DELETE_KEY" = 1 ]; then
   aws ec2 delete-key-pair --key-name "$NAME-key" && rm -f "$STATE_DIR/$NAME-key.pem" && echo "deleted key pair"
+fi
+ROLE="$NAME-instance"
+if command aws iam get-instance-profile --instance-profile-name "$ROLE" >/dev/null 2>&1; then
+  command aws iam remove-role-from-instance-profile --instance-profile-name "$ROLE" --role-name "$ROLE" || true
+  command aws iam delete-instance-profile --instance-profile-name "$ROLE" || true
+  command aws iam delete-role-policy --role-name "$ROLE" --policy-name ses || true
+  command aws iam delete-role --role-name "$ROLE" && echo "deleted IAM role $ROLE"
 fi
 rm -f "$STATE" "$STATE_DIR/$NAME.known_hosts"

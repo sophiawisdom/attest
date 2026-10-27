@@ -2,21 +2,25 @@
 # Run your own attest server on AWS Nitro Enclaves. See SELF_HOSTING.md.
 #
 #   deploy/self-host.sh [--name attest] [--region us-west-2] [--type m7g.xlarge]
-#                       [--domain attest.example.com] [--operator "Your Name"]
-#                       [--commit SHA] [--repo URL]
+#                       [--email-from you@example.com] [--operator "Your Name"]
+#                       [--domain attest.example.com] [--commit SHA] [--repo URL]
 #
-# First run: creates a key pair, security group, Elastic IP and Graviton
-# instance; builds the enclave image on it from --commit (default: the newest
+# Only AWS is needed. Without --domain the server gets a Let's Encrypt
+# certificate for its Elastic IP. --email-from turns on email notifications
+# through Amazon SES (you confirm that address once).
+#
+# First run: creates a key pair, security group, IAM role (SES only), Elastic
+# IP and Graviton instance; builds the enclave image on it from --commit (default: the newest
 # commit with published measurements); checks PCR0 against
 # measurements/<commit>.pcrs.json when that file exists; starts the service.
 # Later runs with the same --name reuse the instance and redeploy (which ends
 # all sessions). Undo everything with deploy/teardown.sh --name NAME.
 #
-# Needs: aws CLI with credentials (EC2 create/describe, SSM read), ssh, git, curl.
+# Needs: aws CLI with credentials (EC2, IAM role creation, SES, SSM read), ssh, git, curl, python3.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-NAME=attest REGION=us-west-2 TYPE=m7g.xlarge DOMAIN="" OPERATOR="" COMMIT="" REPO=""
+NAME=attest REGION=us-west-2 TYPE=m7g.xlarge DOMAIN="" OPERATOR="" COMMIT="" REPO="" EMAIL_FROM=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --name) NAME=$2; shift 2 ;;
@@ -24,9 +28,10 @@ while [ $# -gt 0 ]; do
     --type) TYPE=$2; shift 2 ;;
     --domain) DOMAIN=$2; shift 2 ;;
     --operator) OPERATOR=$2; shift 2 ;;
+    --email-from) EMAIL_FROM=$2; shift 2 ;;
     --commit) COMMIT=$2; shift 2 ;;
     --repo) REPO=$2; shift 2 ;;
-    -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -65,6 +70,29 @@ if [ -z "$COMMIT" ]; then
 fi
 echo "repo $REPO @ $COMMIT"
 
+say "IAM role for the instance (SES only)"
+ROLE="$NAME-instance"
+if ! command aws iam get-role --role-name "$ROLE" >/dev/null 2>&1; then
+  command aws iam create-role --role-name "$ROLE" --description "attest enclave parent: send and verify SES email" \
+    --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}' >/dev/null
+fi
+command aws iam put-role-policy --role-name "$ROLE" --policy-name ses \
+  --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ses:SendEmail","ses:VerifyEmailIdentity","ses:GetIdentityVerificationAttributes"],"Resource":"*"}]}'
+if ! command aws iam get-instance-profile --instance-profile-name "$ROLE" >/dev/null 2>&1; then
+  command aws iam create-instance-profile --instance-profile-name "$ROLE" >/dev/null
+  command aws iam add-role-to-instance-profile --instance-profile-name "$ROLE" --role-name "$ROLE"
+  sleep 10  # IAM propagation
+fi
+if [ -n "$EMAIL_FROM" ]; then
+  STATUS=$(aws ses get-identity-verification-attributes --identities "$EMAIL_FROM" --query "VerificationAttributes.\"$EMAIL_FROM\".VerificationStatus" --output text 2>/dev/null || true)
+  if [ "$STATUS" != Success ]; then
+    aws ses verify-email-identity --email-address "$EMAIL_FROM"
+    echo "SES sent a confirmation email to $EMAIL_FROM. Click its link; notifications start once it's confirmed."
+  else
+    echo "$EMAIL_FROM is already confirmed in SES"
+  fi
+fi
+
 if [ -z "${INSTANCE:-}" ] || [ "$(aws ec2 describe-instances --instance-ids "$INSTANCE" --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null)" != running ]; then
   say "creating key pair, security group, Elastic IP and instance in $REGION"
   if [ ! -f "$KEY" ]; then
@@ -99,12 +127,17 @@ systemctl enable --now docker nitro-enclaves-allocator.service
 touch /var/lib/attest-bootstrapped
 EOF
 )
-  INSTANCE=$(aws ec2 run-instances --image-id "$AMI" --instance-type "$TYPE" --key-name "$NAME-key" \
+  for _ in 1 2 3 4 5 6; do
+    INSTANCE=$(aws ec2 run-instances --image-id "$AMI" --instance-type "$TYPE" --key-name "$NAME-key" \
+    --iam-instance-profile "Name=$ROLE" \
     --network-interfaces "DeviceIndex=0,SubnetId=$SUBNET,Groups=$SG,AssociatePublicIpAddress=true" \
     --enclave-options Enabled=true --metadata-options HttpTokens=required,HttpEndpoint=enabled \
     --block-device-mappings 'DeviceName=/dev/xvda,Ebs={VolumeSize=40,VolumeType=gp3,Encrypted=true,DeleteOnTermination=true}' \
     --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME}]" \
-    --user-data "$USERDATA" --query 'Instances[0].InstanceId' --output text)
+    --user-data "$USERDATA" --query 'Instances[0].InstanceId' --output text 2>/dev/null) && break
+    sleep 10  # the new instance profile may not be visible to EC2 yet
+  done
+  [ -n "${INSTANCE:-}" ] || { echo "could not launch the instance" >&2; exit 1; }
   save
   echo "instance $INSTANCE ($TYPE)"
   aws ec2 wait instance-running --instance-ids "$INSTANCE"
@@ -116,6 +149,9 @@ EOF
   save
 fi
 echo "instance $INSTANCE at $IP"
+if [ "$(aws ec2 describe-iam-instance-profile-associations --filters "Name=instance-id,Values=$INSTANCE" --query 'IamInstanceProfileAssociations[0].State' --output text)" = None ]; then
+  aws ec2 associate-iam-instance-profile --instance-id "$INSTANCE" --iam-instance-profile "Name=$ROLE" >/dev/null
+fi
 
 SSH=(ssh -i "$KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$STATE_DIR/$NAME.known_hosts" -o ConnectTimeout=10 -o BatchMode=yes "ec2-user@$IP")
 say "waiting for the instance to finish setting up (a few minutes on first boot)"
@@ -126,12 +162,13 @@ done
 "${SSH[@]}" 'test -f /var/lib/attest-bootstrapped' || { echo "instance setup did not finish; check /var/log/cloud-init-output.log on it" >&2; exit 1; }
 
 say "building the enclave image on the instance (about 10 minutes)"
-CONFIG=$(printf '{"domain": %s, "operator": %s}' \
-  "$([ -n "$DOMAIN" ] && printf '"%s"' "$DOMAIN" || echo null)" \
-  "$([ -n "$OPERATOR" ] && printf '%s' "$OPERATOR" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' || echo null)")
+CONFIG=$(DOMAIN="$DOMAIN" OPERATOR="$OPERATOR" IP="$IP" EMAIL_FROM="$EMAIL_FROM" REGION="$REGION" python3 -c '
+import json, os
+e = lambda k: os.environ[k] or None
+print(json.dumps({"domain": e("DOMAIN"), "operator": e("OPERATOR"), "public_ip": e("IP"), "email_from": e("EMAIL_FROM"), "ses_region": e("REGION")}))')
 "${SSH[@]}" "set -euo pipefail
   rm -rf attest-src && git clone -q '$REPO' attest-src && cd attest-src && git checkout -q '$COMMIT'
-  sudo mkdir -p /etc/attest && echo '$CONFIG' | sudo tee /etc/attest/host.json >/dev/null
+  sudo mkdir -p /etc/attest && echo '$(printf '%s' "$CONFIG" | base64 | tr -d '\n')' | base64 -d | sudo tee /etc/attest/host.json >/dev/null
   nice -n 5 build/build-eif.sh > ~/build-eif.log 2>&1 || { tail -30 ~/build-eif.log; exit 1; }
   cat build/out/pcrs.json"
 PCR0=$("${SSH[@]}" "python3 -c 'import json; print(json.load(open(\"attest-src/build/out/pcrs.json\"))[\"Measurements\"][\"PCR0\"])'")
@@ -149,7 +186,7 @@ say "starting the service (this ends any sessions on the previous version)"
 
 say "done"
 cat <<EOF
-Server:   https://$IP  (self-signed certificate until a domain points here)
+Server:   https://${DOMAIN:-$IP}  (the enclave gets its Let's Encrypt certificate within a few minutes)
 PCR0:     $PCR0
 Verify:   attest verify-service https://$IP --pcrs $PUBLISHED
 SSH:      ssh -i $KEY ec2-user@$IP

@@ -3,7 +3,8 @@
 //!
 //!   TCP :443              -> enclave vsock 5000   (HTTPS, terminated in the enclave)
 //!   vsock 5001 CONNECT    -> TCP host:443          (enclave's outbound TLS)
-//!   vsock 5002            -> boot config JSON      (domain, email API key)
+//!   vsock 5002            -> boot config JSON      (domain or public IP, email sender)
+//!   vsock 5003            -> instance role credentials from IMDSv2 (for SES)
 //!
 //! Outbound tunnels may go to any public address on port 443 (webhooks can
 //! point anywhere); the enclave decides where it connects.
@@ -30,6 +31,8 @@ struct Args {
     tunnel_port: u32,
     #[arg(long, default_value_t = 5002)]
     config_port: u32,
+    #[arg(long, default_value_t = 5003)]
+    credentials_port: u32,
     /// JSON handed to the enclave at boot: {"domain", "email": {"resend_api_key", "from"}, ...}.
     #[arg(long)]
     config: Option<String>,
@@ -57,6 +60,8 @@ async fn main() -> Result<()> {
     if !args.dev {
         let a = args.clone();
         tasks.spawn(async move { config_server(a).await });
+        let a = args.clone();
+        tasks.spawn(async move { credentials_server(a).await });
     }
     if !args.no_forward {
         let a = args.clone();
@@ -184,10 +189,73 @@ async fn config_server(args: Args) -> Result<()> {
 }
 
 fn serde_json_check(b: &[u8]) -> Result<()> {
-    // Minimal sanity check without a JSON dependency.
-    let t = String::from_utf8_lossy(b);
-    if !t.trim_start().starts_with('{') {
+    let v: serde_json::Value = serde_json::from_slice(b).context("config is not JSON")?;
+    if !v.is_object() {
         bail!("config must be a JSON object");
     }
     Ok(())
+}
+
+/// One plain-HTTP request to the instance metadata service.
+async fn imds(method: &str, path: &str, headers: &[(&str, &str)]) -> Result<String> {
+    use tokio::io::AsyncReadExt;
+    let mut s = tokio::time::timeout(std::time::Duration::from_secs(3), TcpStream::connect("169.254.169.254:80")).await??;
+    let mut req = format!("{method} {path} HTTP/1.0\r\nHost: 169.254.169.254\r\n");
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+    s.write_all(req.as_bytes()).await?;
+    let mut buf = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(3), (&mut s).take(64 * 1024).read_to_end(&mut buf)).await??;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let (head, body) = text.split_once("\r\n\r\n").context("bad IMDS response")?;
+    if !head.starts_with("HTTP/1.0 200") && !head.starts_with("HTTP/1.1 200") {
+        bail!("IMDS {path}: {}", head.lines().next().unwrap_or(""));
+    }
+    Ok(body.to_string())
+}
+
+async fn role_credentials() -> Result<Vec<u8>> {
+    let token = imds("PUT", "/latest/api/token", &[("X-aws-ec2-metadata-token-ttl-seconds", "60")]).await?;
+    let h = [("X-aws-ec2-metadata-token", token.trim())];
+    let role = imds("GET", "/latest/meta-data/iam/security-credentials/", &h).await?;
+    let role = role.lines().next().context("no instance role attached")?.trim().to_string();
+    if role.is_empty() || !role.chars().all(|c| c.is_ascii_alphanumeric() || "_+=,.@-".contains(c)) {
+        bail!("invalid role name");
+    }
+    let v: serde_json::Value = serde_json::from_str(&imds("GET", &format!("/latest/meta-data/iam/security-credentials/{role}"), &h).await?)?;
+    let out = serde_json::json!({
+        "access_key_id": v["AccessKeyId"],
+        "secret_access_key": v["SecretAccessKey"],
+        "session_token": v["Token"],
+    });
+    Ok(serde_json::to_vec(&out)?)
+}
+
+/// Hands the instance role's temporary credentials to the enclave, which
+/// signs its own SES requests over TLS that ends inside it.
+async fn credentials_server(args: Args) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let l = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_ANY, args.credentials_port))?;
+        log(&format!("credentials on vsock {}", args.credentials_port));
+        loop {
+            let (mut s, _) = l.accept().await?;
+            tokio::spawn(async move {
+                match role_credentials().await {
+                    Ok(c) => {
+                        let _ = s.write_all(&c).await;
+                    }
+                    Err(e) => log(&format!("credentials: {e:#}")),
+                }
+                let _ = AsyncWriteExt::shutdown(&mut s).await;
+            });
+        }
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = (args.credentials_port, role_credentials);
+        bail!("vsock requires linux")
+    }
 }

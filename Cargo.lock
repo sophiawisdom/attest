@@ -180,6 +180,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "hex",
+ "hmac",
  "http",
  "http-body-util",
  "hyper",
@@ -192,6 +193,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "sha2",
  "tar",
  "tokio",
  "tokio-rustls",
@@ -206,6 +208,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "serde_json",
  "tokio",
  "tokio-vsock",
 ]

@@ -39,6 +39,9 @@ pub struct Ctx {
     pub boot_doc_b64: Option<String>,
     pub signing: SigningKey,
     pub email: Option<crate::notify::EmailConfig>,
+    pub email_limiter: crate::notify::Limiter,
+    /// Domain, or public IP, the server is reached at (informational).
+    pub public_name: Option<String>,
     pub max_code_bytes: usize,
     pub max_total_code_bytes: usize,
     pub slots: tokio::sync::Semaphore,
@@ -152,8 +155,13 @@ struct Event {
 #[derive(Clone, Default, Serialize)]
 pub struct NotifyPrefs {
     pub email: Option<String>,
-    pub webhook_url: Option<String>,
+    /// none | checking | pending (confirmation email sent) | verified | rate_limited | error
+    pub email_status: String,
+    #[serde(skip)]
+    changes: u32,
 }
+
+const MAX_EMAIL_CHANGES: u32 = 5;
 
 fn random_hex(n: usize) -> String {
     let mut b = vec![0u8; n];
@@ -201,6 +209,10 @@ impl Store {
         bail!("unknown session or wrong link")
     }
 
+    pub fn get(&self, id: &str) -> Option<Arc<Session>> {
+        self.sessions.lock().unwrap().get(id).cloned()
+    }
+
     pub fn total_code_bytes(&self) -> u64 {
         let sessions: Vec<Arc<Session>> = self.sessions.lock().unwrap().values().cloned().collect();
         sessions
@@ -239,8 +251,9 @@ impl Session {
             if Some(role) == by || to.is_some_and(|t| t != role) {
                 continue;
             }
-            if let Some(prefs) = st.notify.get(&role).cloned() {
-                tokio::spawn(crate::notify::deliver(ctx.clone(), prefs, self.id.clone(), role, ev.seq, ev.kind.clone(), ev.text.clone(), ev.important));
+            if let (true, Some(NotifyPrefs { email: Some(email), email_status, .. })) = (ev.important, st.notify.get(&role).cloned()) {
+                let verified = email_status == "verified";
+                tokio::spawn(crate::notify::deliver(ctx.clone(), self.id.clone(), role, email, verified, ev.text.clone()));
             }
         }
     }
@@ -443,20 +456,44 @@ impl Session {
         Ok(json!({"run_id": id}))
     }
 
-    pub fn set_notify(&self, role: Role, v: &Value, email_available: bool) -> Result<Value> {
-        let email = clean(v["email"].as_str());
-        let webhook_url = clean(v["webhook_url"].as_str());
+    /// Set (or clear) this role's notification email. A new address gets
+    /// one confirmation email from SES; nothing else is sent until it's confirmed.
+    pub fn set_notify(&self, ctx: &Arc<Ctx>, role: Role, v: &Value) -> Result<Value> {
+        let email = clean(v["email"].as_str()).map(|e| e.to_ascii_lowercase());
         if let Some(e) = &email {
-            ensure!(email_available, "email is not configured on this server; use a webhook or polling");
-            ensure!(e.len() < 254 && e.contains('@') && !e.contains(char::is_whitespace), "that does not look like an email address");
+            ensure!(ctx.email.is_some(), "email is not configured on this server; poll the session instead");
+            let valid = e.len() < 254
+                && e.split('@').count() == 2
+                && e.split('@').all(|p| !p.is_empty())
+                && e.contains('.')
+                && !e.contains(|c: char| c.is_whitespace() || c == ',' || c == '<' || c == '>');
+            ensure!(valid, "that does not look like an email address");
         }
-        if let Some(u) = &webhook_url {
-            let p = url::Url::parse(u).map_err(|_| anyhow!("webhook_url is not a URL"))?;
-            ensure!(p.scheme() == "https" && p.port().unwrap_or(443) == 443, "webhook_url must be https on port 443");
+        let mut st = self.st.lock().unwrap();
+        let prefs = st.notify.entry(role).or_default();
+        if prefs.email == email {
+            return Ok(serde_json::to_value(prefs.clone())?);
         }
-        let prefs = NotifyPrefs { email, webhook_url };
-        self.st.lock().unwrap().notify.insert(role, prefs.clone());
-        Ok(serde_json::to_value(prefs)?)
+        ensure!(prefs.changes < MAX_EMAIL_CHANGES, "the email address for this session can't be changed again");
+        prefs.changes += 1;
+        prefs.email = email.clone();
+        prefs.email_status = if email.is_some() { "checking" } else { "none" }.into();
+        let out = serde_json::to_value(prefs.clone())?;
+        self.changed(&mut st);
+        if let Some(e) = email {
+            tokio::spawn(crate::notify::verify(ctx.clone(), self.id.clone(), role, e));
+        }
+        Ok(out)
+    }
+
+    pub fn set_email_status(&self, role: Role, email: &str, status: &str) {
+        let mut st = self.st.lock().unwrap();
+        if let Some(p) = st.notify.get_mut(&role) {
+            if p.email.as_deref() == Some(email) {
+                p.email_status = status.into();
+                self.changed(&mut st);
+            }
+        }
     }
 
     // ------------------------------------------------------------ runs

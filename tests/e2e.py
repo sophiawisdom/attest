@@ -71,10 +71,13 @@ class Party:
 def main():
     subprocess.run(["cargo", "build", "--offline", "-q", "--manifest-path", os.path.join(ROOT, "Cargo.toml")], check=True)
     work = tempfile.mkdtemp(prefix="attest-e2e-")
+    cfg = os.path.join(work, "host.json")
+    with open(cfg, "w") as f:
+        json.dump({"email_from": "attest@example.com"}, f)
     procs = [
         subprocess.Popen([sys.executable, "-I", os.path.join(ROOT, "tests", "mock_llm.py"), "19999"]),
         subprocess.Popen([os.path.join(BIN, "attest-host"), "--dev", "--no-forward", "--dev-tunnel", "127.0.0.1:15001"], stderr=open(os.path.join(work, "host.log"), "w")),
-        subprocess.Popen([os.path.join(BIN, "attest-enclave"), "--dev", "--dev-listen", "127.0.0.1:18080", "--dev-tunnel", "127.0.0.1:15001"], stderr=open(os.path.join(work, "enclave.log"), "w")),
+        subprocess.Popen([os.path.join(BIN, "attest-enclave"), "--dev", "--dev-listen", "127.0.0.1:18080", "--dev-tunnel", "127.0.0.1:15001", "--dev-config", cfg], stderr=open(os.path.join(work, "enclave.log"), "w")),
     ]
     try:
         for _ in range(100):
@@ -181,8 +184,11 @@ def run(work):
     check(out.returncode != 0, "tampered certificate is rejected")
 
     print("notifications")
-    check(call("POST", f"/api/sessions/{s['session_id']}/notify", auditor.token, {"webhook_url": "http://example.com/x"})[0] == 400, "plain-http webhooks are refused")
-    check(ok("POST", f"/api/sessions/{s['session_id']}/notify", auditor.token, {"webhook_url": "https://example.com/hook"})["webhook_url"] == "https://example.com/hook", "https webhook accepted")
+    check(call("POST", f"/api/sessions/{s['session_id']}/notify", auditor.token, {"email": "not an address"})[0] == 400, "bad email address is refused")
+    n = ok("POST", f"/api/sessions/{s['session_id']}/notify", auditor.token, {"email": "Auditor@Example.com"})
+    check(n["email"] == "auditor@example.com" and n["email_status"] in ("checking", "verified"), "email is accepted pending confirmation")
+    v = auditor.wait_until(lambda v: v["notify"]["email_status"] == "verified", "dev email confirmation", timeout=10)
+    check(v["email_available"], "server offers email")
     events = auditor.view()["events"]
     check(not any("trace" in e["text"].lower() for e in events) and len(events) > 5, "auditor event feed is populated")
 

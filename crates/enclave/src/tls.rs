@@ -53,7 +53,13 @@ impl ResolvesServerCert for CertResolver {
         if wants_acme {
             let guard = self.challenge.read().unwrap();
             if let Some((name, ck)) = guard.as_ref() {
-                if hello.server_name().is_some_and(|sni| sni.eq_ignore_ascii_case(name)) {
+                // IP identifiers are validated with the reverse-DNS name as
+                // SNI (RFC 8738), or none at all.
+                let ok = match hello.server_name() {
+                    Some(sni) => sni.eq_ignore_ascii_case(name) || sni.eq_ignore_ascii_case(&reverse_dns(name)),
+                    None => name.parse::<std::net::IpAddr>().is_ok(),
+                };
+                if ok {
                     return Some(ck.clone());
                 }
             }
@@ -242,4 +248,32 @@ fn x509_leaf_spki(cert: &[u8]) -> Result<(usize, Vec<u8>)> {
         anyhow::bail!("unexpected der layout");
     }
     Ok((p, cert[p..cs + cl].to_vec()))
+}
+
+/// "1.2.3.4" -> "4.3.2.1.in-addr.arpa" (and the ip6.arpa form for IPv6).
+fn reverse_dns(name: &str) -> String {
+    match name.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            let o = v4.octets();
+            format!("{}.{}.{}.{}.in-addr.arpa", o[3], o[2], o[1], o[0])
+        }
+        Ok(std::net::IpAddr::V6(v6)) => {
+            let hex: String = v6.octets().iter().map(|b| format!("{b:02x}")).collect();
+            let mut out: Vec<String> = hex.chars().rev().map(|c| c.to_string()).collect();
+            out.push("ip6.arpa".into());
+            out.join(".")
+        }
+        Err(_) => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ip_names_become_ip_sans() {
+        let p = rcgen::CertificateParams::new(vec!["16.147.102.127".to_string(), "example.com".to_string()]).unwrap();
+        assert!(matches!(p.subject_alt_names[0], rcgen::SanType::IpAddress(_)));
+        assert!(matches!(p.subject_alt_names[1], rcgen::SanType::DnsName(_)));
+        assert_eq!(super::reverse_dns("16.147.102.127"), "127.102.147.16.in-addr.arpa");
+    }
 }

@@ -58,10 +58,12 @@ cargo build && python3 tests/e2e.py
 
 ## Deploy
 
-`deploy/launch-graviton.sh` creates a Graviton Nitro parent. On it, run
-`build/build-eif.sh` (a reproducible arm64 build plus `nitro-cli build-enclave`),
-then `deploy/run.sh`. Point a DNS-only A record at the instance. The enclave
-gets its own Let's Encrypt certificate once the name resolves to it.
+Only AWS is needed. `deploy/self-host.sh` launches a Graviton Nitro instance,
+builds the enclave image on it reproducibly, checks PCR0 against
+`measurements/`, and starts the service. The enclave gets a Let's Encrypt
+certificate for its Elastic IP, and sends email notifications through SES in
+sandbox mode, so only confirmed addresses get mail. Agents poll instead. See
+[SELF_HOSTING.md](SELF_HOSTING.md).
 
 ## Limits
 

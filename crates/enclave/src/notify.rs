@@ -1,68 +1,93 @@
-//! Notifications: webhooks (for agents) and email. Payloads say only that
-//! something happened; the party then polls the session for details.
+//! Email notifications through Amazon SES, for people. (Agents poll.)
+//!
+//! Not an open relay: SES runs in sandbox mode, where it only delivers to
+//! addresses that have confirmed. Entering an address makes SES send that
+//! address one confirmation email; nothing else reaches it until the link is
+//! clicked. Those confirmation requests are rate-limited. Messages say only
+//! that something happened in a session.
 
-use crate::sessions::{Ctx, NotifyPrefs};
+use crate::sessions::Ctx;
 use attest_core::Role;
-use serde_json::json;
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub struct EmailConfig {
-    /// Resend (https://resend.com) API key.
-    pub resend_api_key: String,
-    /// Sender, e.g. "attest <notify@example.com>"; its domain must be verified with Resend.
+    /// Sender address; must itself be verified in SES by the operator.
     pub from: String,
+    pub region: String,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn deliver(ctx: Arc<Ctx>, prefs: NotifyPrefs, session_id: String, role: Role, seq: u64, kind: String, text: String, important: bool) {
-    if let Some(url) = prefs.webhook_url {
-        let body = json!({
-            "service": "attest",
-            "session_id": session_id,
-            "role": role,
-            "event": {"seq": seq, "kind": kind, "text": text},
-            "hint": "GET /api/sessions/{session_id} with your link's token for details",
-        });
-        if let Err(e) = webhook(&ctx, &url, serde_json::to_vec(&body).unwrap_or_default()).await {
-            crate::log(&format!("webhook for session {}: {e:#}", &session_id[..8]));
+/// Confirmation requests allowed per hour, across all sessions.
+const VERIFICATIONS_PER_HOUR: usize = 30;
+
+#[derive(Default)]
+pub struct Limiter {
+    recent: Mutex<VecDeque<u64>>,
+}
+
+impl Limiter {
+    fn allow(&self) -> bool {
+        let now = attest_core::now_ms();
+        let mut q = self.recent.lock().unwrap();
+        while q.front().is_some_and(|t| now - t > 3_600_000) {
+            q.pop_front();
         }
+        if q.len() >= VERIFICATIONS_PER_HOUR {
+            return false;
+        }
+        q.push_back(now);
+        true
     }
-    if important {
-        if let (Some(to), Some(cfg)) = (prefs.email, ctx.email.clone()) {
-            if let Err(e) = email(&ctx, &cfg, &to, &session_id, &text).await {
-                crate::log(&format!("email for session {}: {e:#}", &session_id[..8]));
+}
+
+/// Check or start confirmation of `email` and record the result on the session.
+pub async fn verify(ctx: Arc<Ctx>, session_id: String, role: Role, email: String) {
+    let (Some(cfg), Some(session)) = (ctx.email.clone(), ctx.store.get(&session_id)) else { return };
+    let status = if ctx.dev {
+        crate::log(&format!("dev outbox: would ask SES to verify {email}"));
+        "verified"
+    } else {
+        match crate::aws::verification_status(&ctx.net, ctx.dev, &cfg.region, &email).await {
+            Ok(Some(s)) if s == "Success" => "verified",
+            Ok(Some(s)) if s == "Pending" => "pending",
+            Ok(_) if !ctx.email_limiter.allow() => "rate_limited",
+            Ok(_) => match crate::aws::request_verification(&ctx.net, ctx.dev, &cfg.region, &email).await {
+                Ok(()) => "pending",
+                Err(e) => {
+                    crate::log(&format!("ses verify: {e:#}"));
+                    "error"
+                }
+            },
+            Err(e) => {
+                crate::log(&format!("ses status: {e:#}"));
+                "error"
             }
         }
-    }
-}
-
-async fn webhook(ctx: &Ctx, url: &str, body: Vec<u8>) -> anyhow::Result<()> {
-    let u = url::Url::parse(url)?;
-    let host = u.host_str().ok_or_else(|| anyhow::anyhow!("no host"))?;
-    let path = match u.query() {
-        Some(q) => format!("{}?{q}", u.path()),
-        None => u.path().to_string(),
     };
-    let r = ctx.net.request(true, host, 443, &path, &[("user-agent", "attest-enclave")], body, Duration::from_secs(20)).await?;
-    anyhow::ensure!(r.status < 400, "HTTP {}", r.status);
-    Ok(())
+    session.set_email_status(role, &email, status);
 }
 
-async fn email(ctx: &Ctx, cfg: &EmailConfig, to: &str, session_id: &str, text: &str) -> anyhow::Result<()> {
-    let host = ctx.info.domain.clone().unwrap_or_else(|| "the attest server".into());
-    let body = json!({
-        "from": cfg.from,
-        "to": [to],
-        "subject": format!("attest: {}", text.chars().take(90).collect::<String>()),
-        "text": format!("{text}\n\nSession {} on {host}. Open your session link to continue.\n\nYou are getting this because someone set this address for notifications in an attest session.", &session_id[..8]),
-    });
-    let auth = format!("Bearer {}", cfg.resend_api_key);
-    let r = ctx
-        .net
-        .request(true, "api.resend.com", 443, "/emails", &[("authorization", &auth)], serde_json::to_vec(&body)?, Duration::from_secs(20))
-        .await?;
-    anyhow::ensure!(r.status < 400, "HTTP {}: {}", r.status, String::from_utf8_lossy(&r.body[..r.body.len().min(300)]));
-    Ok(())
+pub async fn deliver(ctx: Arc<Ctx>, session_id: String, role: Role, email: String, verified: bool, text: String) {
+    let (Some(cfg), Some(session)) = (ctx.email.clone(), ctx.store.get(&session_id)) else { return };
+    let server = ctx.public_name.clone().unwrap_or_else(|| "the attest server".into());
+    let subject = format!("attest: {}", text.chars().take(90).collect::<String>());
+    let body = format!(
+        "{text}\n\nSession {} on {server}. Open your session link to continue.\n\nYou are getting this because this address was entered and confirmed for notifications in an attest session.",
+        &session.id[..8]
+    );
+    if ctx.dev {
+        crate::log(&format!("dev outbox: to {email}: {subject}"));
+        return;
+    }
+    if !verified {
+        // Confirmation may have happened since; check before giving up.
+        match crate::aws::verification_status(&ctx.net, ctx.dev, &cfg.region, &email).await {
+            Ok(Some(s)) if s == "Success" => session.set_email_status(role, &email, "verified"),
+            _ => return,
+        }
+    }
+    if let Err(e) = crate::aws::send_email(&ctx.net, ctx.dev, &cfg.region, &cfg.from, &email, &subject, &body).await {
+        crate::log(&format!("email for session {}: {e:#}", &session.id[..8]));
+    }
 }

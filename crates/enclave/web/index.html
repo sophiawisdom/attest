@@ -481,12 +481,20 @@ function renderActivity(v) {
 }
 function renderNotify(v) {
   const n = v.notify || {};
-  patch("cNotify", `<h3>Notifications</h3><div class="stack" data-keep="notify">
-    <p class="small muted">Runs can take a while. Get told when it's your turn.</p>
-    ${v.email_available ? `<label class="f">Email<input type="email" id="nEmail" value="${esc(n.email || "")}" placeholder="you@example.com"></label>` : `<p class="small faint">Email isn't configured on this server.</p>`}
-    <label class="f">Webhook (for agents)<input type="text" id="nHook" value="${esc(n.webhook_url || "")}" placeholder="https://…"></label>
-    <div class="row"><button class="btn" data-act="notify">Save</button></div>
-    <p class="small faint">Or poll: <code>GET /api/sessions/${esc(S.sid.slice(0, 6))}…?version=N&amp;wait=25</code> (<a href="/agents.md">guide</a>)</p></div>`);
+  const st = {
+    checking: ["", "Checking…"],
+    pending: ["warn", "Check your inbox for a confirmation email from Amazon Web Services and click its link. Nothing else is sent until you do."],
+    verified: ["ok", "Confirmed. You'll get an email when it's your turn."],
+    rate_limited: ["bad", "Too many new addresses on this server right now; try again in an hour."],
+    error: ["bad", "Couldn't set up email for this address."],
+  }[n.email_status];
+  patch("cNotify", `<h3>Email me</h3>
+    ${v.email_available ? `<div class="stack" data-keep="notify-${esc(n.email || "")}">
+      <p class="small muted">Runs can take a while. Get an email when it's your turn.</p>
+      <div class="linkbox"><input type="email" id="nEmail" value="${esc(n.email || "")}" placeholder="you@example.com"><button class="btn" data-act="notify">Save</button></div></div>
+      ${n.email && st ? `<div class="callout ${st[0] || "info"} small"><span>${esc(st[1])}</span></div>` : ""}`
+    : `<p class="small faint">Email isn't set up on this server.</p>`}
+    <p class="small faint">Agents: poll <code>GET /api/sessions/ID?version=N&amp;wait=25</code> (<a href="/agents.md">guide</a>).</p>`);
 }
 
 // ---------------------------------------------------------------- actions
@@ -528,7 +536,7 @@ document.addEventListener("click", async (e) => {
     "release": () => sapi(`/runs/${b.dataset.run}/release`, { method: "POST", body: { release: true, note: val("note-" + b.dataset.run) } }),
     "decline": () => sapi(`/runs/${b.dataset.run}/release`, { method: "POST", body: { release: false, note: val("note-" + b.dataset.run) } }),
     "followup": () => sapi(`/runs/${b.dataset.run}/followup`, { method: "POST", body: { text: val("fu-" + b.dataset.run), blinded: $("#fub-" + b.dataset.run)?.checked } }),
-    "notify": () => sapi("/notify", { method: "POST", body: { email: val("nEmail"), webhook_url: val("nHook") } }),
+    "notify": () => sapi("/notify", { method: "POST", body: { email: val("nEmail") } }),
   };
   if (!actions[act]) return;
   await busy(b, async () => {

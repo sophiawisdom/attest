@@ -19,6 +19,8 @@ use std::time::Duration;
 /// Let's Encrypt certificates last 90 days. A fresh key per boot means a
 /// new certificate per boot anyway.
 const RENEW_AFTER: Duration = Duration::from_secs(60 * 24 * 3600);
+/// IP-address certificates are short-lived (about six days).
+const RENEW_IP_AFTER: Duration = Duration::from_secs(3 * 24 * 3600);
 
 struct NetHttp {
     net: Net,
@@ -93,7 +95,8 @@ pub async fn run(net: Net, tls: Arc<ServerIdentity>, name: String, directory: St
             Ok(()) => {
                 crate::log(&format!("acme: certificate installed for {name}"));
                 backoff = Duration::from_secs(60);
-                tokio::time::sleep(RENEW_AFTER).await;
+                let ip = name.parse::<std::net::IpAddr>().is_ok();
+                tokio::time::sleep(if ip { RENEW_IP_AFTER } else { RENEW_AFTER }).await;
             }
             Err(e) => {
                 tls.clear_challenge();
@@ -120,8 +123,16 @@ async fn obtain(net: &Net, tls: &ServerIdentity, name: &str, directory: &str, ac
         *account = Some(acct);
     }
     let account = account.as_ref().expect("set above");
-    let idents = [Identifier::Dns(name.to_string())];
-    let mut order = account.new_order(&NewOrder::new(&idents)).await.context("new order")?;
+    let ip = name.parse::<std::net::IpAddr>().ok();
+    let idents = [match ip {
+        Some(ip) => Identifier::Ip(ip),
+        None => Identifier::Dns(name.to_string()),
+    }];
+    let mut new_order = NewOrder::new(&idents);
+    if ip.is_some() {
+        new_order = new_order.profile("shortlived");
+    }
+    let mut order = account.new_order(&new_order).await.context("new order")?;
     let mut authorizations = order.authorizations();
     while let Some(result) = authorizations.next().await {
         let mut authz = result.context("authorization")?;
