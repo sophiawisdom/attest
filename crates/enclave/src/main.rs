@@ -11,6 +11,7 @@ mod acme;
 mod aws;
 mod blobs;
 mod bundle;
+mod jail;
 mod llm;
 mod net;
 mod notify;
@@ -173,6 +174,10 @@ async fn read_host_config(args: &Args) -> Result<HostConfig> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--jail-probe") {
+        println!("{}", jail::probe());
+        return Ok(());
+    }
     let args = Args::parse();
     start_log_forwarding(args.dev);
     let attester = nsm::Attester::new(args.dev)?;
@@ -239,6 +244,9 @@ async fn main() -> Result<()> {
     });
     let app = Arc::new(App { ctx: ctx.clone(), attester });
     tokio::spawn(measure_blob_store(ctx.blobs.clone()));
+    if !args.dev {
+        jail::spawn_probe();
+    }
     {
         let (slot, dir) = (ctx.sandbox.clone(), args.python_dir.clone());
         tokio::task::spawn_blocking(move || {

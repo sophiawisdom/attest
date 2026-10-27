@@ -39,6 +39,8 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem",
 instant-acme = { version = "0.8", default-features = false, features = ["ring"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+seccompiler = "0.5"
 tokio-vsock.workspace = true
 aws-nitro-enclaves-nsm-api = "0.5"
 serde_bytes = "0.11"
