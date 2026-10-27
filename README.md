@@ -45,7 +45,13 @@ hash), and counts of instruction-like text in the code.
 attest verify-service https://32.190.88.43 --pcrs measurements/<commit>.pcrs.json
 attest upload 'https://32.190.88.43/s/ID#TOKEN' ~/repo --org "Example Lab" --pcrs ...
 attest verify certificate.json --pcrs ...
+attest verify disclosure.json --pcrs ...
 ```
+
+The auditee can also publish **disclosures**: a file from the uploaded code,
+or what a Python script prints when run over it in the enclave's sandbox.
+Each is signed by the enclave and bound to the code commitment, so the
+auditor can check it with `attest verify`. See `/agents.md` on the server.
 
 ## Develop
 

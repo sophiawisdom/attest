@@ -52,6 +52,14 @@ The script:
 A few minutes later the enclave has its own Let's Encrypt certificate for the
 IP (short-lived, renewed every few days), and `https://IP` works in browsers.
 
+**Test deploys.** Let's Encrypt issues at most 5 certificates a week for one
+IP, and every deploy restarts the enclave, which requests a new one. For
+repeated test deploys add `--acme-staging`: the certificate comes from
+Let's Encrypt's staging CA, which browsers don't trust (use `curl -k`; the
+`attest` CLI checks the enclave's TLS key through attestation either way).
+Or pass `--domain` with an A record pointing at the IP, which has its own
+limit.
+
 **Email.** Notifications go through Amazon SES in sandbox mode, which only
 delivers to confirmed addresses. When someone enters an address in a
 session, SES sends it one confirmation email, and nothing else goes to it
@@ -87,5 +95,8 @@ the enclave. `/agents.md` on the server describes the protocol.
 - `InsufficientInstanceCapacity`: rerun with another `--region` or `--type`.
 - If the PCR0 check prints a WARNING, the build did not reproduce. Report
   it rather than deploying anyway.
+- The script adds SSH access from your current address on every run, so it
+  keeps working if your IP changes. Old addresses stay in the security
+  group; remove them by hand if you like.
 - The script is safe to rerun. It reuses the instance recorded in
   `~/.config/attest/<name>.env`.
