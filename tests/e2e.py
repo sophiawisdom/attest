@@ -104,6 +104,12 @@ def main():
                 break
             except Exception:
                 time.sleep(0.1)
+        # The enclave's boot-time blob benchmark leaves a test blob until it
+        # finishes; wait so it doesn't show up in the host-storage check.
+        for _ in range(600):
+            if "blob store: 16 MiB" in open(os.path.join(work, "enclave.log")).read():
+                break
+            time.sleep(0.1)
         run(work)
         print("ALL E2E CHECKS PASSED")
     finally:

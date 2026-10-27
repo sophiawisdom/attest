@@ -65,6 +65,7 @@ struct Upstream {
 /// those make the provider contact arbitrary URLs, which could carry data
 /// out. Also pins the approved model, forces `store: false`, and pads the
 /// body (see `llm::pad_json`) so its size says little to the parent.
+#[cfg(test)]
 pub fn vet_request(
     provider: Provider,
     path: &str,
@@ -143,6 +144,9 @@ pub fn vet_request_zdr(
             "usage",
         ],
     };
+    // Harness bookkeeping the provider doesn't need (Codex sends install and
+    // session ids here): removed rather than forwarded.
+    obj.remove("client_metadata");
     if let Some(bad) = obj.keys().find(|k| !allowed.contains(&k.as_str())) {
         return Err(format!(
             "request field {bad:?} is not allowed through the attest proxy"
@@ -154,32 +158,14 @@ pub fn vet_request_zdr(
         ));
     }
     if let Some(tools) = obj.get("tools") {
-        let tools = tools.as_array().ok_or("tools must be an array")?;
-        for t in tools {
-            let ty = t.get("type").and_then(|x| x.as_str()).unwrap_or("");
-            let ok = match provider {
-                // Client tools have no type or "custom"; bash/text_editor
-                // tools are executed by the client, inside the jail.
-                Provider::Anthropic => {
-                    ty.is_empty()
-                        || ty == "custom"
-                        || ty.starts_with("bash_")
-                        || ty.starts_with("text_editor_")
-                }
-                // Function tools run in the harness; local_shell too.
-                _ => ty == "function" || ty == "custom" || ty == "local_shell",
-            };
-            if !ok {
-                return Err(format!("tool type {ty:?} is not allowed: the provider would run it outside the enclave"));
-            }
-        }
+        vet_tools(provider, tools, 0)?;
     }
     // Content: only text, tool calls/results and reasoning. Anything that
     // points the provider at a URL or a stored file (images, documents,
     // file ids) is refused, wherever it appears.
     for key in ["input", "messages", "system", "instructions"] {
         if let Some(c) = obj.get(key) {
-            vet_content(c, 0)?;
+            vet_content(provider, c, 0)?;
         }
     }
     if endpoint == "responses" {
@@ -233,7 +219,48 @@ const URL_KEYS: &[&str] = &[
     "file",
 ];
 
-fn vet_content(v: &Value, depth: usize) -> Result<(), String> {
+/// Only tools the harness runs itself, inside the jail. Responses-API
+/// namespaces group such tools and are checked one level down.
+fn vet_tools(provider: Provider, tools: &Value, depth: usize) -> Result<(), String> {
+    let tools = tools.as_array().ok_or("tools must be an array")?;
+    for t in tools {
+        let ty = t.get("type").and_then(|x| x.as_str()).unwrap_or("");
+        let ok = match provider {
+            // Client tools have no type or "custom"; bash/text_editor
+            // tools are executed by the client, inside the jail.
+            Provider::Anthropic => {
+                ty.is_empty()
+                    || ty == "custom"
+                    || ty.starts_with("bash_")
+                    || ty.starts_with("text_editor_")
+            }
+            // Function tools run in the harness; local_shell too.
+            _ => {
+                ty == "function"
+                    || ty == "custom"
+                    || ty == "local_shell"
+                    || (ty == "namespace" && depth == 0)
+            }
+        };
+        if !ok {
+            return Err(format!(
+                "tool type {ty:?} is not allowed: the provider would run it outside the enclave"
+            ));
+        }
+        if ty == "namespace" {
+            vet_tools(provider, t.get("tools").unwrap_or(&Value::Null), depth + 1)?;
+        }
+        if let Some(k) = t
+            .as_object()
+            .and_then(|m| m.keys().find(|k| URL_KEYS.contains(&k.as_str())))
+        {
+            return Err(format!("tool field {k:?} is not allowed"));
+        }
+    }
+    Ok(())
+}
+
+fn vet_content(provider: Provider, v: &Value, depth: usize) -> Result<(), String> {
     if depth > 32 {
         return Err("request content is nested too deeply".into());
     }
@@ -243,6 +270,17 @@ fn vet_content(v: &Value, depth: usize) -> Result<(), String> {
                 return Err(format!("content field {k:?} is not allowed: the provider could fetch it from outside the enclave"));
             }
             if let Some(t) = m.get("type").and_then(|t| t.as_str()) {
+                // Codex sends its tool list as an input item. Its tools are
+                // vetted as tools; their JSON schemas aren't content.
+                if t == "additional_tools" && provider != Provider::Anthropic {
+                    if let Some(k) = m
+                        .keys()
+                        .find(|k| !["type", "id", "role", "tools"].contains(&k.as_str()))
+                    {
+                        return Err(format!("additional_tools field {k:?} is not allowed"));
+                    }
+                    return vet_tools(provider, m.get("tools").unwrap_or(&Value::Null), 0);
+                }
                 if !CONTENT_TYPES.contains(&t) {
                     return Err(format!(
                         "content type {t:?} is not allowed through the attest proxy"
@@ -250,11 +288,13 @@ fn vet_content(v: &Value, depth: usize) -> Result<(), String> {
                 }
             }
             for val in m.values() {
-                vet_content(val, depth + 1)?;
+                vet_content(provider, val, depth + 1)?;
             }
             Ok(())
         }
-        Value::Array(a) => a.iter().try_for_each(|x| vet_content(x, depth + 1)),
+        Value::Array(a) => a
+            .iter()
+            .try_for_each(|x| vet_content(provider, x, depth + 1)),
         _ => Ok(()),
     }
 }
@@ -615,6 +655,39 @@ mod tests {
         )
         .is_err());
         assert!(vet_request(Provider::Anthropic, "/v1/messages", "m", br#"{"model":"m","messages":[],"tools":[{"type":"web_fetch_20250910","name":"web_fetch"}]}"#).is_err());
+        // Codex 0.164 sends tools as an input item, grouped in namespaces.
+        let at = |tool: &str| {
+            format!(
+                r#"{{"model":"m","input":[{{"type":"additional_tools","id":"a","role":"developer","tools":[{{"type":"namespace","name":"functions","description":"d","tools":[{tool}]}}]}},{{"type":"message","role":"user","content":[{{"type":"input_text","text":"hi"}}]}}],"client_metadata":{{"session_id":"s"}}}}"#
+            )
+        };
+        let ok = at(
+            r#"{"type":"function","name":"wait","parameters":{"type":"object","properties":{"ms":{"type":"number"}}}},{"type":"custom","name":"exec","format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"}}"#,
+        );
+        let out = vet_request(Provider::Openai, "/v1/responses", "m", ok.as_bytes()).unwrap();
+        assert!(!String::from_utf8_lossy(&out).contains("client_metadata"));
+        assert!(vet_request(
+            Provider::Openai,
+            "/v1/responses",
+            "m",
+            at(r#"{"type":"web_search"}"#).as_bytes()
+        )
+        .is_err());
+        assert!(vet_request(
+            Provider::Openai,
+            "/v1/responses",
+            "m",
+            at(r#"{"type":"namespace","name":"n","tools":[{"type":"function","name":"f"}]}"#)
+                .as_bytes()
+        )
+        .is_err());
+        assert!(vet_request(
+            Provider::Openai,
+            "/v1/responses",
+            "m",
+            at(r#"{"type":"mcp","server_url":"https://x"}"#).as_bytes()
+        )
+        .is_err());
         assert!(vet_request(
             Provider::Anthropic,
             "/v1/messages",

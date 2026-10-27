@@ -324,11 +324,7 @@ fn exec_inner(spec_json: &str) -> anyhow::Result<i32> {
         // is its own loopback, where one port is bridged to the model proxy.
         check(
             libc::unshare(
-                libc::CLONE_NEWNS
-                    | libc::CLONE_NEWPID
-                    | libc::CLONE_NEWIPC
-                    | libc::CLONE_NEWUTS
-                    | libc::CLONE_NEWNET,
+                libc::CLONE_NEWNS | libc::CLONE_NEWIPC | libc::CLONE_NEWUTS | libc::CLONE_NEWNET,
             ),
             "unshare",
         )?;
@@ -403,9 +399,21 @@ fn exec_inner(spec_json: &str) -> anyhow::Result<i32> {
         let host = cstr("attest-jail");
         libc::sethostname(host.as_ptr(), 11);
 
-        let pid = libc::fork();
+        // The new PID namespace is made by the clone itself, not unshare:
+        // after unshare(CLONE_NEWPID) the kernel refuses to start threads in
+        // this process, and the proxy bridge below needs them. The child
+        // also gets its own copy of the mounts, so its pivot_root doesn't
+        // move this process's root and /work stays reachable for collecting.
+        let pid = libc::syscall(
+            libc::SYS_clone,
+            (libc::CLONE_NEWPID | libc::CLONE_NEWNS | libc::SIGCHLD) as libc::c_ulong,
+            0usize,
+            0usize,
+            0usize,
+            0usize,
+        ) as libc::pid_t;
         if pid < 0 {
-            anyhow::bail!("fork: {}", std::io::Error::last_os_error());
+            anyhow::bail!("clone: {}", std::io::Error::last_os_error());
         }
         if pid == 0 {
             // PID 1 of the new namespace: finish the jail and exec.
@@ -621,7 +629,11 @@ fn install_seccomp() -> anyhow::Result<()> {
         rules,
         SeccompAction::Allow,
         SeccompAction::Errno(libc::EPERM as u32),
-        seccompiler::TargetArch::aarch64,
+        if cfg!(target_arch = "x86_64") {
+            seccompiler::TargetArch::x86_64
+        } else {
+            seccompiler::TargetArch::aarch64
+        },
     )
     .map_err(|e| anyhow::anyhow!("seccomp: {e}"))?;
     let prog: seccompiler::BpfProgram = f
@@ -660,6 +672,12 @@ pub async fn materialize(bundle: &crate::bundle::Bundle, dir: &str) -> anyhow::R
         let data = bundle.read(path).await?;
         let p = format!("{dir}/{path}");
         tokio::fs::write(&p, &*data).await?;
+        // Writing sets the access time; reset it so `accessed_since` counts
+        // only reads made during the run.
+        std::fs::File::options()
+            .write(true)
+            .open(&p)?
+            .set_times(std::fs::FileTimes::new().set_accessed(std::time::UNIX_EPOCH))?;
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o444))?;
     }
     for d in bundle.dirs.iter() {

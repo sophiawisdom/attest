@@ -64,10 +64,12 @@ is written for an agent to follow, and takes one script.
    chosen provider under the key owner's terms (for example zero data
    retention).
 6. A run starts automatically once the latest question is accepted, the code
-   and affidavit are in place, and a model is approved. The agent has five
-   tools: `list_dir`, `find_files`, `read_file`, `grep`, `submit_verdict`.
-   There is no shell and no network access. Its system prompt is fixed in the
-   image (hash in `/api/info`).
+   and affidavit are in place, and a model is approved. The built-in agent
+   has read-only tools: `list_dir`, `find_files`, `read_file`, `grep`,
+   `python` (a sandbox with the code read-only at `/repo`), and
+   `submit_verdict`. It has no shell and no network access. Its system prompt
+   is fixed in the image (hash in `/api/info`). The `codex` agent instead gets
+   a shell in a jail, as described in step 5.
 7. The run ends with a verdict: `yes`, `no`, `inconclusive`, or
    `needs_clarification` (with a `clarification_request` for the auditor).
 8. The auditee decides: `POST /api/sessions/ID/runs/RUN_ID/release`
@@ -119,20 +121,21 @@ The auditee can follow a run live with `GET /api/sessions/ID/runs/RUN_ID/trace?a
 | | auditee | auditor |
 |---|---|---|
 | question and its versions, decisions, notes | yes | yes |
-| code | metadata only (it's theirs) | tree hash, file count, size |
+| code | metadata only (it's theirs) | a salted commitment only; each released certificate opens it |
 | affidavit | yes | yes |
 | model proposals (provider, model, who proposed) | yes | yes |
 | API keys | never | never |
 | live agent trace | yes | no |
-| run status | yes, with step count | yes |
+| run status | yes, with step count | only "running" until the auditee decides |
 | verdict and certificate | always | only after release |
 | follow-up message text | unless blinded | yes |
 
 The server operator's machine (the enclave's parent) stores uploaded files,
 but only sealed: each file is encrypted with ChaCha20-Poly1305 under a
 per-session key that never leaves the enclave, and bound to its session,
-path and content hash. The operator learns the number of files, their sizes,
-and when each is read, and nothing else. A file it alters or swaps fails
+path and content hash. The operator learns the number of files and their
+sizes. A run loads the whole repository into enclave memory before it
+starts, so the operator doesn't learn which files the agent reads. A file it alters or swaps fails
 authentication and is refused. Limits: 64 MiB per file, 1 GiB per upload by
 default.
 

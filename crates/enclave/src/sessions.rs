@@ -1629,7 +1629,7 @@ fn minimize_for_strict_format(m: &mut Manifest) {
     m.started_at_ms -= m.started_at_ms % hour;
     m.finished_at_ms -= m.finished_at_ms % hour;
     if let Outcome::Error { message } = &mut m.outcome {
-        *message = "the run failed".into();
+        *message = "details withheld (strict answer format)".into();
     }
 }
 

@@ -179,7 +179,7 @@ pub async fn run_codex(
             env: vec![
                 ("PATH".into(), "/usr/bin:/bin".into()),
                 ("HOME".into(), "/work".into()),
-                ("CODEX_HOME".into(), "/work/.codex".into()),
+                ("CODEX_HOME".into(), "/work".into()),
                 ("TMPDIR".into(), "/tmp".into()),
                 ("ATTEST_PROXY_TOKEN".into(), proxy.token.clone()),
                 ("NO_COLOR".into(), "1".into()),
