@@ -84,9 +84,18 @@ async fn read_host_config(args: &Args) -> Result<HostConfig> {
     {
         use tokio::io::AsyncReadExt;
         let addr = tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_HOST, CONFIG_VSOCK_PORT);
-        let mut s = tokio::time::timeout(Duration::from_secs(30), tokio_vsock::VsockStream::connect(addr))
-            .await
-            .map_err(|_| anyhow!("timeout reaching parent config service"))??;
+        // The parent's config service may start after us; keep trying for a minute.
+        let mut attempt = 0;
+        let mut s = loop {
+            match tokio::time::timeout(Duration::from_secs(5), tokio_vsock::VsockStream::connect(addr)).await {
+                Ok(Ok(s)) => break s,
+                _ if attempt < 60 => {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                _ => bail!("cannot reach the parent config service on vsock {CONFIG_VSOCK_PORT}"),
+            }
+        };
         let mut buf = Vec::new();
         (&mut s).take(1 << 20).read_to_end(&mut buf).await?;
         Ok(serde_json::from_slice(&buf).context("host config JSON")?)

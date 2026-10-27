@@ -21,7 +21,7 @@ NAME=attest
 # The host must be up first: the enclave reads its config at boot.
 sudo pkill -f "attest-host --enclave-cid" || true
 sudo nohup build/out/bin/attest-host --enclave-cid "$CID" --listen 0.0.0.0:443 --config "$CONFIG" >> attest-host.log 2>&1 &
-sleep 1
+sleep 2
 
 if nitro-cli describe-enclaves | grep -q "\"EnclaveName\": \"$NAME\""; then
   nitro-cli terminate-enclave --enclave-name "$NAME"
