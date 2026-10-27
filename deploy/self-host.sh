@@ -37,7 +37,9 @@ while [ $# -gt 0 ]; do
 done
 [[ "$NAME" =~ ^[a-z0-9-]{1,40}$ ]] || { echo "--name must be lowercase letters, digits and dashes" >&2; exit 2; }
 say() { printf '\n== %s\n' "$*"; }
-aws() { command aws --region "$REGION" "$@"; }
+# Region-scoped AWS CLI. (Not `command aws` in conditions: macOS bash 3.2
+# exits under set -e when a `command` builtin fails inside `if !`.)
+awsr() { aws --region "$REGION" "$@"; }
 
 STATE_DIR=${ATTEST_STATE_DIR:-$HOME/.config/attest}
 STATE="$STATE_DIR/$NAME.env"
@@ -56,7 +58,7 @@ case "$TYPE" in
 esac
 
 say "checking AWS credentials"
-command aws sts get-caller-identity --query Account --output text
+aws sts get-caller-identity --query Account --output text
 
 if [ -z "$REPO" ]; then
   REPO=$(git remote get-url origin 2>/dev/null || echo https://github.com/sophiawisdom/attest)
@@ -72,50 +74,50 @@ echo "repo $REPO @ $COMMIT"
 
 say "IAM role for the instance (SES only)"
 ROLE="$NAME-instance"
-if ! command aws iam get-role --role-name "$ROLE" >/dev/null 2>&1; then
-  command aws iam create-role --role-name "$ROLE" --description "attest enclave parent: send and verify SES email" \
+if ! aws iam get-role --role-name "$ROLE" >/dev/null 2>&1; then
+  aws iam create-role --role-name "$ROLE" --description "attest enclave parent: send and verify SES email" \
     --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}' >/dev/null
 fi
-command aws iam put-role-policy --role-name "$ROLE" --policy-name ses \
+aws iam put-role-policy --role-name "$ROLE" --policy-name ses \
   --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ses:SendEmail","ses:VerifyEmailIdentity","ses:GetIdentityVerificationAttributes"],"Resource":"*"}]}'
-if ! command aws iam get-instance-profile --instance-profile-name "$ROLE" >/dev/null 2>&1; then
-  command aws iam create-instance-profile --instance-profile-name "$ROLE" >/dev/null
-  command aws iam add-role-to-instance-profile --instance-profile-name "$ROLE" --role-name "$ROLE"
+if ! aws iam get-instance-profile --instance-profile-name "$ROLE" >/dev/null 2>&1; then
+  aws iam create-instance-profile --instance-profile-name "$ROLE" >/dev/null
+  aws iam add-role-to-instance-profile --instance-profile-name "$ROLE" --role-name "$ROLE"
   sleep 10  # IAM propagation
 fi
 if [ -n "$EMAIL_FROM" ]; then
-  STATUS=$(aws ses get-identity-verification-attributes --identities "$EMAIL_FROM" --query "VerificationAttributes.\"$EMAIL_FROM\".VerificationStatus" --output text 2>/dev/null || true)
+  STATUS=$(awsr ses get-identity-verification-attributes --identities "$EMAIL_FROM" --query "VerificationAttributes.\"$EMAIL_FROM\".VerificationStatus" --output text 2>/dev/null || true)
   if [ "$STATUS" != Success ]; then
-    aws ses verify-email-identity --email-address "$EMAIL_FROM"
+    awsr ses verify-email-identity --email-address "$EMAIL_FROM"
     echo "SES sent a confirmation email to $EMAIL_FROM. Click its link; notifications start once it's confirmed."
   else
     echo "$EMAIL_FROM is already confirmed in SES"
   fi
 fi
 
-if [ -z "${INSTANCE:-}" ] || [ "$(aws ec2 describe-instances --instance-ids "$INSTANCE" --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null)" != running ]; then
+if [ -z "${INSTANCE:-}" ] || [ "$(awsr ec2 describe-instances --instance-ids "$INSTANCE" --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null)" != running ]; then
   say "creating key pair, security group, Elastic IP and instance in $REGION"
   if [ ! -f "$KEY" ]; then
-    aws ec2 create-key-pair --key-name "$NAME-key" --query KeyMaterial --output text > "$KEY"
+    awsr ec2 create-key-pair --key-name "$NAME-key" --query KeyMaterial --output text > "$KEY"
     chmod 600 "$KEY"
   fi
-  VPC=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
+  VPC=$(awsr ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
   [ "$VPC" != None ] || { echo "no default VPC in $REGION" >&2; exit 1; }
-  AZS=$(aws ec2 describe-instance-type-offerings --location-type availability-zone --filters "Name=instance-type,Values=$TYPE" --query 'InstanceTypeOfferings[].Location' --output text)
+  AZS=$(awsr ec2 describe-instance-type-offerings --location-type availability-zone --filters "Name=instance-type,Values=$TYPE" --query 'InstanceTypeOfferings[].Location' --output text)
   SUBNET=""
   for az in $AZS; do
-    SUBNET=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC" "Name=availability-zone,Values=$az" "Name=default-for-az,Values=true" --query 'Subnets[0].SubnetId' --output text)
+    SUBNET=$(awsr ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC" "Name=availability-zone,Values=$az" "Name=default-for-az,Values=true" --query 'Subnets[0].SubnetId' --output text)
     [ "$SUBNET" != None ] && break
   done
   [ -n "$SUBNET" ] && [ "$SUBNET" != None ] || { echo "$TYPE is not offered in a default subnet in $REGION" >&2; exit 1; }
-  SG=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=$NAME" "Name=vpc-id,Values=$VPC" --query 'SecurityGroups[0].GroupId' --output text)
+  SG=$(awsr ec2 describe-security-groups --filters "Name=group-name,Values=$NAME" "Name=vpc-id,Values=$VPC" --query 'SecurityGroups[0].GroupId' --output text)
   if [ "$SG" = None ]; then
     MYIP=$(curl -s https://checkip.amazonaws.com | tr -d '[:space:]')
-    SG=$(aws ec2 create-security-group --group-name "$NAME" --vpc-id "$VPC" --description "attest: HTTPS from anywhere, SSH from the deployer" --query GroupId --output text)
-    aws ec2 authorize-security-group-ingress --group-id "$SG" --protocol tcp --port 22 --cidr "$MYIP/32" >/dev/null
-    aws ec2 authorize-security-group-ingress --group-id "$SG" --ip-permissions 'IpProtocol=tcp,FromPort=443,ToPort=443,IpRanges=[{CidrIp=0.0.0.0/0}],Ipv6Ranges=[{CidrIpv6=::/0}]' >/dev/null
+    SG=$(awsr ec2 create-security-group --group-name "$NAME" --vpc-id "$VPC" --description "attest: HTTPS from anywhere, SSH from the deployer" --query GroupId --output text)
+    awsr ec2 authorize-security-group-ingress --group-id "$SG" --protocol tcp --port 22 --cidr "$MYIP/32" >/dev/null
+    awsr ec2 authorize-security-group-ingress --group-id "$SG" --ip-permissions 'IpProtocol=tcp,FromPort=443,ToPort=443,IpRanges=[{CidrIp=0.0.0.0/0}],Ipv6Ranges=[{CidrIpv6=::/0}]' >/dev/null
   fi
-  AMI=$(aws ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64 --query Parameter.Value --output text)
+  AMI=$(awsr ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64 --query Parameter.Value --output text)
   USERDATA=$(cat <<EOF
 #!/bin/bash
 set -euxo pipefail
@@ -128,7 +130,7 @@ touch /var/lib/attest-bootstrapped
 EOF
 )
   for _ in 1 2 3 4 5 6; do
-    INSTANCE=$(aws ec2 run-instances --image-id "$AMI" --instance-type "$TYPE" --key-name "$NAME-key" \
+    INSTANCE=$(awsr ec2 run-instances --image-id "$AMI" --instance-type "$TYPE" --key-name "$NAME-key" \
     --iam-instance-profile "Name=$ROLE" \
     --network-interfaces "DeviceIndex=0,SubnetId=$SUBNET,Groups=$SG,AssociatePublicIpAddress=true" \
     --enclave-options Enabled=true --metadata-options HttpTokens=required,HttpEndpoint=enabled \
@@ -140,17 +142,17 @@ EOF
   [ -n "${INSTANCE:-}" ] || { echo "could not launch the instance" >&2; exit 1; }
   save
   echo "instance $INSTANCE ($TYPE)"
-  aws ec2 wait instance-running --instance-ids "$INSTANCE"
+  awsr ec2 wait instance-running --instance-ids "$INSTANCE"
   if [ -z "${ALLOC:-}" ]; then
-    ALLOC=$(aws ec2 allocate-address --domain vpc --tag-specifications "ResourceType=elastic-ip,Tags=[{Key=Name,Value=$NAME}]" --query AllocationId --output text)
+    ALLOC=$(awsr ec2 allocate-address --domain vpc --tag-specifications "ResourceType=elastic-ip,Tags=[{Key=Name,Value=$NAME}]" --query AllocationId --output text)
   fi
-  aws ec2 associate-address --allocation-id "$ALLOC" --instance-id "$INSTANCE" >/dev/null
-  IP=$(aws ec2 describe-addresses --allocation-ids "$ALLOC" --query 'Addresses[0].PublicIp' --output text)
+  awsr ec2 associate-address --allocation-id "$ALLOC" --instance-id "$INSTANCE" >/dev/null
+  IP=$(awsr ec2 describe-addresses --allocation-ids "$ALLOC" --query 'Addresses[0].PublicIp' --output text)
   save
 fi
 echo "instance $INSTANCE at $IP"
-if [ "$(aws ec2 describe-iam-instance-profile-associations --filters "Name=instance-id,Values=$INSTANCE" --query 'IamInstanceProfileAssociations[0].State' --output text)" = None ]; then
-  aws ec2 associate-iam-instance-profile --instance-id "$INSTANCE" --iam-instance-profile "Name=$ROLE" >/dev/null
+if [ "$(awsr ec2 describe-iam-instance-profile-associations --filters "Name=instance-id,Values=$INSTANCE" --query 'IamInstanceProfileAssociations[0].State' --output text)" = None ]; then
+  awsr ec2 associate-iam-instance-profile --instance-id "$INSTANCE" --iam-instance-profile "Name=$ROLE" >/dev/null
 fi
 
 SSH=(ssh -i "$KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$STATE_DIR/$NAME.known_hosts" -o ConnectTimeout=10 -o BatchMode=yes "ec2-user@$IP")
