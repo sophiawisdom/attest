@@ -371,7 +371,7 @@ function renderModel(v) {
   let body = "";
   const rows = [...v.models].reverse().filter(m => m.status !== "superseded");
   if (rows.length) body += `<div class="stack" style="gap:8px">${rows.map(m => `<div class="row" style="justify-content:space-between">
-      <div class="row" style="gap:8px"><b>${esc(m.provider)} / ${esc(m.model)}</b>${statusPill(m.status)}${m.fine_tuned ? `<span class="pill warn">fine-tune</span>` : ""}<span class="faint small">key from the ${esc(m.proposed_by)}</span></div>
+      <div class="row" style="gap:8px"><b>${esc(m.provider)} / ${esc(m.model)}</b>${m.agent && m.agent !== "builtin" ? `<span class="pill">${esc(m.agent)}</span>` : ""}${statusPill(m.status)}${m.fine_tuned ? `<span class="pill warn">fine-tune</span>` : ""}<span class="faint small">key from the ${esc(m.proposed_by)}</span></div>
       ${isAuditee() && m.status === "pending" ? `<div class="row"><button class="btn primary" data-act="m-approve" data-id="${m.id}">Approve</button><button class="btn danger" data-act="m-reject" data-id="${m.id}">Reject</button></div>` : ""}
     </div>${m.note ? `<div class="small faint">“${esc(m.note)}”</div>` : ""}`).join("")}</div>`;
   else body += `<p class="muted">${isAuditee() ? "Choose the model and API key the agent will use." : "The auditee usually chooses the model and key. You can offer your own instead; the auditee must approve it."}</p>`;
@@ -382,6 +382,7 @@ function renderModel(v) {
     body += `<details data-keep="mform" ${open ? "open" : ""}><summary>${isAuditee() ? (approved ? "Use a different model" : "Choose model and key") : "Offer your own model and key"}</summary>
       <div class="stack" style="margin-top:10px">
         <div class="seg" id="mProv">${providers.map((p, i) => `<button type="button" data-act="prov" data-p="${p.id}" aria-pressed="${i === 0}">${esc(p.label)}</button>`).join("")}</div>
+        ${(S.info?.harness?.agents || []).length > 1 ? `<label class="f">Agent<select id="mAgent">${S.info.harness.agents.map(a => `<option value="${esc(a.split(" ")[0])}">${a === "builtin" ? "Built-in tools (read, grep, python sandbox)" : esc(a) + " (full shell in a jail; OpenAI or OpenRouter)"}</option>`).join("")}</select></label>` : ""}
         <div class="grid2"><label class="f">Model<input type="text" id="mModel" placeholder="${esc(providers[0].ph)}"></label>
           <label class="f">API key<input type="password" id="mKey" autocomplete="off" placeholder="sk-…"></label></div>
         <label class="check" id="mZdrRow" hidden><input type="checkbox" id="mZdr" checked><span>Zero-data-retention endpoints only</span></label>
@@ -427,7 +428,11 @@ function traceHtml(entries) {
     } else if (e.type === "tool_result" && e.name !== "submit_verdict") {
       const c = String(e.content || ""); const n = c.split("\n").length;
       out.push(`<div class="ev"><div class="who"></div><div class="what"><details><summary class="small">${esc(e.name)} · ${num(n)} line${n === 1 ? "" : "s"}</summary><pre class="out">${esc(c)}</pre></details></div></div>`);
-    } else if (e.type === "harness") out.push(`<div class="ev"><div class="who">Harness</div><div class="what faint small">${esc(e.content)}</div></div>`);
+    } else if (e.type === "model_exchange") {
+      const req = e.request || {};
+      out.push(`<div class="ev"><div class="who">Model</div><div class="what"><details><summary class="small">exchange · ${num(req.bytes)} bytes sent · HTTP ${esc(e.status)}</summary><div class="small faint" style="margin-top:6px">Latest input</div><pre class="out">${esc(req.latest || "")}</pre><div class="small faint">Response</div><pre class="out">${esc(e.response || "")}</pre></details></div></div>`);
+    } else if (e.type === "harness_log") out.push(`<div class="ev"><div class="who">Agent log</div><div class="what"><pre class="out" style="margin:0">${esc(e.content)}</pre></div></div>`);
+    else if (e.type === "harness") out.push(`<div class="ev"><div class="who">Harness</div><div class="what faint small">${esc(e.content)}</div></div>`);
     else if (e.type === "error") out.push(`<div class="ev"><div class="who">Error</div><div class="what"><div class="callout bad"><span>${esc(e.content)}</span></div></div></div>`);
     else if (e.type === "files_read") out.push(`<div class="ev"><div class="who">Read</div><div class="what"><div class="pills">${(e.paths || []).map(p => `<span class="pill mono">${esc(p)}</span>`).join("") || `<span class="faint small">no files</span>`}</div></div></div>`);
   }
@@ -530,7 +535,7 @@ document.addEventListener("click", async (e) => {
       if (!$("#aSign").checked) throw new Error("Tick the box to confirm the statement.");
       return sapi("/affidavit", { method: "POST", body: { organization: val("aOrg"), repo_url: val("aRepo"), git_commit: val("aCommit"), tree_sha256: b.dataset.tree } });
     },
-    "propose-model": () => sapi("/models", { method: "POST", body: { provider: $("#mProv [aria-pressed=true]").dataset.p, model: val("mModel"), api_key: val("mKey"), openrouter_zdr: $("#mZdr")?.checked, mock_endpoint: val("mMock") } }),
+    "propose-model": () => sapi("/models", { method: "POST", body: { provider: $("#mProv [aria-pressed=true]").dataset.p, model: val("mModel"), api_key: val("mKey"), openrouter_zdr: $("#mZdr")?.checked, mock_endpoint: val("mMock"), agent: val("mAgent") || "builtin" } }),
     "m-approve": () => sapi(`/models/${b.dataset.id}/decision`, { method: "POST", body: { approve: true } }),
     "m-reject": () => sapi(`/models/${b.dataset.id}/decision`, { method: "POST", body: { approve: false } }),
     "release": () => sapi(`/runs/${b.dataset.run}/release`, { method: "POST", body: { release: true, note: val("note-" + b.dataset.run) } }),

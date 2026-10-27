@@ -23,6 +23,9 @@ pub struct Net {
     dev: bool,
     dev_tunnel: String,
     tls: Arc<rustls::ClientConfig>,
+    /// The only hosts this enclave may connect to (outside dev mode). Set
+    /// once at boot: model providers, the ACME CA, SES, and itself.
+    allowed: Arc<std::sync::RwLock<std::collections::BTreeSet<String>>>,
 }
 
 pub struct HttpResponse {
@@ -46,7 +49,15 @@ impl Net {
             .with_root_certificates(roots)
             .with_no_client_auth();
         cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
-        Ok(Self { dev, dev_tunnel, tls: Arc::new(cfg) })
+        Ok(Self { dev, dev_tunnel, tls: Arc::new(cfg), allowed: Arc::default() })
+    }
+
+    pub fn allow(&self, host: &str) {
+        self.allowed.write().unwrap().insert(host.to_ascii_lowercase());
+    }
+
+    pub fn allowed_hosts(&self) -> Vec<String> {
+        self.allowed.read().unwrap().iter().cloned().collect()
     }
 
     async fn dial_parent(&self) -> Result<Stream> {
@@ -67,6 +78,9 @@ impl Net {
     }
 
     async fn tunnel(&self, host: &str, port: u16) -> Result<Stream> {
+        if !self.dev && (port != 443 || !self.allowed.read().unwrap().contains(&host.to_ascii_lowercase())) {
+            bail!("connection to {host}:{port} refused: not on this enclave's egress allowlist");
+        }
         let mut s = self.dial_parent().await?;
         s.write_all(format!("CONNECT {host}:{port}\n").as_bytes()).await?;
         // Read the one-line reply byte by byte so nothing after it is consumed.

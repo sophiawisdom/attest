@@ -11,8 +11,10 @@ mod acme;
 mod aws;
 mod blobs;
 mod bundle;
+mod harnesses;
 mod jail;
 mod llm;
+mod modelproxy;
 mod net;
 mod notify;
 mod nsm;
@@ -174,6 +176,9 @@ async fn read_host_config(args: &Args) -> Result<HostConfig> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--jail-exec") {
+        jail::exec_main(&std::env::args().nth(2).unwrap_or_default());
+    }
     if std::env::args().nth(1).as_deref() == Some("--jail-probe") {
         println!("{}", jail::probe());
         return Ok(());
@@ -216,11 +221,27 @@ async fn main() -> Result<()> {
             tools: TOOLS.iter().map(|s| s.to_string()).collect(),
             max_steps_cap: MAX_STEPS_CAP,
             endpoints,
+            agents: harnesses::available(),
         },
     };
     let info_json = serde_json::to_string(&info)?;
     let boot_doc = attester.attest(&sha256(info_json.as_bytes()), &signing.verifying_key().to_bytes(), None)?;
     let net = net::Net::new(args.dev, args.dev_tunnel.clone())?;
+    // Egress allowlist: everything this enclave may ever connect to.
+    for p in [Provider::Openai, Provider::Anthropic, Provider::Openrouter] {
+        net.allow(llm::endpoint(p).0);
+    }
+    let acme_dir = cfg.acme_directory.clone().unwrap_or_else(|| LETS_ENCRYPT.into());
+    if let Some(h) = url::Url::parse(&acme_dir).ok().and_then(|u| u.host_str().map(String::from)) {
+        net.allow(&h);
+    }
+    if let Some(n) = &cert_name {
+        net.allow(n); // the DNS self-check before requesting a certificate
+    }
+    if cfg.email_from.is_some() {
+        net.allow(&format!("email.{}.amazonaws.com", cfg.ses_region.clone().unwrap_or_else(|| "us-west-2".into())));
+    }
+    log(&format!("egress allowlist: {}", net.allowed_hosts().join(", ")));
     let ctx = Arc::new(Ctx {
         dev: args.dev,
         net: net.clone(),
@@ -246,6 +267,7 @@ async fn main() -> Result<()> {
     tokio::spawn(measure_blob_store(ctx.blobs.clone()));
     if !args.dev {
         jail::spawn_probe();
+        let _ = std::fs::create_dir_all("/jails");
     }
     {
         let (slot, dir) = (ctx.sandbox.clone(), args.python_dir.clone());
@@ -263,7 +285,7 @@ async fn main() -> Result<()> {
     log(&format!("boot {} mode={} commit={}", ctx.info.boot_id, ctx.info.mode, ctx.info.source_commit));
 
     if let (Some(t), Some(d)) = (&tls, &cert_name) {
-        tokio::spawn(acme::run(net, t.clone(), d.clone(), cfg.acme_directory.unwrap_or_else(|| LETS_ENCRYPT.into())));
+        tokio::spawn(acme::run(net, t.clone(), d.clone(), acme_dir));
     }
     serve(args, app, tls).await
 }

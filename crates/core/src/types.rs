@@ -116,6 +116,9 @@ pub struct HarnessInfo {
     pub max_steps_cap: u32,
     /// Inference endpoints per provider. Fixed in the image.
     pub endpoints: BTreeMap<String, String>,
+    /// Agents this image can run: the built-in tool loop and jailed harnesses.
+    #[serde(default)]
+    pub agents: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -252,6 +255,9 @@ pub struct ModelInfo {
     /// OpenRouter only: upstream providers that actually served the calls.
     pub upstream_providers: Vec<String>,
     pub openrouter_zdr: Option<bool>,
+    /// "builtin" (attest's own tool loop) or a jailed harness like "codex 0.164.0".
+    #[serde(default)]
+    pub agent: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]

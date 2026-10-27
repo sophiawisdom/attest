@@ -12,7 +12,7 @@ RUN set -eux; \
     printf 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/%s bookworm main\n' "$DEBIAN_SNAPSHOT" > /etc/apt/sources.list; \
     rm -f /etc/apt/sources.list.d/debian.sources; \
     apt-get -o Acquire::Check-Valid-Until=false update; \
-    apt-get install -y --no-install-recommends gcc libc6-dev musl-tools unzip; \
+    apt-get install -y --no-install-recommends gcc libc6-dev musl-tools unzip busybox-static curl ca-certificates; \
     rm -rf /var/lib/apt/lists/*
 
 # Static musl binary for the build platform: x86_64 for Intel/AMD Nitro
@@ -46,6 +46,20 @@ ADD --checksum=sha256:252e2e17fab9f51a51fbfc73d51e18805cb633e9f9200c9753b4b801c7
 RUN mkdir -p /opt/python-wasi && cd /opt/python-wasi && unzip -q /tmp/python-wasi.zip \
  && find /opt/python-wasi -exec touch -h -d @0 {} +
 
+# Jail image for real agent harnesses: static busybox for the shell, and the
+# Codex CLI (static musl build, pinned by the release's published sha256).
+ARG CODEX_VERSION=0.164.0
+RUN set -eux; mkdir -p /opt/jailroot/bin /opt/jailroot/usr/bin; \
+    cp /bin/busybox /opt/jailroot/bin/busybox; \
+    for a in $(/bin/busybox --list); do ln -sf /bin/busybox /opt/jailroot/bin/$a; done; \
+    if [ "$(cat /target-triple)" = aarch64-unknown-linux-musl ]; then \
+      curl -fsSL -o /tmp/codex.tgz https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/codex-aarch64-unknown-linux-musl.tar.gz; \
+      echo "29a507a2a3fd8f6cd94b96b762d281d299d15d7902dee6132d314b78cf9108eb  /tmp/codex.tgz" | sha256sum -c; \
+      tar -xzf /tmp/codex.tgz -C /tmp; mv /tmp/codex-aarch64-unknown-linux-musl /opt/jailroot/usr/bin/codex; \
+      chmod 755 /opt/jailroot/usr/bin/codex; \
+    fi; \
+    find /opt/jailroot -exec touch -h -d @0 {} +
+
 RUN mkdir -p /out && \
     T=$(cat /target-triple) && \
     cp target/$T/release/attest-enclave target/$T/release/attest-host target/$T/release/attest /out/ && \
@@ -59,4 +73,5 @@ COPY --from=builder /out/ /
 FROM scratch AS enclave
 COPY --from=builder /out/attest-enclave /attest-enclave
 COPY --from=builder /opt/python-wasi /opt/python-wasi
+COPY --from=builder /opt/jailroot /opt/jailroot
 ENTRYPOINT ["/attest-enclave"]

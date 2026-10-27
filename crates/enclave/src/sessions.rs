@@ -102,6 +102,8 @@ struct ModelProposal {
     api_key: String,
     openrouter_zdr: bool,
     mock_endpoint: Option<String>,
+    /// "builtin" or "codex".
+    agent: String,
     /// pending | approved | rejected | superseded
     status: &'static str,
     proposed_at_ms: u64,
@@ -112,7 +114,7 @@ struct ModelProposal {
 impl ModelProposal {
     fn public(&self) -> Value {
         json!({
-            "id": self.id, "proposed_by": self.by, "provider": self.provider, "model": self.model,
+            "id": self.id, "proposed_by": self.by, "provider": self.provider, "model": self.model, "agent": self.agent,
             "openrouter_zdr": self.openrouter_zdr, "status": self.status,
             "fine_tuned": llm::is_fine_tuned(self.provider, &self.model),
             "proposed_at_ms": self.proposed_at_ms, "decided_at_ms": self.decided_at_ms, "note": self.note,
@@ -367,6 +369,8 @@ impl Session {
         let api_key = clean(v["api_key"].as_str()).ok_or_else(|| anyhow!("api_key is required"))?;
         ensure!(model.len() < 200 && api_key.len() < 1000, "model or key too long");
         let mock_endpoint = clean(v["mock_endpoint"].as_str());
+        let agent = clean(v["agent"].as_str()).unwrap_or_else(|| "builtin".into());
+        crate::harnesses::supports(&agent, provider)?;
         ensure!(provider != Provider::Mock || mock_endpoint.is_some(), "mock_endpoint is required for the mock provider");
         let mut st = self.st.lock().unwrap();
         let id = st.models.len() as u32 + 1;
@@ -379,14 +383,14 @@ impl Session {
         }
         st.models.push(ModelProposal {
             id, by: role, provider, model: model.clone(), api_key,
-            openrouter_zdr: v["openrouter_zdr"].as_bool().unwrap_or(false), mock_endpoint,
+            openrouter_zdr: v["openrouter_zdr"].as_bool().unwrap_or(false), mock_endpoint, agent: agent.clone(),
             status: if approved { "approved" } else { "pending" },
             proposed_at_ms: now_ms(), decided_at_ms: approved.then(now_ms), note: None,
         });
         let msg = if approved {
-            format!("The auditee chose {} / {model}.", provider.as_str())
+            format!("The auditee chose {} / {model}{}.", provider.as_str(), if agent == "builtin" { String::new() } else { format!(" with {agent}") })
         } else {
-            format!("The auditor proposed {} / {model} with their own API key; the auditee must approve it.", provider.as_str())
+            format!("The auditor proposed {} / {model}{} with their own API key; the auditee must approve it.", provider.as_str(), if agent == "builtin" { String::new() } else { format!(" with {agent}") })
         };
         self.event(ctx, &mut st, "model_proposed", msg, None, Some(role), !approved);
         self.maybe_start(ctx, &mut st);
@@ -551,13 +555,20 @@ impl Session {
             key_owner: None,
             upstream_providers: vec![],
             openrouter_zdr: (m.provider == Provider::Openrouter).then_some(m.openrouter_zdr),
+            agent: if m.agent == "codex" { format!("codex {}", crate::harnesses::CODEX_VERSION) } else { "builtin".into() },
         };
+        let harness_job = (m.agent == "codex").then(|| (m.provider, m.model.clone(), m.api_key.clone()));
 
         let (mut turns, mut messages, mut trace) = (Vec::new(), Vec::new(), Vec::new());
+        let mut previous_verdict = None;
         match &spec.parent {
             Some(pid) => {
                 let parent = st.runs.iter().find(|r| &r.id == pid).ok_or_else(|| anyhow!("no parent run"))?;
-                turns = parent.turns.clone().ok_or_else(|| anyhow!("parent run has no conversation to continue"))?;
+                if harness_job.is_some() {
+                    previous_verdict = parent.verdict.clone();
+                } else {
+                    turns = parent.turns.clone().ok_or_else(|| anyhow!("parent run has no conversation to continue"))?;
+                }
                 messages = parent.messages.clone();
             }
             None => {
@@ -609,7 +620,9 @@ impl Session {
         let job = RunJob {
             session: self.clone(), ctx: ctx.clone(), run_id: id.clone(), number, parent: spec.parent, client, bundle,
             turns, question, affidavit, model_info, history,
-            messages: messages.into_iter().map(|(r, _)| r).collect(),
+            messages: messages.iter().map(|(r, _)| r.clone()).collect(),
+            harness_prompt: crate::harnesses::codex_prompt(&q.text, previous_verdict.as_ref().zip(messages.last().map(|(_, t)| t.as_str()))),
+            harness_job,
         };
         tokio::spawn(job.execute());
         Ok(id)
@@ -681,6 +694,9 @@ struct RunJob {
     model_info: ModelInfo,
     history: History,
     messages: Vec<MessageRecord>,
+    /// For jailed harnesses: (provider, model, key), and the prompt.
+    harness_job: Option<(Provider, String, String)>,
+    harness_prompt: String,
 }
 
 impl RunJob {
@@ -689,16 +705,24 @@ impl RunJob {
         let started_at_ms = now_ms();
         let session = self.session.clone();
         let run_id = self.run_id.clone();
-        let progress = move |entries: Vec<Value>| {
+        let progress: Arc<dyn Fn(Vec<Value>) + Send + Sync> = Arc::new(move |entries: Vec<Value>| {
             let mut st = session.st.lock().unwrap();
             if let Some(r) = st.runs.iter_mut().find(|r| r.id == run_id) {
-                r.steps += entries.iter().filter(|e| e["type"] == "assistant").count() as u32;
+                r.steps += entries.iter().filter(|e| e["type"] == "assistant" || e["type"] == "model_exchange").count() as u32;
                 r.trace.extend(entries);
             }
             session.changed(&mut st);
+        });
+        let out = match &self.harness_job {
+            Some((provider, model, key)) => {
+                let timeout = Duration::from_secs((self.question.max_steps as u64 * 20).clamp(300, 1800));
+                crate::harnesses::run_codex(self.ctx.net.clone(), &self.run_id, &self.bundle, *provider, model, key, self.harness_prompt.clone(), timeout, progress.clone()).await
+            }
+            None => {
+                let sandbox = self.ctx.sandbox.get().cloned();
+                run::agent_loop(&self.client, &self.bundle, sandbox, self.turns.clone(), self.question.max_steps, &*progress).await
+            }
         };
-        let sandbox = self.ctx.sandbox.get().cloned();
-        let out = run::agent_loop(&self.client, &self.bundle, sandbox, self.turns.clone(), self.question.max_steps, &progress).await;
 
         let mut model = self.model_info.clone();
         model.response_models = out.response_models.clone();

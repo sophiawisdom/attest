@@ -45,7 +45,10 @@ is written for an agent to follow, and takes one script.
    that nothing in it was arranged to influence the audit.
 5. Either party proposes a model: `POST /api/sessions/ID/models`
    `{"provider": "anthropic"|"openai"|"openrouter", "model": "...", "api_key": "...", "openrouter_zdr": true}`.
-   An auditee proposal is approved immediately. An auditor proposal waits
+   Add `"agent": "codex"` to run OpenAI's Codex CLI (full shell, in a jail:
+   repository read-only at /repo, 20 MB scratch, no network except the
+   model) instead of the built-in tools; `GET /api/info` lists the agents a
+   server has. An auditee proposal is approved immediately. An auditor proposal waits
    for `POST /api/sessions/ID/models/MODEL_ID/decision` `{"approve": true}`
    from the auditee. Keys are never shown to anyone. The code is sent to the
    chosen provider under the key owner's terms (for example zero data
