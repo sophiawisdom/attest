@@ -113,6 +113,7 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); box-sha
 .kv { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 12px; font-size: 13px; }
 .kv dt { color: var(--ink-3); } .kv dd { margin: 0; overflow-wrap: anywhere; }
 .hash { font-family: var(--mono); font-size: 12px; cursor: copy; border-bottom: 1px dotted var(--ink-3); }
+.dpre { white-space: pre-wrap; word-break: break-word; font: 12px/1.45 var(--mono); background: var(--sunken); border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin: 0; max-height: 360px; overflow: auto; }
 .tx { display: flex; flex-direction: column; gap: 8px; max-height: 560px; overflow: auto; padding: 4px 2px; }
 .ev { display: grid; grid-template-columns: 68px minmax(0, 1fr); gap: 10px; }
 .ev .who { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-3); padding-top: 3px; font-weight: 600; }
@@ -266,6 +267,7 @@ function sessionShell() {
       <section class="panel" id="cCode"></section>
       <section class="panel" id="cModel"></section>
       <section class="panel" id="cRuns"></section>
+      <section class="panel" id="cDisclose"></section>
     </div>
     <aside class="col">
       <div class="panel pad stack" id="cActivity"></div>
@@ -281,7 +283,7 @@ function head(n, title, done, extra = "") {
 function statusPill(s) {
   const m = { proposed: ["warn", "waiting for auditee"], accepted: ["ok", "accepted"], rejected: ["bad", "rejected"], superseded: ["", "superseded"],
     pending: ["warn", "waiting for auditee"], approved: ["ok", "approved"], running: ["run", "running"], awaiting_release: ["warn", "awaiting auditee"],
-    released: ["ok", "released"], declined: ["bad", "declined"] }[s] || ["", s];
+    released: ["ok", "released"], declined: ["bad", "declined"], draft: ["warn", "draft, only you see it"], published: ["ok", "published"], discarded: ["", "discarded"] }[s] || ["", s];
   return `<span class="pill ${m[0]}">${esc(m[1])}</span>`;
 }
 
@@ -290,7 +292,7 @@ function render() {
   $("#who").innerHTML = `<span class="pill"><b>${isAuditee() ? "Auditee" : "Auditor"}</b> · session ${esc(v.session_id.slice(0, 8))}</span>`;
   const running = v.runs.some(r => r.status === "running");
   patch("banner", `<div class="banner"><i class="dot ${running ? "run" : v.next_actions.length ? "warn" : "ok"}"></i><div class="say">${esc(v.status)}</div></div>`);
-  renderQuestion(v); renderCode(v); renderModel(v); renderRuns(v); renderActivity(v); renderNotify(v);
+  renderQuestion(v); renderCode(v); renderModel(v); renderRuns(v); renderDisclosures(v); renderActivity(v); renderNotify(v);
   patch("cVerify", verifyPanel());
 }
 
@@ -502,6 +504,37 @@ function runHtml(v, r) {
   return `<div class="run pad stack">${meta}${msgHtml}${main}</div>`;
 }
 
+// ---------------------------------------------------------------- disclosures
+function disclosureContent(c) {
+  if (c.kind === "file") return `<div class="small muted">File <code>${esc(c.path)}</code> · ${bytes(c.size)} · sha256 ${hash(c.sha256)}</div>`
+    + (c.text != null ? `<pre class="dpre">${esc(c.text)}</pre>` : `<p class="small faint">Binary file; download the signed disclosure to get it.</p>`);
+  return `<div class="small muted">Script run over the code · opened ${Object.keys(c.files_opened).length} file(s)${c.timed_out ? " · timed out" : ""}${c.exit_code ? ` · exit ${c.exit_code}` : ""}</div>
+    <details><summary class="small">Script</summary><pre class="dpre">${esc(c.code)}</pre></details>
+    <pre class="dpre">${esc(c.stdout || "(no output)")}</pre>${c.stderr ? `<details><summary class="small">stderr</summary><pre class="dpre">${esc(c.stderr)}</pre></details>` : ""}`;
+}
+function renderDisclosures(v) {
+  const ds = (v.disclosures || []).filter(d => d.status !== "discarded");
+  let body = "";
+  if (isAuditee()) {
+    body += `<p class="small muted">Show the auditor a file, or what a Python script prints when run over your code in the enclave. You see a draft first; publishing signs it, ties it to the code commitment, and shows it to the auditor.</p>`;
+    if (!v.code) body += `<p class="muted">Upload code first.</p>`;
+    else body += `<details data-keep="disc-new"><summary>New disclosure</summary><div class="stack" style="margin-top:10px">
+      <label class="f">Kind<select id="dKind"><option value="file">A file</option><option value="python">A script's output</option></select></label>
+      <label class="f" data-dfor="file">Path<input type="text" id="dPath" placeholder="trainer/train.py"></label>
+      <label class="f" data-dfor="python" hidden>Python (the code is read-only at /repo; no network; 60 s)<textarea id="dCode" placeholder="import os&#10;print(sum(1 for _ in os.walk('/repo')))"></textarea></label>
+      <label class="f">Note for the auditor (optional)<input type="text" id="dNote"></label>
+      <div class="row"><button class="btn primary" data-act="disc-draft">Prepare draft</button></div></div></details>`;
+  } else if (!ds.length) {
+    body += `<p class="muted">Nothing disclosed. The auditee can choose to show you files, or the output of scripts run over the code, each signed by the enclave.</p>`;
+  }
+  body += ds.slice().reverse().map(d => `<div class="stack" style="gap:6px;border-top:1px solid var(--line);padding-top:10px">
+    <div class="row"><b>#${d.number}</b> ${statusPill(d.status)}<span class="faint small">${esc(ago(d.body.published_at_ms || d.body.created_at_ms))}</span></div>
+    ${d.body.note ? `<p class="small">${esc(d.body.note)}</p>` : ""}${disclosureContent(d.body.content)}
+    ${d.status === "draft" ? `<div class="row"><button class="btn primary" data-act="disc-publish" data-n="${d.number}">Publish to auditor</button><button class="btn danger" data-act="disc-discard" data-n="${d.number}">Discard</button></div>`
+      : `<div class="row"><a class="btn" href="#" data-act="disc-get" data-n="${d.number}">Download signed disclosure</a><span class="faint small">Check it with <code>attest verify</code>.</span></div>`}</div>`).join("");
+  patch("cDisclose", `<div class="card-head"><h2>Disclosures</h2></div><div class="pad stack">${body}</div>`);
+}
+
 // ---------------------------------------------------------------- side
 function renderActivity(v) {
   S.events = (S.events || []).concat(v.events.filter(e => !(S.events || []).some(x => x.seq === e.seq)));
@@ -551,7 +584,19 @@ document.addEventListener("click", async (e) => {
       a.download = `certificate-${b.dataset.run.slice(0, 8)}.json`; a.click(); URL.revokeObjectURL(a.href);
     });
   }
+  if (act === "disc-get") {
+    e.preventDefault();
+    return busy(b, async () => {
+      const d = await sapi(`/disclosures/${b.dataset.n}`);
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([JSON.stringify(d, null, 2)], { type: "application/json" }));
+      a.download = `disclosure-${S.sid.slice(0, 8)}-${b.dataset.n}.json`; a.click(); URL.revokeObjectURL(a.href);
+    });
+  }
   const actions = {
+    "disc-draft": () => sapi("/disclosures", { method: "POST", body: val("dKind") === "python" ? { kind: "python", code: val("dCode"), note: val("dNote") } : { kind: "file", path: val("dPath"), note: val("dNote") } }),
+    "disc-publish": () => sapi(`/disclosures/${b.dataset.n}/decision`, { method: "POST", body: { publish: true } }),
+    "disc-discard": () => sapi(`/disclosures/${b.dataset.n}/decision`, { method: "POST", body: { publish: false } }),
     "ask": () => {
       const kind = val("qFormat") || "text";
       const answer_format = kind === "yes_no" ? { kind } : kind === "choice"
@@ -586,7 +631,10 @@ function syncFormatFields() {
   const k = val("qFormat") || "text";
   $$("#qFormatExtra [data-for]").forEach(el => el.hidden = el.dataset.for !== k);
 }
-document.addEventListener("change", (e) => { if (e.target.id === "qFormat") syncFormatFields(); });
+document.addEventListener("change", (e) => {
+  if (e.target.id === "qFormat") syncFormatFields();
+  if (e.target.id === "dKind") $$("[data-dfor]").forEach(el => el.hidden = el.dataset.dfor !== e.target.value);
+});
 new MutationObserver(() => { if ($("#qFormat")) syncFormatFields(); }).observe(document.documentElement, { childList: true, subtree: true });
 document.addEventListener("input", (e) => {
   if (["aOrg", "aRepo", "aCommit"].includes(e.target.id)) {

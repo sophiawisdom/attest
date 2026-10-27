@@ -756,6 +756,17 @@ async fn session_route(
         ("GET", ["runs", rid, "certificate"]) => {
             ok(serde_json::to_value(s.certificate(role, rid)?).map_err(anyhow::Error::from)?)
         }
+        ("POST", ["disclosures"]) => ok(s
+            .draft_disclosure(ctx, role, &body_json(req).await?)
+            .await?),
+        ("POST", ["disclosures", n, "decision"]) => {
+            let n: u32 = n.parse().map_err(|_| anyhow!("bad disclosure number"))?;
+            ok(s.decide_disclosure(ctx, role, n, &body_json(req).await?)?)
+        }
+        ("GET", ["disclosures", n]) => {
+            let n: u32 = n.parse().map_err(|_| anyhow!("bad disclosure number"))?;
+            ok(serde_json::to_value(s.disclosure(role, n)?).map_err(anyhow::Error::from)?)
+        }
         ("POST", ["notify"]) => ok(s.set_notify(ctx, role, &body_json(req).await?)?),
         _ => Err(ApiError(
             StatusCode::NOT_FOUND,

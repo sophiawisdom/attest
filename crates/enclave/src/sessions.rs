@@ -83,7 +83,21 @@ struct State {
     events: Vec<Event>,
     notify: HashMap<Role, NotifyPrefs>,
     event_counts: [u64; 2],
+    disclosures: Vec<DisclosureState>,
 }
+
+/// A disclosure starts as a draft only the auditee sees; publishing signs
+/// it and shows it to the auditor.
+struct DisclosureState {
+    body: DisclosureBody,
+    /// draft | published | discarded
+    status: &'static str,
+    signed: Option<Disclosure>,
+}
+
+const MAX_DISCLOSURES: usize = 100;
+const MAX_DISCLOSED_FILE: u64 = 1 << 20;
+const MAX_SCRIPT_BYTES: usize = 100_000;
 
 #[derive(Clone, Serialize)]
 struct Question {
@@ -1100,6 +1114,7 @@ impl Session {
             }),
             "models": st.models.iter().map(|m| m.public()).collect::<Vec<_>>(),
             "runs": runs,
+            "disclosures": st.disclosures.iter().filter(|d| role == Role::Auditee || d.status == "published").map(disclosure_view).collect::<Vec<_>>(),
             "events": events,
             "last_event_seq": st.event_counts[ri(role)],
             "notify": st.notify.get(&role).cloned().unwrap_or_default(),
@@ -1123,6 +1138,204 @@ impl Session {
         Ok(
             json!({"run_id": r.id, "status": r.status, "next": r.trace.len(), "entries": &r.trace[after.min(r.trace.len())..]}),
         )
+    }
+
+    /// Draft a disclosure: read a file, or run a Python script over the code
+    /// in the sandbox. Only the auditee sees the draft.
+    pub async fn draft_disclosure(
+        self: &Arc<Self>,
+        ctx: &Arc<Ctx>,
+        role: Role,
+        v: &Value,
+    ) -> Result<Value> {
+        use base64::Engine as _;
+        ensure!(role == Role::Auditee, "only the auditee discloses");
+        let bundle = {
+            let st = self.st.lock().unwrap();
+            ensure!(
+                st.disclosures.len() < MAX_DISCLOSURES,
+                "this session has {MAX_DISCLOSURES} disclosures already"
+            );
+            st.code
+                .clone()
+                .ok_or_else(|| anyhow!("upload code first"))?
+        };
+        let note = clean(v["note"].as_str());
+        ensure!(
+            note.as_ref().map_or(0, |n| n.len()) <= 4000,
+            "the note is over 4000 bytes"
+        );
+        let content = match v["kind"].as_str() {
+            Some("file") => {
+                let raw = v["path"].as_str().unwrap_or_default();
+                let path = attest_core::tree::normalize_path(raw.trim())
+                    .ok_or_else(|| anyhow!("bad path {raw:?}"))?;
+                let e = bundle
+                    .files
+                    .get(&path)
+                    .ok_or_else(|| anyhow!("no such file: {path}"))?;
+                ensure!(
+                    e.size <= MAX_DISCLOSED_FILE,
+                    "{path} is over {} KiB; disclose a script's output instead",
+                    MAX_DISCLOSED_FILE >> 10
+                );
+                let sha256 = hex::encode(e.digest);
+                let bytes = bundle.read(&path).await?;
+                let (text, b64) = match std::str::from_utf8(&bytes) {
+                    Ok(t) => (Some(t.to_string()), None),
+                    Err(_) => (
+                        None,
+                        Some(base64::engine::general_purpose::STANDARD.encode(&*bytes)),
+                    ),
+                };
+                DisclosureContent::File {
+                    path,
+                    size: bytes.len() as u64,
+                    sha256,
+                    text,
+                    base64: b64,
+                }
+            }
+            Some("python") => {
+                let code = v["code"].as_str().unwrap_or_default().to_string();
+                ensure!(!code.trim().is_empty(), "code is empty");
+                ensure!(
+                    code.len() <= MAX_SCRIPT_BYTES,
+                    "the script is over {MAX_SCRIPT_BYTES} bytes"
+                );
+                let sandbox = ctx.sandbox.get().cloned().ok_or_else(|| {
+                    anyhow!("the python sandbox is still starting up; try again in a minute")
+                })?;
+                let _slot = ctx
+                    .slots
+                    .acquire()
+                    .await
+                    .map_err(|_| anyhow!("shutting down"))?;
+                let _pin = bundle.pin().await?;
+                let opened = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+                let out = sandbox
+                    .run_python(bundle.clone(), &code, opened.clone())
+                    .await;
+                let files_opened = opened
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(k, d)| (k.clone(), hex::encode(d)))
+                    .collect();
+                DisclosureContent::Python {
+                    code_sha256: sha256_hex(code.as_bytes()),
+                    code,
+                    stdout: out.stdout,
+                    stderr: out.stderr,
+                    exit_code: out.exit_code,
+                    timed_out: out.timed_out,
+                    error: out.error,
+                    files_opened,
+                }
+            }
+            _ => bail!("kind must be \"file\" or \"python\""),
+        };
+        let mut st = self.st.lock().unwrap();
+        ensure!(
+            st.code.as_ref().is_some_and(|c| Arc::ptr_eq(c, &bundle)),
+            "the code was replaced while the disclosure was being prepared; try again"
+        );
+        let body = DisclosureBody {
+            schema: "attest/disclosure-body/v1".into(),
+            session_id: self.id.clone(),
+            boot_id: ctx.info.boot_id.clone(),
+            number: st.disclosures.len() as u32 + 1,
+            code_commitment_sha256: bundle.info.commitment_sha256.clone(),
+            note,
+            created_at_ms: now_ms(),
+            published_at_ms: 0,
+            content,
+        };
+        let out = disclosure_view(&DisclosureState {
+            body: body.clone(),
+            status: "draft",
+            signed: None,
+        });
+        st.disclosures.push(DisclosureState {
+            body,
+            status: "draft",
+            signed: None,
+        });
+        self.changed_for(&mut st, Role::Auditee);
+        Ok(out)
+    }
+
+    /// Publish (sign and show the auditor) or discard a draft.
+    pub fn decide_disclosure(
+        self: &Arc<Self>,
+        ctx: &Arc<Ctx>,
+        role: Role,
+        number: u32,
+        v: &Value,
+    ) -> Result<Value> {
+        ensure!(role == Role::Auditee, "only the auditee discloses");
+        let publish = v["publish"]
+            .as_bool()
+            .ok_or_else(|| anyhow!("publish (true or false) is required"))?;
+        let mut st = self.st.lock().unwrap();
+        let current = st.code.as_ref().map(|c| c.info.commitment_sha256.clone());
+        let d = st
+            .disclosures
+            .iter_mut()
+            .find(|d| d.body.number == number)
+            .ok_or_else(|| anyhow!("no such disclosure"))?;
+        ensure!(
+            d.status == "draft",
+            "disclosure {number} is already {}",
+            d.status
+        );
+        if !publish {
+            d.status = "discarded";
+            self.changed_for(&mut st, Role::Auditee);
+            return Ok(json!({"number": number, "status": "discarded"}));
+        }
+        ensure!(
+            current.as_deref() == Some(d.body.code_commitment_sha256.as_str()),
+            "the code changed since this draft was made; draft it again"
+        );
+        d.body.published_at_ms = now_ms();
+        let signed = sign::sign(&ctx.signing, DOMAIN_DISCLOSURE, &d.body)?;
+        d.signed = Some(Disclosure {
+            enclave_info_json: ctx.info_json.clone(),
+            boot_document_b64: ctx.boot_doc_b64.clone(),
+            signed,
+        });
+        d.status = "published";
+        let what = match &d.body.content {
+            DisclosureContent::File { path, .. } => format!("the file {path}"),
+            DisclosureContent::Python { .. } => "the output of a script run over the code".into(),
+        };
+        let out = disclosure_view(d);
+        self.event(
+            ctx,
+            &mut st,
+            "disclosure_published",
+            format!("The auditee disclosed {what} (disclosure {number})."),
+            None,
+            Some(role),
+            true,
+        );
+        Ok(out)
+    }
+
+    pub fn disclosure(&self, role: Role, number: u32) -> Result<Disclosure> {
+        let st = self.st.lock().unwrap();
+        let d = st
+            .disclosures
+            .iter()
+            .find(|d| d.body.number == number)
+            .ok_or_else(|| anyhow!("no such disclosure"))?;
+        if role == Role::Auditor {
+            ensure!(d.status == "published", "no such disclosure");
+        }
+        d.signed
+            .clone()
+            .ok_or_else(|| anyhow!("disclosure {number} is a draft; publish it first"))
     }
 
     pub fn certificate(&self, role: Role, run_id: &str) -> Result<Certificate> {
@@ -1351,6 +1564,10 @@ fn auditor_sees_finish(_st: &State, _r: &RunState) -> bool {
     // Never: run duration is model-controlled. The auditor learns of a run's
     // end only from the auditee's release or decline.
     false
+}
+
+fn disclosure_view(d: &DisclosureState) -> Value {
+    json!({"number": d.body.number, "status": d.status, "body": d.body})
 }
 
 fn run_view(r: &RunState, role: Role, st: &State) -> Value {

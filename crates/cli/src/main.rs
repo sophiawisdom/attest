@@ -90,7 +90,7 @@ enum Cmd {
         #[command(flatten)]
         policy: PolicyArgs,
     },
-    /// Verify a certificate offline.
+    /// Verify a certificate or a disclosure offline.
     Verify {
         certificate: PathBuf,
         #[command(flatten)]
@@ -423,8 +423,63 @@ async fn main() -> Result<()> {
             policy,
             json,
         } => {
-            let cert: Certificate = serde_json::from_str(&std::fs::read_to_string(&certificate)?)
-                .context("certificate JSON")?;
+            let raw = std::fs::read_to_string(&certificate)?;
+            let probe: Value = serde_json::from_str(&raw).context("JSON")?;
+            if probe["signed"]["domain"] == json!(attest_core::DOMAIN_DISCLOSURE) {
+                let d: attest_core::Disclosure =
+                    serde_json::from_value(probe).context("disclosure JSON")?;
+                let v = attest_core::verify::verify_disclosure(&d, &policy.policy()?)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &json!({"body": v.body, "enclave_warnings": v.enclave.warnings})
+                        )?
+                    );
+                    return Ok(());
+                }
+                print_enclave(&v.enclave);
+                let b = &v.body;
+                println!();
+                println!(
+                    "disclosure #{} in session {}, code commitment {}",
+                    b.number, b.session_id, b.code_commitment_sha256
+                );
+                if let Some(n) = &b.note {
+                    println!("note: {n}");
+                }
+                match &b.content {
+                    attest_core::DisclosureContent::File {
+                        path,
+                        size,
+                        sha256,
+                        text,
+                        ..
+                    } => {
+                        println!("file {path} ({size} bytes, sha256 {sha256})\n");
+                        match text {
+                            Some(t) => print!("{t}"),
+                            None => println!("(binary; see --json)"),
+                        }
+                    }
+                    attest_core::DisclosureContent::Python {
+                        code,
+                        stdout,
+                        stderr,
+                        exit_code,
+                        timed_out,
+                        files_opened,
+                        ..
+                    } => {
+                        println!("script ({} files opened, exit {:?}{}):\n{code}\n--- stdout ---\n{stdout}", files_opened.len(), exit_code, if *timed_out { ", timed out" } else { "" });
+                        if !stderr.is_empty() {
+                            println!("--- stderr ---\n{stderr}");
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            let cert: Certificate = serde_json::from_str(&raw).context("certificate JSON")?;
             let v = verify_certificate(&cert, &policy.policy()?)?;
             if json {
                 println!(

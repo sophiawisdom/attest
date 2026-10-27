@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const DOMAIN_CERTIFICATE: &str = "attest/certificate/v2";
+pub const DOMAIN_DISCLOSURE: &str = "attest/disclosure/v1";
 pub const SOURCE_REPO: &str = "https://github.com/sophiawisdom/attest";
 
 /// Detached ed25519 signature over `domain || "\n" || body`.
@@ -141,6 +142,56 @@ pub struct Certificate {
     pub boot_document_b64: Option<String>,
     /// DOMAIN_CERTIFICATE, signed by the enclave key; body is `CertificateBody`.
     pub signed: Signed,
+}
+
+/// Something the auditee chose to reveal to the auditor about the code: a
+/// whole file, or what a Python script printed when run over the code in
+/// the enclave's sandbox. Signed by the enclave, bound to the code commitment.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Disclosure {
+    pub enclave_info_json: String,
+    pub boot_document_b64: Option<String>,
+    /// DOMAIN_DISCLOSURE; body is `DisclosureBody`.
+    pub signed: Signed,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DisclosureBody {
+    pub schema: String,
+    pub session_id: String,
+    pub boot_id: String,
+    pub number: u32,
+    /// `CodeInfo::commitment_sha256` of the code it was computed from.
+    pub code_commitment_sha256: String,
+    pub note: Option<String>,
+    pub created_at_ms: u64,
+    pub published_at_ms: u64,
+    pub content: DisclosureContent,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DisclosureContent {
+    File {
+        path: String,
+        size: u64,
+        /// The file's sha256, as it enters the tree hash.
+        sha256: String,
+        /// UTF-8 text, or None for a binary file (then `base64`).
+        text: Option<String>,
+        base64: Option<String>,
+    },
+    Python {
+        code: String,
+        code_sha256: String,
+        stdout: String,
+        stderr: String,
+        exit_code: Option<i32>,
+        timed_out: bool,
+        error: Option<String>,
+        /// Repository files the script opened, with their sha256.
+        files_opened: std::collections::BTreeMap<String, String>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

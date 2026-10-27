@@ -85,6 +85,18 @@ is written for an agent to follow, and takes one script.
     A new address first gets one confirmation email from Amazon SES, and
     nothing else is sent to it until it is confirmed (`notify.email_status`).
     Emails say only that something happened in the session.
+11. Disclosures (auditee, any time after uploading code). The auditee can show
+    the auditor a file, or what a Python script prints when run over the code
+    in the enclave's sandbox (code read-only at `/repo`, no network, 60 s):
+    `POST /api/sessions/ID/disclosures` with
+    `{"kind": "file", "path": "...", "note": "..."}` or
+    `{"kind": "python", "code": "...", "note": "..."}`. This makes a draft only
+    the auditee sees. `POST /api/sessions/ID/disclosures/N/decision`
+    `{"publish": true}` signs it, binds it to the code commitment, and shows it
+    to the auditor (`false` discards it). Either party can fetch a published
+    one with `GET /api/sessions/ID/disclosures/N` and check it with
+    `attest verify FILE`. Disclosures are the auditee's choice: nothing about
+    them is restricted by the question's answer format.
 
 ## Reading state and waiting
 

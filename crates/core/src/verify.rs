@@ -149,6 +149,52 @@ pub fn verify_certificate(
     })
 }
 
+pub struct VerifiedDisclosure {
+    pub enclave: VerifiedEnclave,
+    pub body: DisclosureBody,
+}
+
+pub fn verify_disclosure(d: &Disclosure, policy: &EnclavePolicy) -> Result<VerifiedDisclosure> {
+    let enclave = verify_enclave(
+        &d.enclave_info_json,
+        d.boot_document_b64.as_deref(),
+        None,
+        policy,
+    )?;
+    let body: DisclosureBody = d
+        .signed
+        .open_by(DOMAIN_DISCLOSURE, &enclave.info.signing_public_key)?;
+    if body.boot_id != enclave.info.boot_id {
+        bail!("disclosure boot id does not match the enclave that signed it");
+    }
+    match &body.content {
+        DisclosureContent::File {
+            sha256,
+            text,
+            base64: b64,
+            size,
+            ..
+        } => {
+            let bytes = match (text, b64) {
+                (Some(t), None) => t.as_bytes().to_vec(),
+                (None, Some(b)) => base64::engine::general_purpose::STANDARD.decode(b)?,
+                _ => bail!("file disclosure must carry exactly one of text and base64"),
+            };
+            if crate::sha256_hex(&bytes) != *sha256 || bytes.len() as u64 != *size {
+                bail!("disclosed file content does not match its hash");
+            }
+        }
+        DisclosureContent::Python {
+            code, code_sha256, ..
+        } => {
+            if crate::sha256_hex(code.as_bytes()) != *code_sha256 {
+                bail!("disclosed script does not match its hash");
+            }
+        }
+    }
+    Ok(VerifiedDisclosure { enclave, body })
+}
+
 fn categories(c: &ScanCounts) -> String {
     c.matches_by_category
         .iter()
