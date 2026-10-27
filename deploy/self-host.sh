@@ -169,9 +169,14 @@ import json, os
 e = lambda k: os.environ[k] or None
 print(json.dumps({"domain": e("DOMAIN"), "operator": e("OPERATOR"), "public_ip": e("IP"), "email_from": e("EMAIL_FROM"), "ses_region": e("REGION")}))')
 "${SSH[@]}" "set -euo pipefail
+  if [ \"\$(cat attest-src/build/out/built-commit 2>/dev/null)\" = '$COMMIT' ]; then
+    echo 'enclave image for $COMMIT already built; reusing it'; cd attest-src
+  else
   rm -rf attest-src && git clone -q '$REPO' attest-src && cd attest-src && git checkout -q '$COMMIT'
-  sudo mkdir -p /etc/attest && echo '$(printf '%s' "$CONFIG" | base64 | tr -d '\n')' | base64 -d | sudo tee /etc/attest/host.json >/dev/null
   nice -n 5 build/build-eif.sh > ~/build-eif.log 2>&1 || { tail -30 ~/build-eif.log; exit 1; }
+  echo '$COMMIT' > build/out/built-commit
+  fi
+  sudo mkdir -p /etc/attest && echo '$(printf '%s' "$CONFIG" | base64 | tr -d '\n')' | base64 -d | sudo tee /etc/attest/host.json >/dev/null
   cat build/out/pcrs.json"
 PCR0=$("${SSH[@]}" "python3 -c 'import json; print(json.load(open(\"attest-src/build/out/pcrs.json\"))[\"Measurements\"][\"PCR0\"])'")
 PUBLISHED="measurements/$COMMIT.pcrs.json"
