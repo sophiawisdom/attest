@@ -102,7 +102,7 @@ pub async fn agent_loop(
                     Err(e) => format!("error: {e}"),
                 }
             } else {
-                tools.call(&call.name, &call.args)
+                tools.call(&call.name, &call.args).await
             };
             events.push(json!({"type": "tool_result", "id": call.id, "name": call.name, "content": out}));
             results.push((call.id.clone(), out));

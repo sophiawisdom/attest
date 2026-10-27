@@ -76,8 +76,10 @@ def main():
         json.dump({"email_from": "attest@example.com"}, f)
     procs = [
         subprocess.Popen([sys.executable, "-I", os.path.join(ROOT, "tests", "mock_llm.py"), "19999"]),
-        subprocess.Popen([os.path.join(BIN, "attest-host"), "--dev", "--no-forward", "--dev-tunnel", "127.0.0.1:15001"], stderr=open(os.path.join(work, "host.log"), "w")),
-        subprocess.Popen([os.path.join(BIN, "attest-enclave"), "--dev", "--dev-listen", "127.0.0.1:18080", "--dev-tunnel", "127.0.0.1:15001", "--dev-config", cfg], stderr=open(os.path.join(work, "enclave.log"), "w")),
+        subprocess.Popen([os.path.join(BIN, "attest-host"), "--dev", "--no-forward", "--dev-tunnel", "127.0.0.1:15001",
+                          "--dev-blobs", "127.0.0.1:15005", "--blob-dir", os.path.join(work, "blobs")], stderr=open(os.path.join(work, "host.log"), "w")),
+        subprocess.Popen([os.path.join(BIN, "attest-enclave"), "--dev", "--dev-listen", "127.0.0.1:18080", "--dev-tunnel", "127.0.0.1:15001",
+                          "--dev-blobs", "127.0.0.1:15005", "--dev-config", cfg], stderr=open(os.path.join(work, "enclave.log"), "w")),
     ]
     try:
         for _ in range(100):
@@ -125,6 +127,9 @@ def run(work):
     check(out.returncode == 0 and "affidavit confirmed" in out.stdout, "attest upload sends code and confirms the affidavit")
     v = auditor.view()
     check(v["code"]["file_count"] == 2 and v["affidavit"]["current"], "auditor sees code metadata and affidavit")
+    blobs = os.listdir(os.path.join(work, "blobs"))
+    raw = b"".join(open(os.path.join(work, "blobs", b), "rb").read() for b in blobs)
+    check(len(blobs) == 2 and b"NOTE TO AUDITOR" not in raw and b"include_cot" not in raw, "code is stored on the host only as ciphertext")
     check("NOTE TO AUDITOR" not in json.dumps(v), "auditor view has no code")
 
     print("auditor proposes a model; auditee approves")
@@ -191,6 +196,33 @@ def run(work):
     check(v["email_available"], "server offers email")
     events = auditor.view()["events"]
     check(not any("trace" in e["text"].lower() for e in events) and len(events) > 5, "auditor event feed is populated")
+
+    print("storage limits and tampering")
+    big = os.path.join(work, "big")
+    os.makedirs(big)
+    with open(os.path.join(big, "huge.bin"), "wb") as f:
+        f.truncate(65 << 20)
+    with open(os.path.join(big, "ok.txt"), "w") as f:
+        f.write("fine\n")
+    out = subprocess.run([os.path.join(BIN, "attest"), "upload", link, big, "--allow-dev", "--allow-dirty"], capture_output=True, text=True)
+    check(out.returncode == 0 and "leaving out huge.bin" in out.stderr, "CLI leaves out files over 64 MiB")
+    check(auditee.view()["code"]["file_count"] == 1, "upload replaced the code with the smaller tree")
+    for b in os.listdir(os.path.join(work, "blobs")):
+        p = os.path.join(work, "blobs", b)
+        data = bytearray(open(p, "rb").read()); data[-1] ^= 1; open(p, "wb").write(bytes(data))
+    s2 = ok("POST", "/api/sessions", body={})
+    a2, o2 = Party(s2["session_id"], s2["auditee_token"]), Party(s2["session_id"], s2["auditor_token"])
+    o2.post("/question", {"text": "Does trainer/train.py compute loss on chain-of-thought tokens?"})
+    a2.post("/question/decision", {"version": 1, "accept": True})
+    subprocess.run([os.path.join(BIN, "attest"), "upload", f"{BASE}/s/{s2['session_id']}#{s2['auditee_token']}", repo, "--org", "X", "--allow-dev"], check=True, capture_output=True)
+    for b in os.listdir(os.path.join(work, "blobs")):
+        p = os.path.join(work, "blobs", b)
+        if os.path.getmtime(p) > time.time() - 5:
+            data = bytearray(open(p, "rb").read()); data[-1] ^= 1; open(p, "wb").write(bytes(data))
+    a2.post("/models", {"provider": "mock", "model": "gpt-mock", "api_key": "test-key", "mock_endpoint": "127.0.0.1:19999"})
+    v = a2.wait_until(lambda v: v["runs"] and v["runs"][-1]["status"] != "running", "tamper run")
+    tr = ok("GET", f"/api/sessions/{s2['session_id']}/runs/{v['runs'][-1]['id']}/trace?after=0", a2.token)
+    check(any("failed authentication" in str(e.get("content", "")) for e in tr["entries"]), "a file altered by the host is detected, not read")
 
 
 if __name__ == "__main__":

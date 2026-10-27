@@ -40,10 +40,12 @@ pub struct Ctx {
     pub signing: SigningKey,
     pub email: Option<crate::notify::EmailConfig>,
     pub email_limiter: crate::notify::Limiter,
+    pub blobs: crate::blobs::BlobClient,
+    pub cache: Arc<crate::blobs::Cache>,
+    pub upload_slots: tokio::sync::Semaphore,
     /// Domain, or public IP, the server is reached at (informational).
     pub public_name: Option<String>,
     pub max_code_bytes: usize,
-    pub max_total_code_bytes: usize,
     pub slots: tokio::sync::Semaphore,
     pub store: Store,
 }
@@ -177,7 +179,14 @@ impl Store {
     pub fn create(&self) -> Result<(Arc<Session>, String, String)> {
         let mut map = self.sessions.lock().unwrap();
         let now = now_ms();
-        map.retain(|_, s| now.saturating_sub(s.created_at_ms) < SESSION_TTL_MS);
+        let expired: Vec<String> = map.iter().filter(|(_, s)| now.saturating_sub(s.created_at_ms) >= SESSION_TTL_MS).map(|(k, _)| k.clone()).collect();
+        for id in expired {
+            if let Some(s) = map.remove(&id) {
+                if let Some(b) = s.st.lock().unwrap().code.take() {
+                    tokio::spawn(async move { b.discard().await });
+                }
+            }
+        }
         ensure!(map.len() < MAX_SESSIONS, "this server is at its session limit; try again later");
         let auditee = random_hex(32);
         let auditor = random_hex(32);
@@ -213,13 +222,6 @@ impl Store {
         self.sessions.lock().unwrap().get(id).cloned()
     }
 
-    pub fn total_code_bytes(&self) -> u64 {
-        let sessions: Vec<Arc<Session>> = self.sessions.lock().unwrap().values().cloned().collect();
-        sessions
-            .iter()
-            .map(|s| s.st.lock().unwrap().code.as_ref().map(|b| b.info.total_bytes).unwrap_or(0))
-            .sum()
-    }
 
     fn note_text_run(&self, text_sha: &str, session: &str) -> u32 {
         let mut idx = self.text_index.lock().unwrap();
@@ -310,12 +312,18 @@ impl Session {
         Ok(json!({"ok": true}))
     }
 
-    pub fn upload_code(self: &Arc<Self>, ctx: &Arc<Ctx>, role: Role, tar: &[u8]) -> Result<Value> {
+    /// Install a freshly ingested bundle, replacing (and discarding) any earlier one.
+    pub fn set_code(self: &Arc<Self>, ctx: &Arc<Ctx>, role: Role, bundle: Bundle) -> Result<Value> {
         ensure!(role == Role::Auditee, "only the auditee uploads code");
-        let bundle = Arc::new(Bundle::from_tar(tar)?);
+        let bundle = Arc::new(bundle);
         let info = bundle.info.clone();
         let mut st = self.st.lock().unwrap();
-        st.code = Some(bundle);
+        if let Some(old) = st.code.replace(bundle) {
+            // Runs still holding it keep working; blobs go once nothing does.
+            if Arc::strong_count(&old) == 1 {
+                tokio::spawn(async move { old.discard().await });
+            }
+        }
         let had_affidavit = st.affidavit.take().is_some();
         let msg = format!(
             "The auditee uploaded code: {} files, {} bytes, tree {}{}.",

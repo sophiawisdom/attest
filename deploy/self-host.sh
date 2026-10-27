@@ -86,12 +86,27 @@ if ! aws iam get-instance-profile --instance-profile-name "$ROLE" >/dev/null 2>&
   sleep 10  # IAM propagation
 fi
 if [ -n "$EMAIL_FROM" ]; then
-  STATUS=$(awsr ses get-identity-verification-attributes --identities "$EMAIL_FROM" --query "VerificationAttributes.\"$EMAIL_FROM\".VerificationStatus" --output text 2>/dev/null || true)
-  if [ "$STATUS" != Success ]; then
-    awsr ses verify-email-identity --email-address "$EMAIL_FROM"
-    echo "SES sent a confirmation email to $EMAIL_FROM. Click its link; notifications start once it's confirmed."
+  # Prefer a domain identity (e.g. noreply@attest.example.com): it needs three
+  # DKIM DNS records, once. Otherwise confirm the single address by email.
+  MAIL_DOMAIN=${EMAIL_FROM#*@}
+  if awsr sesv2 get-email-identity --email-identity "$MAIL_DOMAIN" >/dev/null 2>&1; then
+    DSTATUS=$(awsr sesv2 get-email-identity --email-identity "$MAIL_DOMAIN" --query 'VerificationStatus' --output text)
+    echo "SES domain identity $MAIL_DOMAIN: $DSTATUS"
+    if [ "$DSTATUS" != SUCCESS ]; then
+      echo "Add these DNS records for $MAIL_DOMAIN (then SES verifies within minutes):"
+      for t in $(awsr sesv2 get-email-identity --email-identity "$MAIL_DOMAIN" --query 'DkimAttributes.Tokens' --output text); do
+        echo "  CNAME  $t._domainkey.$MAIL_DOMAIN  ->  $t.dkim.amazonses.com"
+      done
+    fi
   else
-    echo "$EMAIL_FROM is already confirmed in SES"
+    STATUS=$(awsr ses get-identity-verification-attributes --identities "$EMAIL_FROM" --query "VerificationAttributes.\"$EMAIL_FROM\".VerificationStatus" --output text 2>/dev/null || true)
+    if [ "$STATUS" != Success ]; then
+      awsr ses verify-email-identity --email-address "$EMAIL_FROM"
+      echo "SES sent a confirmation email to $EMAIL_FROM. Click its link; notifications start once it's confirmed."
+      echo "(To send from a domain instead: aws sesv2 create-email-identity --email-identity your.domain, add the DKIM records it prints, and rerun.)"
+    else
+      echo "$EMAIL_FROM is already confirmed in SES"
+    fi
   fi
 fi
 

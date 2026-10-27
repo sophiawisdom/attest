@@ -555,7 +555,9 @@ document.addEventListener("input", (e) => {
 });
 document.addEventListener("change", async (e) => {
   if (e.target.id !== "folder") return;
-  const files = [...e.target.files].filter(f => !f.webkitRelativePath.split("/").includes(".git"));
+  const all = [...e.target.files].filter(f => !f.webkitRelativePath.split("/").includes(".git"));
+  const files = all.filter(f => f.size <= 64 * 1024 * 1024);
+  if (files.length < all.length) toast(`Leaving out ${all.length - files.length} file(s) over 64 MiB`);
   if (!files.length) return toast("That folder is empty.", true);
   const total = files.reduce((n, f) => n + f.size, 0);
   const st = $("#upStatus");

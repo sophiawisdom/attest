@@ -103,6 +103,14 @@ The auditee can follow a run live with `GET /api/sessions/ID/runs/RUN_ID/trace?a
 | verdict and certificate | always | only after release |
 | follow-up message text | unless blinded | yes |
 
+The server operator's machine (the enclave's parent) stores uploaded files,
+but only sealed: each file is encrypted with ChaCha20-Poly1305 under a
+per-session key that never leaves the enclave, and bound to its session,
+path and content hash. The operator learns the number of files, their sizes,
+and when each is read, and nothing else. A file it alters or swaps fails
+authentication and is refused. Limits: 64 MiB per file, 1 GiB per upload by
+default.
+
 ## Verifying this service
 
 Do this before uploading code or trusting a result.

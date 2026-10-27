@@ -9,6 +9,7 @@
 mod acme;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod aws;
+mod blobs;
 mod bundle;
 mod llm;
 mod net;
@@ -52,6 +53,9 @@ struct Args {
     dev_listen: String,
     #[arg(long, default_value = "127.0.0.1:5001")]
     dev_tunnel: String,
+    /// Dev only: address of the host's blob store.
+    #[arg(long, default_value = "127.0.0.1:5005")]
+    dev_blobs: String,
     /// Dev only: host config JSON (what the parent serves over vsock in production).
     #[arg(long)]
     dev_config: Option<String>,
@@ -73,7 +77,8 @@ struct HostConfig {
     /// The server's public IP, for an IP-address certificate when there's no domain.
     public_ip: Option<String>,
     max_code_mib: Option<usize>,
-    max_total_code_mib: Option<usize>,
+    /// Decrypted-file cache size in the enclave.
+    cache_mib: Option<usize>,
     /// Shown on the landing page as "run by ...". Unverified.
     operator: Option<String>,
 }
@@ -133,21 +138,27 @@ async fn read_host_config(args: &Args) -> Result<HostConfig> {
     {
         use tokio::io::AsyncReadExt;
         let addr = tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_HOST, CONFIG_VSOCK_PORT);
-        // The parent's config service may start after us; keep trying for a minute.
-        let mut attempt = 0;
-        let mut s = loop {
-            match tokio::time::timeout(Duration::from_secs(5), tokio_vsock::VsockStream::connect(addr)).await {
-                Ok(Ok(s)) => break s,
-                _ if attempt < 60 => {
-                    attempt += 1;
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-                _ => bail!("cannot reach the parent config service on vsock {CONFIG_VSOCK_PORT}"),
+        // The parent's config service may start after us, or drop a
+        // connection; retry the whole exchange for a minute.
+        let mut last = String::new();
+        for _ in 0..60 {
+            let attempt = async {
+                let mut s = tokio::time::timeout(Duration::from_secs(5), tokio_vsock::VsockStream::connect(addr))
+                    .await
+                    .map_err(|_| anyhow!("timeout"))??;
+                let mut buf = Vec::new();
+                tokio::time::timeout(Duration::from_secs(5), (&mut s).take(1 << 20).read_to_end(&mut buf))
+                    .await
+                    .map_err(|_| anyhow!("timeout"))??;
+                anyhow::Ok(serde_json::from_slice::<HostConfig>(&buf).context("host config JSON")?)
+            };
+            match attempt.await {
+                Ok(c) => return Ok(c),
+                Err(e) => last = format!("{e:#}"),
             }
-        };
-        let mut buf = Vec::new();
-        (&mut s).take(1 << 20).read_to_end(&mut buf).await?;
-        Ok(serde_json::from_slice(&buf).context("host config JSON")?)
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        bail!("cannot read the parent config on vsock {CONFIG_VSOCK_PORT}: {last}")
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -215,17 +226,51 @@ async fn main() -> Result<()> {
         email_limiter: notify::Limiter::default(),
         public_name: domain.clone().or(cfg.public_ip.clone()),
         max_code_bytes: cfg.max_code_mib.unwrap_or(1024) << 20,
-        max_total_code_bytes: cfg.max_total_code_mib.unwrap_or(4096) << 20,
+        blobs: blobs::BlobClient::new(args.dev, args.dev_blobs.clone()),
+        cache: Arc::new(blobs::Cache::new(cfg.cache_mib.unwrap_or(1024) << 20)),
+        upload_slots: tokio::sync::Semaphore::new(2),
         slots: tokio::sync::Semaphore::new(args.concurrency),
         store: sessions::Store::default(),
     });
     let app = Arc::new(App { ctx: ctx.clone(), attester });
+    tokio::spawn(measure_blob_store(ctx.blobs.clone()));
     log(&format!("boot {} mode={} commit={}", ctx.info.boot_id, ctx.info.mode, ctx.info.source_commit));
 
     if let (Some(t), Some(d)) = (&tls, &cert_name) {
         tokio::spawn(acme::run(net, t.clone(), d.clone(), cfg.acme_directory.unwrap_or_else(|| LETS_ENCRYPT.into())));
     }
     serve(args, app, tls).await
+}
+
+/// Time a 16 MiB round trip to the parent's blob store, for the log.
+async fn measure_blob_store(store: blobs::BlobClient) {
+    let mut data = vec![0u8; 16 << 20];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut data);
+    let mut id = [0u8; 24];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut id);
+    let t0 = std::time::Instant::now();
+    if let Err(e) = store.put(&id, &data).await {
+        log(&format!("blob store check failed: {e:#}"));
+        return;
+    }
+    let put = t0.elapsed();
+    let t1 = std::time::Instant::now();
+    let ok = matches!(store.get(&id).await, Ok(Some(d)) if d == data);
+    let get = t1.elapsed();
+    let mb = 16.0;
+    // Small-request latency.
+    let mut tiny = [0u8; 24];
+    tiny[0] = 0xff;
+    let t2 = std::time::Instant::now();
+    for _ in 0..20 {
+        let _ = store.get(&tiny).await;
+    }
+    let rtt = t2.elapsed() / 20;
+    let _ = store.delete_session(&id[..8].try_into().unwrap()).await;
+    log(&format!(
+        "blob store: 16 MiB put {:.0} ms ({:.0} MB/s), get {:.0} ms ({:.0} MB/s), small request {:.2} ms, verified={ok}",
+        put.as_secs_f64() * 1e3, mb / put.as_secs_f64(), get.as_secs_f64() * 1e3, mb / get.as_secs_f64(), rtt.as_secs_f64() * 1e3
+    ));
 }
 
 struct App {
@@ -388,6 +433,54 @@ fn create_session(app: &App, req: &Request<hyper::body::Incoming>) -> Result<Res
     ))
 }
 
+/// Stream an uploaded tar into a sealed bundle: body frames go through a
+/// bounded channel to a blocking parser, so at most a few frames and one
+/// file are in memory at a time.
+async fn ingest_upload(ctx: &Arc<Ctx>, session_id: &str, mut body: hyper::body::Incoming) -> Result<bundle::Bundle, ApiError> {
+    let max = ctx.max_code_bytes as u64;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(16);
+    let (store, cache, sid) = (ctx.blobs.clone(), ctx.cache.clone(), session_id.to_string());
+    let rt = tokio::runtime::Handle::current();
+    let job = tokio::task::spawn_blocking(move || bundle::Bundle::ingest(ChannelReader { rx, buf: Bytes::new() }, &sid, store, cache, rt, max));
+    let mut received = 0u64;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|e| anyhow!("upload interrupted: {e}"))?;
+        if let Ok(data) = frame.into_data() {
+            received += data.len() as u64;
+            // The tar has headers and padding on top of file contents.
+            if received > max + max / 8 + (16 << 20) {
+                return Err(ApiError(StatusCode::PAYLOAD_TOO_LARGE, format!("the archive is larger than {} MiB", max >> 20)));
+            }
+            if tx.send(data).await.is_err() {
+                break; // the parser stopped early (error); its result says why
+            }
+        }
+    }
+    drop(tx);
+    let b = job.await.map_err(|_| anyhow!("upload parser crashed"))??;
+    Ok(b)
+}
+
+struct ChannelReader {
+    rx: tokio::sync::mpsc::Receiver<Bytes>,
+    buf: Bytes,
+}
+
+impl std::io::Read for ChannelReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        while self.buf.is_empty() {
+            match self.rx.blocking_recv() {
+                Some(b) => self.buf = b,
+                None => return Ok(0),
+            }
+        }
+        let n = out.len().min(self.buf.len());
+        out[..n].copy_from_slice(&self.buf[..n]);
+        self.buf = self.buf.slice(n..);
+        Ok(n)
+    }
+}
+
 fn bearer(req: &Request<hyper::body::Incoming>) -> Option<String> {
     req.headers()
         .get("authorization")
@@ -419,21 +512,12 @@ async fn session_route(app: &Arc<App>, id: &str, rest: &[&str], req: Request<hyp
         ("POST", ["question"]) => ok(s.propose_question(ctx, role, &body_json(req).await?)?),
         ("POST", ["question", "decision"]) => ok(s.decide_question(ctx, role, &body_json(req).await?)?),
         ("PUT", ["code"]) => {
-            if role != Role::Auditee {
+            if role != attest_core::Role::Auditee {
                 return Err(anyhow!("only the auditee uploads code").into());
             }
-            let used = ctx.store.total_code_bytes() as usize;
-            let room = ctx.max_total_code_bytes.saturating_sub(used);
-            let limit = ctx.max_code_bytes.min(room);
-            if limit < 1024 {
-                return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "this server is out of room for code right now".into()));
-            }
-            let tar = http_body_util::Limited::new(req.into_body(), limit)
-                .collect()
-                .await
-                .map_err(|_| ApiError(StatusCode::PAYLOAD_TOO_LARGE, format!("code archive is larger than {} MiB", limit >> 20)))?
-                .to_bytes();
-            ok(s.upload_code(ctx, role, &tar)?)
+            let _slot = ctx.upload_slots.acquire().await.map_err(|_| anyhow!("shutting down"))?;
+            let bundle = ingest_upload(ctx, &s.id, req.into_body()).await?;
+            ok(s.set_code(ctx, role, bundle)?)
         }
         ("POST", ["affidavit"]) => ok(s.confirm_affidavit(ctx, role, &body_json(req).await?)?),
         ("POST", ["models"]) => ok(s.propose_model(ctx, role, &body_json(req).await?)?),

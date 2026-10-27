@@ -6,6 +6,7 @@
 //!   vsock 5002            -> boot config JSON      (domain or public IP, email sender)
 //!   vsock 5003            -> instance role credentials from IMDSv2 (for SES)
 //!   vsock 5004            <- the enclave's operational log lines (printed here)
+//!   vsock 5005            <-> sealed file store (ciphertext only; the enclave holds the keys)
 //!
 //! Outbound tunnels may go to any public address on port 443 (webhooks can
 //! point anywhere); the enclave decides where it connects.
@@ -40,6 +41,15 @@ struct Args {
     /// Dev only: address to accept tunnel requests on.
     #[arg(long, default_value = "127.0.0.1:5001")]
     dev_tunnel: String,
+    /// Where sealed files are kept. Wiped at startup: the keys died with the last enclave.
+    #[arg(long, default_value = "/var/lib/attest/blobs")]
+    blob_dir: String,
+    /// Disk quota for sealed files.
+    #[arg(long, default_value_t = 50)]
+    blob_quota_gib: u64,
+    /// Dev only: address for the blob store.
+    #[arg(long, default_value = "127.0.0.1:5005")]
+    dev_blobs: String,
     /// Don't forward inbound connections (dev, where the enclave serves HTTP itself).
     #[arg(long)]
     no_forward: bool,
@@ -58,6 +68,8 @@ async fn main() -> Result<()> {
     let mut tasks = tokio::task::JoinSet::new();
     let a = args.clone();
     tasks.spawn(async move { tunnel_server(a).await });
+    let a = args.clone();
+    tasks.spawn(async move { blob_server(a).await });
     if !args.dev {
         let a = args.clone();
         tasks.spawn(async move { config_server(a).await });
@@ -179,8 +191,16 @@ async fn config_server(args: Args) -> Result<()> {
         log(&format!("config on vsock {}", args.config_port));
         loop {
             let (mut s, _) = l.accept().await?;
-            let _ = s.write_all(&body).await;
-            let _ = AsyncWriteExt::shutdown(&mut s).await;
+            let body = body.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let _ = s.write_all(&body).await;
+                let _ = AsyncWriteExt::shutdown(&mut s).await;
+                // Keep the socket open until the enclave closes it, so it
+                // can finish reading.
+                let mut sink = [0u8; 64];
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(30), s.read(&mut sink)).await;
+            });
         }
     }
     #[allow(unreachable_code)]
@@ -196,6 +216,118 @@ fn serde_json_check(b: &[u8]) -> Result<()> {
         bail!("config must be a JSON object");
     }
     Ok(())
+}
+
+// ------------------------------------------------------------------ sealed file store
+
+struct Blobs {
+    dir: std::path::PathBuf,
+    quota: u64,
+    used: std::sync::Mutex<u64>,
+}
+
+impl Blobs {
+    fn path(&self, id: &[u8]) -> std::path::PathBuf {
+        self.dir.join(id.iter().map(|b| format!("{b:02x}")).collect::<String>())
+    }
+}
+
+/// op u8 | id [24] | len u64le | data  ->  status u8 | len u64le | data
+async fn handle_blob<S: Io>(b: std::sync::Arc<Blobs>, mut s: S) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    let op = s.read_u8().await?;
+    let mut id = [0u8; 24];
+    s.read_exact(&mut id).await?;
+    let len = s.read_u64_le().await?;
+    if len > (65 << 20) {
+        bail!("blob too large");
+    }
+    let mut data = vec![0u8; len as usize];
+    s.read_exact(&mut data).await?;
+    let reply = |status: u8, body: &[u8]| {
+        let mut out = vec![status];
+        out.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        out.extend_from_slice(body);
+        out
+    };
+    let out = match op {
+        1 => {
+            let mut used = b.used.lock().unwrap();
+            if *used + len > b.quota {
+                reply(2, b"blob store full")
+            } else {
+                *used += len;
+                drop(used);
+                match std::fs::write(b.path(&id), &data) {
+                    Ok(()) => reply(0, b""),
+                    Err(e) => reply(2, e.to_string().as_bytes()),
+                }
+            }
+        }
+        2 => match std::fs::read(b.path(&id)) {
+            Ok(d) => reply(0, &d),
+            Err(_) => reply(1, b""),
+        },
+        3 => {
+            // Delete every blob whose id starts with the 8-byte session tag.
+            let prefix: String = id[..8].iter().map(|x| format!("{x:02x}")).collect();
+            let mut freed = 0;
+            for e in std::fs::read_dir(&b.dir)?.flatten() {
+                if e.file_name().to_string_lossy().starts_with(&prefix) {
+                    freed += e.metadata().map(|m| m.len()).unwrap_or(0);
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+            let mut used = b.used.lock().unwrap();
+            *used = used.saturating_sub(freed);
+            reply(0, b"")
+        }
+        _ => reply(2, b"bad op"),
+    };
+    s.write_all(&out).await?;
+    s.flush().await?;
+    Ok(())
+}
+
+async fn blob_server(args: Args) -> Result<()> {
+    let dir = std::path::PathBuf::from(&args.blob_dir);
+    // Anything here is sealed under keys that died with the previous enclave.
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).with_context(|| format!("clearing {}", dir.display()))?;
+    }
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let b = std::sync::Arc::new(Blobs { dir, quota: args.blob_quota_gib << 30, used: std::sync::Mutex::new(0) });
+    if args.dev {
+        let l = TcpListener::bind(&args.dev_blobs).await?;
+        log(&format!("dev blob store on {}", args.dev_blobs));
+        loop {
+            let (s, _) = l.accept().await?;
+            let b = b.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handle_blob(b, s).await {
+                    log(&format!("blob: {e:#}"));
+                }
+            });
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let l = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_ANY, 5005))?;
+        log("blob store on vsock 5005");
+        loop {
+            let (s, _) = l.accept().await?;
+            let b = b.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handle_blob(b, s).await {
+                    log(&format!("blob: {e:#}"));
+                }
+            });
+        }
+    }
+    #[allow(unreachable_code)]
+    {
+        bail!("vsock requires linux; use --dev")
+    }
 }
 
 /// Print the enclave's log lines (it has no console in production).

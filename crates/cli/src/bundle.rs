@@ -6,6 +6,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
+/// Same per-file limit as the enclave.
+pub const MAX_FILE_BYTES: u64 = 64 << 20;
+
 pub struct GitInfo {
     pub head: Option<String>,
     pub remote: Option<String>,
@@ -65,6 +68,10 @@ pub fn collect(dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
         };
         if !meta.file_type().is_file() {
             skipped += 1;
+            continue;
+        }
+        if meta.len() > MAX_FILE_BYTES {
+            eprintln!("note: leaving out {p} ({} MiB; the limit is 64 MiB per file)", meta.len() >> 20);
             continue;
         }
         let norm = normalize_path(&p).with_context(|| format!("unusable path {p:?}"))?;
