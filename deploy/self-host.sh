@@ -4,10 +4,13 @@
 #   deploy/self-host.sh [--name attest] [--region us-west-2] [--type m7g.xlarge]
 #                       [--email-from you@example.com] [--operator "Your Name"]
 #                       [--domain attest.example.com] [--commit SHA] [--repo URL]
+#                       [--acme-staging]
 #
 # Only AWS is needed. Without --domain the server gets a Let's Encrypt
 # certificate for its Elastic IP. --email-from turns on email notifications
-# through Amazon SES (you confirm that address once).
+# through Amazon SES (you confirm that address once). --acme-staging uses
+# Let's Encrypt's staging CA (untrusted certificate; for test deploys, which
+# don't count against the 5-per-week limit per IP or domain).
 #
 # First run: creates a key pair, security group, IAM role (SES only), Elastic
 # IP and Graviton instance; builds the enclave image on it from --commit (default: the newest
@@ -31,6 +34,7 @@ while [ $# -gt 0 ]; do
     --email-from) EMAIL_FROM=$2; shift 2 ;;
     --commit) COMMIT=$2; shift 2 ;;
     --repo) REPO=$2; shift 2 ;;
+    --acme-staging) ACME_DIR=https://acme-staging-v02.api.letsencrypt.org/directory; shift ;;
     -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
@@ -179,10 +183,10 @@ done
 "${SSH[@]}" 'test -f /var/lib/attest-bootstrapped' || { echo "instance setup did not finish; check /var/log/cloud-init-output.log on it" >&2; exit 1; }
 
 say "building the enclave image on the instance (about 10 minutes)"
-CONFIG=$(DOMAIN="$DOMAIN" OPERATOR="$OPERATOR" IP="$IP" EMAIL_FROM="$EMAIL_FROM" REGION="$REGION" python3 -c '
+CONFIG=$(ACME_DIR="${ACME_DIR:-}" DOMAIN="$DOMAIN" OPERATOR="$OPERATOR" IP="$IP" EMAIL_FROM="$EMAIL_FROM" REGION="$REGION" python3 -c '
 import json, os
 e = lambda k: os.environ[k] or None
-print(json.dumps({"domain": e("DOMAIN"), "operator": e("OPERATOR"), "public_ip": e("IP"), "email_from": e("EMAIL_FROM"), "ses_region": e("REGION")}))')
+print(json.dumps({"domain": e("DOMAIN"), "operator": e("OPERATOR"), "public_ip": e("IP"), "email_from": e("EMAIL_FROM"), "ses_region": e("REGION"), "acme_directory": e("ACME_DIR")}))')
 "${SSH[@]}" "set -euo pipefail
   if [ \"\$(cat attest-src/build/out/built-commit 2>/dev/null)\" = '$COMMIT' ]; then
     echo 'enclave image for $COMMIT already built; reusing it'; cd attest-src
