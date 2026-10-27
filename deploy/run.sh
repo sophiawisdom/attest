@@ -6,7 +6,8 @@
 #   CONFIG=/etc/attest/host.json deploy/run.sh
 #
 # host.json is handed to the enclave at boot, e.g.
-#   {"domain": "attest.example.com", "email": {"resend_api_key": "...", "from": "attest <notify@example.com>"}}
+#   {"public_ip": "1.2.3.4", "email_from": "you@example.com", "ses_region": "us-west-2", "operator": "...", "domain": null}
+# (deploy/self-host.sh writes it.)
 #
 # Restarting the enclave ends every session; the new boot id is visible.
 set -euo pipefail
