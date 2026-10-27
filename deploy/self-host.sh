@@ -66,7 +66,12 @@ aws sts get-caller-identity --query Account --output text
 
 if [ -z "$REPO" ]; then
   REPO=$(git remote get-url origin 2>/dev/null || echo https://github.com/sophiawisdom/attest)
-  REPO=${REPO/git@github.com:/https:\/\/github.com\/}
+  # The instance clones anonymously over HTTPS, so turn SSH remotes
+  # (git@github.com:o/r, or an ssh-config alias like git@github-x:o/r) into URLs.
+  case "$REPO" in
+    git@*:*) REPO="https://github.com/${REPO#*:}" ;;
+    ssh://git@*/*) REPO="https://github.com/${REPO#ssh://git@*/}" ;;
+  esac
 fi
 if [ -z "$COMMIT" ]; then
   # The newest published build, so the PCRs can be checked against measurements/.
