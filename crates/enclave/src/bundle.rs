@@ -324,6 +324,8 @@ impl<'a> Tools<'a> {
         let prefix = prefix.map(clean_dir).unwrap_or_default();
         let mut out = Vec::new();
         let (mut total, mut files_matched, mut scanned) = (0usize, 0usize, 0u64);
+        // Which files to search, within the byte budget.
+        let mut targets = Vec::new();
         let mut stopped_early = false;
         for (p, f) in self.bundle.files.range(prefix.clone()..) {
             if !p.starts_with(&prefix) {
@@ -337,7 +339,17 @@ impl<'a> Tools<'a> {
                 break;
             }
             scanned += f.size;
-            let bytes = self.bundle.read(p).await?;
+            targets.push(p.clone());
+        }
+        // Fetch 8 at a time from the parent; results stay in path order.
+        use futures_util::StreamExt;
+        let mut fetched = futures_util::stream::iter(targets.into_iter().map(|p| async move {
+            let r = self.bundle.read(&p).await;
+            (p, r)
+        }))
+        .buffered(8);
+        while let Some((p, bytes)) = fetched.next().await {
+            let bytes = bytes?;
             let t = String::from_utf8_lossy(&bytes);
             if !re.is_match(&t) {
                 continue;

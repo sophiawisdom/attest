@@ -132,7 +132,7 @@ impl Sealer {
 
     fn aad(&self, path: &str, digest: &[u8; 32]) -> Vec<u8> {
         let mut a = Vec::with_capacity(64 + path.len());
-        a.extend_from_slice(b"attest-blob-v1\0");
+        a.extend_from_slice(b"attest-blob-v2\0");
         a.extend_from_slice(self.session_id.as_bytes());
         a.push(0);
         a.extend_from_slice(path.as_bytes());
@@ -141,8 +141,11 @@ impl Sealer {
         a
     }
 
-    /// Returns (blob id, sealed bytes = nonce || ciphertext).
+    /// Returns (blob id, sealed bytes = nonce || ciphertext of LZ4(plain)).
+    /// Compressing first means less to move over vsock and store.
     pub fn seal(&self, path: &str, digest: &[u8; 32], plain: &[u8]) -> Result<(BlobId, Vec<u8>)> {
+        let packed = lz4_flex::compress_prepend_size(plain);
+        let plain = &packed[..];
         let mut id = [0u8; 24];
         id[..8].copy_from_slice(&self.tag);
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut id[8..]);
@@ -164,6 +167,10 @@ impl Sealer {
             .cipher
             .decrypt(Nonce::from_slice(&sealed[..12]), Payload { msg: &sealed[12..], aad: &self.aad(path, digest) })
             .map_err(|_| anyhow!("stored copy of {path} failed authentication (tampered or swapped by the host)"))?;
+        ensure!(plain.len() >= 4, "stored copy of {path} is malformed");
+        let declared = u32::from_le_bytes(plain[..4].try_into().unwrap()) as usize;
+        ensure!(declared <= MAX_FILE_BYTES, "stored copy of {path} is too large");
+        let plain = lz4_flex::decompress_size_prepended(&plain).map_err(|_| anyhow!("stored copy of {path} is malformed"))?;
         ensure!(&attest_core::sha256(&plain) == digest, "stored copy of {path} has the wrong content");
         Ok(plain)
     }

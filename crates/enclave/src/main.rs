@@ -227,7 +227,7 @@ async fn main() -> Result<()> {
         public_name: domain.clone().or(cfg.public_ip.clone()),
         max_code_bytes: cfg.max_code_mib.unwrap_or(1024) << 20,
         blobs: blobs::BlobClient::new(args.dev, args.dev_blobs.clone()),
-        cache: Arc::new(blobs::Cache::new(cfg.cache_mib.unwrap_or(1024) << 20)),
+        cache: Arc::new(blobs::Cache::new(cfg.cache_mib.unwrap_or(2048) << 20)),
         upload_slots: tokio::sync::Semaphore::new(2),
         slots: tokio::sync::Semaphore::new(args.concurrency),
         store: sessions::Store::default(),
@@ -266,7 +266,22 @@ async fn measure_blob_store(store: blobs::BlobClient) {
         let _ = store.get(&tiny).await;
     }
     let rtt = t2.elapsed() / 20;
+    // Eight 2 MiB transfers at once, as grep does.
+    let t3 = std::time::Instant::now();
+    let parallel = futures_util::future::join_all((0..8u8).map(|i| {
+        let store = store.clone();
+        let mut pid = id;
+        pid[23] ^= i.wrapping_add(1);
+        let chunk = data[..2 << 20].to_vec();
+        async move {
+            store.put(&pid, &chunk).await.is_ok() && matches!(store.get(&pid).await, Ok(Some(d)) if d.len() == chunk.len())
+        }
+    }))
+    .await;
+    let par = t3.elapsed();
+    let par_ok = parallel.iter().all(|x| *x);
     let _ = store.delete_session(&id[..8].try_into().unwrap()).await;
+    log(&format!("blob store: 8 parallel 2 MiB put+get {:.0} ms ({:.0} MB/s each way), ok={par_ok}", par.as_secs_f64() * 1e3, 16.0 / par.as_secs_f64() * 2.0 / 2.0));
     log(&format!(
         "blob store: 16 MiB put {:.0} ms ({:.0} MB/s), get {:.0} ms ({:.0} MB/s), small request {:.2} ms, verified={ok}",
         put.as_secs_f64() * 1e3, mb / put.as_secs_f64(), get.as_secs_f64() * 1e3, mb / get.as_secs_f64(), rtt.as_secs_f64() * 1e3
