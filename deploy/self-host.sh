@@ -175,6 +175,9 @@ if [ "$(awsr ec2 describe-iam-instance-profile-associations --filters "Name=inst
 fi
 
 SSH=(ssh -i "$KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$STATE_DIR/$NAME.known_hosts" -o ConnectTimeout=10 -o BatchMode=yes "ec2-user@$IP")
+# SSH from wherever this runs now (the deployer's address may have changed).
+MYIP=$(curl -s https://checkip.amazonaws.com | tr -d '[:space:]')
+awsr ec2 authorize-security-group-ingress --group-id "$SG" --protocol tcp --port 22 --cidr "$MYIP/32" >/dev/null 2>&1 || true
 say "waiting for the instance to finish setting up (a few minutes on first boot)"
 for _ in $(seq 60); do
   "${SSH[@]}" 'sudo cloud-init status --wait >/dev/null 2>&1; test -f /var/lib/attest-bootstrapped' 2>/dev/null && break
