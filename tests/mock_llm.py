@@ -26,6 +26,16 @@ def respond(messages):
             "answer": "needs_clarification", "confidence": 0.2,
             "summary": "The repository has no single training pipeline.",
             "clarification_request": "Name the training entry point you mean, or ask about all of them."})]
+    if "PYTHON" in question:
+        if n == 0:
+            code = ("import os\nsrc = open('/repo/trainer/train.py').read()\n"
+                    "print('files:', sorted(os.listdir('/repo')))\nprint('lines:', len(src.splitlines()))\n"
+                    "print('include_cot = True' in src)\n"
+                    "try:\n    open('/repo/x', 'w')\nexcept OSError as e:\n    print('write blocked:', type(e).__name__)\n"
+                    "try:\n    import socket; socket.create_connection(('1.1.1.1', 80), 2)\nexcept Exception as e:\n    print('network blocked:', type(e).__name__)\n")
+            return "", [tool_call(f"{uid}_p", "python", {"code": code})]
+        out = tools[0]["content"]
+        return "", [tool_call(f"{uid}_v", "submit_verdict", {"answer": "yes" if "True" in out else "no", "confidence": 0.9, "summary": "python said: " + out.replace("\n", " | ")})]
     if n == 0:
         return "Looking at the layout.", [tool_call(f"{uid}_0", "list_dir", {"path": ""})]
     if n == 1:

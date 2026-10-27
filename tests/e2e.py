@@ -68,6 +68,22 @@ class Party:
         return v
 
 
+PY_URL = "https://github.com/brettcannon/cpython-wasi-build/releases/download/v3.15.1/python-3.15.1-wasi_sdk-33.zip"
+PY_SHA256 = "252e2e17fab9f51a51fbfc73d51e18805cb633e9f9200c9753b4b801c70ad32c"
+
+
+def python_wasi():
+    """The pinned CPython WASI build the enclave image also uses."""
+    import hashlib, zipfile
+    d = os.path.join(ROOT, "target", "python-wasi")
+    if not os.path.exists(os.path.join(d, "python.wasm")):
+        z = os.path.join(ROOT, "target", "python-wasi.zip")
+        urllib.request.urlretrieve(PY_URL, z)
+        assert hashlib.sha256(open(z, "rb").read()).hexdigest() == PY_SHA256, "python-wasi checksum mismatch"
+        zipfile.ZipFile(z).extractall(d)
+    return d
+
+
 def main():
     subprocess.run(["cargo", "build", "--offline", "-q", "--manifest-path", os.path.join(ROOT, "Cargo.toml")], check=True)
     work = tempfile.mkdtemp(prefix="attest-e2e-")
@@ -79,7 +95,7 @@ def main():
         subprocess.Popen([os.path.join(BIN, "attest-host"), "--dev", "--no-forward", "--dev-tunnel", "127.0.0.1:15001",
                           "--dev-blobs", "127.0.0.1:15005", "--blob-dir", os.path.join(work, "blobs")], stderr=open(os.path.join(work, "host.log"), "w")),
         subprocess.Popen([os.path.join(BIN, "attest-enclave"), "--dev", "--dev-listen", "127.0.0.1:18080", "--dev-tunnel", "127.0.0.1:15001",
-                          "--dev-blobs", "127.0.0.1:15005", "--dev-config", cfg], stderr=open(os.path.join(work, "enclave.log"), "w")),
+                          "--dev-blobs", "127.0.0.1:15005", "--dev-config", cfg, "--python-dir", python_wasi()], stderr=open(os.path.join(work, "enclave.log"), "w")),
     ]
     try:
         for _ in range(100):
@@ -196,6 +212,26 @@ def run(work):
     check(v["email_available"], "server offers email")
     events = auditor.view()["events"]
     check(not any("trace" in e["text"].lower() for e in events) and len(events) > 5, "auditor event feed is populated")
+
+    print("python sandbox")
+    s3 = ok("POST", "/api/sessions", body={})
+    a3, o3 = Party(s3["session_id"], s3["auditee_token"]), Party(s3["session_id"], s3["auditor_token"])
+    o3.post("/question", {"text": "PYTHON: does trainer/train.py compute loss on CoT tokens?"})
+    a3.post("/question/decision", {"version": 1, "accept": True})
+    subprocess.run([os.path.join(BIN, "attest"), "upload", f"{BASE}/s/{s3['session_id']}#{s3['auditee_token']}", repo, "--org", "X", "--allow-dev"], check=True, capture_output=True)
+    for _ in range(600):  # the sandbox compiles python.wasm at boot
+        if "python sandbox ready" in open(os.path.join(work, "enclave.log")).read():
+            break
+        time.sleep(0.5)
+    a3.post("/models", {"provider": "mock", "model": "gpt-mock", "api_key": "test-key", "mock_endpoint": "127.0.0.1:19999"})
+    v = a3.wait_until(lambda v: v["runs"] and v["runs"][-1]["status"] != "running", "python run", timeout=120)
+    summary = v["runs"][-1]["verdict"]["summary"]
+    print("   ", summary[:200])
+    check("lines: 7" in summary and "True" in summary, "python reads the repository through /repo")
+    check("files: ['README.md', 'trainer']" in summary, "python lists /repo")
+    check("write blocked" in summary, "writes to /repo are refused")
+    check("network blocked" in summary, "the sandbox has no network")
+    check(v["runs"][-1]["manifest"]["activity"]["python_calls"] == 1 and v["runs"][-1]["manifest"]["activity"]["files_read"] >= 1, "certificate counts python calls and the files python opened")
 
     print("storage limits and tampering")
     big = os.path.join(work, "big")

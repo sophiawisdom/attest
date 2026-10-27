@@ -43,6 +43,8 @@ pub struct Ctx {
     pub blobs: crate::blobs::BlobClient,
     pub cache: Arc<crate::blobs::Cache>,
     pub upload_slots: tokio::sync::Semaphore,
+    /// Compiled at boot in the background; None until ready (or if absent).
+    pub sandbox: Arc<std::sync::OnceLock<Arc<crate::sandbox::Sandbox>>>,
     /// Domain, or public IP, the server is reached at (informational).
     pub public_name: Option<String>,
     pub max_code_bytes: usize,
@@ -695,7 +697,8 @@ impl RunJob {
             }
             session.changed(&mut st);
         };
-        let out = run::agent_loop(&self.client, &self.bundle, self.turns.clone(), self.question.max_steps, &progress).await;
+        let sandbox = self.ctx.sandbox.get().cloned();
+        let out = run::agent_loop(&self.client, &self.bundle, sandbox, self.turns.clone(), self.question.max_steps, &progress).await;
 
         let mut model = self.model_info.clone();
         model.response_models = out.response_models.clone();

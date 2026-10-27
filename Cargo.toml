@@ -27,6 +27,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-vsock = "0.7"
 
+# Optimize dependencies in dev builds: wasmtime compiling python.wasm
+# unoptimized takes minutes.
+[profile.dev.package."*"]
+opt-level = 2
+
 [profile.release]
 opt-level = 3
 lto = true

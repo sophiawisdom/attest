@@ -16,6 +16,7 @@ mod net;
 mod notify;
 mod nsm;
 mod run;
+mod sandbox;
 mod sessions;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod tls;
@@ -61,6 +62,9 @@ struct Args {
     dev_config: Option<String>,
     #[arg(long, default_value_t = 4)]
     concurrency: usize,
+    /// CPython WASI build: python.wasm and lib/python3.x.
+    #[arg(long, default_value = "/opt/python-wasi")]
+    python_dir: String,
 }
 
 /// Supplied by the untrusted parent at boot. Nothing in it is trusted for
@@ -229,11 +233,25 @@ async fn main() -> Result<()> {
         blobs: blobs::BlobClient::new(args.dev, args.dev_blobs.clone()),
         cache: Arc::new(blobs::Cache::new(cfg.cache_mib.unwrap_or(2048) << 20)),
         upload_slots: tokio::sync::Semaphore::new(2),
+        sandbox: Arc::new(std::sync::OnceLock::new()),
         slots: tokio::sync::Semaphore::new(args.concurrency),
         store: sessions::Store::default(),
     });
     let app = Arc::new(App { ctx: ctx.clone(), attester });
     tokio::spawn(measure_blob_store(ctx.blobs.clone()));
+    {
+        let (slot, dir) = (ctx.sandbox.clone(), args.python_dir.clone());
+        tokio::task::spawn_blocking(move || {
+            let t = std::time::Instant::now();
+            match sandbox::Sandbox::load(std::path::Path::new(&dir)) {
+                Ok(sb) => {
+                    let _ = slot.set(Arc::new(sb));
+                    log(&format!("python sandbox ready ({:.1} s to compile)", t.elapsed().as_secs_f64()));
+                }
+                Err(e) => log(&format!("python sandbox unavailable: {e:#}")),
+            }
+        });
+    }
     log(&format!("boot {} mode={} commit={}", ctx.info.boot_id, ctx.info.mode, ctx.info.source_commit));
 
     if let (Some(t), Some(d)) = (&tls, &cert_name) {

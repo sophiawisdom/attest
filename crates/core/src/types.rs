@@ -268,6 +268,8 @@ pub struct Activity {
     pub find_calls: u32,
     pub list_calls: u32,
     pub read_calls: u32,
+    #[serde(default)]
+    pub python_calls: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]

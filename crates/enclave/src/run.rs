@@ -27,13 +27,14 @@ pub struct AgentOutput {
 /// `progress` receives trace entries as they happen (auditee-visible).
 pub async fn agent_loop(
     client: &Client,
-    bundle: &Bundle,
+    bundle: &std::sync::Arc<Bundle>,
+    sandbox: Option<std::sync::Arc<crate::sandbox::Sandbox>>,
     mut turns: Vec<Turn>,
     max_steps: u32,
     progress: &(dyn Fn(Vec<Value>) + Send + Sync),
 ) -> AgentOutput {
     let schemas = tool_schemas();
-    let mut tools = Tools::new(bundle);
+    let mut tools = Tools::new(bundle, sandbox);
     let mut activity = Activity::default();
     let mut response_models = BTreeSet::new();
     let mut upstream = BTreeSet::new();
@@ -123,6 +124,7 @@ pub async fn agent_loop(
     activity.find_calls = tools.counts.find;
     activity.read_calls = tools.counts.read;
     activity.grep_calls = tools.counts.grep;
+    activity.python_calls = tools.counts.python;
     let files_read = tools.files_read.clone();
     progress(vec![json!({"type": "files_read", "paths": files_read.keys().collect::<Vec<_>>()})]);
     AgentOutput {

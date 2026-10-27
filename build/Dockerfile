@@ -12,7 +12,7 @@ RUN set -eux; \
     printf 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/%s bookworm main\n' "$DEBIAN_SNAPSHOT" > /etc/apt/sources.list; \
     rm -f /etc/apt/sources.list.d/debian.sources; \
     apt-get -o Acquire::Check-Valid-Until=false update; \
-    apt-get install -y --no-install-recommends gcc libc6-dev musl-tools; \
+    apt-get install -y --no-install-recommends gcc libc6-dev musl-tools unzip; \
     rm -rf /var/lib/apt/lists/*
 
 # Static musl binary for the build platform: x86_64 for Intel/AMD Nitro
@@ -40,6 +40,12 @@ RUN T=$(cat /target-triple) \
  && cargo build --release --locked --target "$T" -p attest-enclave -p attest-host -p attest-cli \
  && cargo test --release --locked --target "$T" -p attest-core -p attest-enclave
 
+# CPython compiled to WASI, for the agent's python sandbox. Pinned by hash.
+ADD --checksum=sha256:252e2e17fab9f51a51fbfc73d51e18805cb633e9f9200c9753b4b801c70ad32c \
+    https://github.com/brettcannon/cpython-wasi-build/releases/download/v3.15.1/python-3.15.1-wasi_sdk-33.zip /tmp/python-wasi.zip
+RUN mkdir -p /opt/python-wasi && cd /opt/python-wasi && unzip -q /tmp/python-wasi.zip \
+ && find /opt/python-wasi -exec touch -h -d @0 {} +
+
 RUN mkdir -p /out && \
     T=$(cat /target-triple) && \
     cp target/$T/release/attest-enclave target/$T/release/attest-host target/$T/release/attest /out/ && \
@@ -52,4 +58,5 @@ COPY --from=builder /out/ /
 # for provider TLS are compiled in (webpki-roots), so they are in PCR0 too.
 FROM scratch AS enclave
 COPY --from=builder /out/attest-enclave /attest-enclave
+COPY --from=builder /opt/python-wasi /opt/python-wasi
 ENTRYPOINT ["/attest-enclave"]

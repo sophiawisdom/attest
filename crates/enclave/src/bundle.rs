@@ -192,7 +192,8 @@ fn truncate_line(s: &str, max: usize) -> String {
 /// Read-only tools. Every call returns text for the model; errors are also
 /// returned as text so the model can recover.
 pub struct Tools<'a> {
-    pub bundle: &'a Bundle,
+    pub bundle: &'a Arc<Bundle>,
+    pub sandbox: Option<Arc<crate::sandbox::Sandbox>>,
     pub files_read: BTreeMap<String, [u8; 32]>,
     pub counts: ToolCounts,
 }
@@ -203,6 +204,7 @@ pub struct ToolCounts {
     pub find: u32,
     pub read: u32,
     pub grep: u32,
+    pub python: u32,
 }
 
 const MAX_OUTPUT: usize = 60_000;
@@ -210,8 +212,43 @@ const MAX_OUTPUT: usize = 60_000;
 const MAX_GREP_BYTES: u64 = 2 << 30;
 
 impl<'a> Tools<'a> {
-    pub fn new(bundle: &'a Bundle) -> Self {
-        Self { bundle, files_read: BTreeMap::new(), counts: ToolCounts::default() }
+    pub fn new(bundle: &'a Arc<Bundle>, sandbox: Option<Arc<crate::sandbox::Sandbox>>) -> Self {
+        Self { bundle, sandbox, files_read: BTreeMap::new(), counts: ToolCounts::default() }
+    }
+
+    async fn python(&mut self, code: &str) -> Result<String> {
+        let sb = self.sandbox.clone().context("the python sandbox is still starting up; try again in a minute, or use the other tools")?;
+        ensure!(!code.trim().is_empty(), "code is empty");
+        let opened = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let out = sb.run_python(self.bundle.clone(), code, opened.clone()).await;
+        self.files_read.extend(opened.lock().unwrap().iter().map(|(k, v)| (k.clone(), *v)));
+        let mut s = String::new();
+        if out.timed_out {
+            s.push_str(&format!("[stopped: the {} s time limit was reached]\n", crate::sandbox::TIME_LIMIT.as_secs()));
+        }
+        if let Some(e) = &out.error {
+            let first: String = e.lines().take(3).collect::<Vec<_>>().join("\n");
+            s.push_str(&format!("[sandbox error: {first}]\n"));
+        }
+        if let Some(c) = out.exit_code {
+            if c != 0 {
+                s.push_str(&format!("[exit code {c}]\n"));
+            }
+        }
+        if !out.stdout.is_empty() {
+            s.push_str(&out.stdout);
+            if !out.stdout.ends_with('\n') {
+                s.push('\n');
+            }
+        }
+        if !out.stderr.is_empty() {
+            s.push_str("--- stderr ---\n");
+            s.push_str(&out.stderr);
+        }
+        if s.is_empty() {
+            s.push_str("(no output; use print())");
+        }
+        Ok(s)
     }
 
     pub async fn call(&mut self, name: &str, args: &serde_json::Value) -> String {
@@ -237,6 +274,10 @@ impl<'a> Tools<'a> {
                     args["max_results"].as_u64(),
                 )
                 .await
+            }
+            "python" => {
+                self.counts.python += 1;
+                self.python(args["code"].as_str().unwrap_or("")).await
             }
             other => Err(anyhow::anyhow!("unknown tool {other}")),
         };
@@ -386,6 +427,8 @@ pub fn tool_schemas() -> Vec<(&'static str, &'static str, serde_json::Value)> {
             json!({"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]})),
         ("grep", "Search file contents line by line with a regular expression (Rust regex syntax). Optionally restrict to a directory prefix.",
             json!({"type":"object","properties":{"pattern":{"type":"string"},"path_prefix":{"type":"string"},"case_insensitive":{"type":"boolean"},"max_results":{"type":"integer"}},"required":["pattern"]})),
+        ("python", "Run a Python 3.15 script in a sandbox and get its printed output. The repository is read-only at /repo (e.g. open('/repo/src/main.py')); the standard library is available, third-party packages are not. No network, no subprocesses, no writing files. Limits per call: 60 s, 512 MiB, 30k characters of output. Use it to parse, count, cross-reference or search in ways the other tools can't.",
+            json!({"type":"object","properties":{"code":{"type":"string","description":"Python source to run. print() what you want to see."}},"required":["code"]})),
         ("submit_verdict", "Finish: record your verdict for the auditor (released only if the auditee approves).",
             json!({"type":"object","properties":{
                 "answer":{"type":"string","enum":["yes","no","inconclusive","needs_clarification"]},
@@ -421,9 +464,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn tools_work() {
-        let b = ingest(tar_of(&[("src/a.rs", b"fn a() {}\n// TODO cot\n"), ("src/b/c.py", b"x = 1\n"), ("bin", b"\0\0")]), 1 << 30).unwrap();
+        let b = Arc::new(ingest(tar_of(&[("src/a.rs", b"fn a() {}\n// TODO cot\n"), ("src/b/c.py", b"x = 1\n"), ("bin", b"\0\0")]), 1 << 30).unwrap());
         assert_eq!(b.info.file_count, 3);
-        let mut tools = Tools::new(&b);
+        let mut tools = Tools::new(&b, None);
         let l = tools.call("list_dir", &serde_json::json!({"path": "src"})).await;
         assert!(l.contains("b/") && l.contains("a.rs"), "{l}");
         let g = tools.call("grep", &serde_json::json!({"pattern": "cot"})).await;
