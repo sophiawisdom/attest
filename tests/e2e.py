@@ -249,11 +249,15 @@ def run(work):
         v = a.wait_until(lambda v: v["runs"] and v["runs"][-1]["status"] != "running", text)
         ov = o.view()
         hidden = ov["runs"][-1]["status"] == "running"
+        hidden = hidden and ov["status"].startswith("The agent is running")
+        hidden = hidden and not any(e["kind"] == "run_finished" for e in ov["events"]) and ov["last_event_seq"] == max([0] + [e["seq"] for e in ov["events"]])
+        st, err = call("POST", f"/api/sessions/{s['session_id']}/runs/{v['runs'][-1]['id']}/followup", o.token, {"text": "x"})
+        hidden = hidden and st != 200 and "wait until the current run" in json.dumps(err)
         a.post(f"/runs/{v['runs'][-1]['id']}/release", {"release": True})
         return o.view()["runs"][-1], hidden
     r, hidden = one_run("Does trainer/train.py compute loss on chain-of-thought tokens?", {"kind": "yes_no"})
     check(r["verdict"]["answer"] == "yes" and r["verdict"]["summary"] == "" and r["verdict"]["confidence"] == 0, "yes/no format: the auditor gets only the answer")
-    check(hidden, "yes/no format: the auditor can't see when the run finished")
+    check(hidden, "yes/no format: the auditor can't see when the run finished (status, events, follow-up errors)")
     a = r["manifest"]["activity"]
     check(all(n == 0 or (n & (n - 1)) == 0 for n in [a["llm_calls"], a["tool_calls"], a["files_read"]]) and a["files_read_commitment"] == "", "yes/no format: activity is coarsened")
     r, _ = one_run("CHOICE: which option?", {"kind": "choice", "options": ["option a", "option b"]})

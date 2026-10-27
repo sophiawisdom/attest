@@ -22,6 +22,9 @@ pub const MAX_CALLS_PER_RUN: u32 = 300;
 
 #[derive(Default, Clone)]
 pub struct Usage {
+    /// Authenticated requests, counted before anything goes upstream,
+    /// whether they succeed, fail or are refused.
+    pub attempts: u32,
     pub calls: u32,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -48,9 +51,12 @@ struct Upstream {
     provider: Provider,
     model: String,
     api_key: String,
+    openrouter_zdr: bool,
     token: String,
     usage: Arc<Mutex<Usage>>,
     record: Arc<dyn Fn(Value) + Send + Sync>,
+    /// One upstream request at a time.
+    inflight: tokio::sync::Semaphore,
 }
 
 /// What a jailed harness may ask the provider for. Fail closed: unknown
@@ -64,6 +70,18 @@ pub fn vet_request(
     path: &str,
     approved_model: &str,
     body: &[u8],
+) -> Result<Vec<u8>, String> {
+    vet_request_zdr(provider, path, approved_model, body, false)
+}
+
+/// `vet_request`, and with `zdr` on OpenRouter, require zero-data-retention
+/// routing as the built-in harness does.
+pub fn vet_request_zdr(
+    provider: Provider,
+    path: &str,
+    approved_model: &str,
+    body: &[u8],
+    zdr: bool,
 ) -> Result<Vec<u8>, String> {
     let mut v: Value =
         serde_json::from_slice(body).map_err(|_| "request body is not JSON".to_string())?;
@@ -167,6 +185,12 @@ pub fn vet_request(
     if endpoint == "responses" {
         obj.insert("store".into(), Value::Bool(false));
     }
+    if provider == Provider::Openrouter && zdr {
+        obj.insert(
+            "provider".into(),
+            json!({"zdr": true, "data_collection": "deny"}),
+        );
+    }
     let out = serde_json::to_vec(&v).map_err(|e| e.to_string())?;
     Ok(crate::llm::pad_json(out))
 }
@@ -259,6 +283,7 @@ impl ModelProxy {
         provider: Provider,
         model: String,
         api_key: String,
+        openrouter_zdr: bool,
         socket_path: &str,
         record: Arc<dyn Fn(Value) + Send + Sync>,
     ) -> Result<Self> {
@@ -274,9 +299,11 @@ impl ModelProxy {
             provider,
             model,
             api_key,
+            openrouter_zdr,
             token: token.clone(),
             usage: usage.clone(),
             record,
+            inflight: tokio::sync::Semaphore::new(1),
         });
         let task = tokio::spawn(async move {
             while let Ok((s, _)) = l.accept().await {
@@ -324,10 +351,20 @@ async fn handle(up: Arc<Upstream>, req: Request<hyper::body::Incoming>) -> Respo
     }
     // Each request is visible to the parent as a size and a time; cap how
     // many a run can make.
-    if up.usage.lock().unwrap().calls >= MAX_CALLS_PER_RUN {
-        (up.record)(
-            json!({"type": "error", "content": format!("proxy refused a model request: the run's limit of {MAX_CALLS_PER_RUN} model calls is reached")}),
-        );
+    // Each request is visible to the parent as a size and a time (and a
+    // refused one as a trace entry); reserve a slot before doing anything.
+    let attempt = {
+        let mut u = up.usage.lock().unwrap();
+        u.attempts = u.attempts.saturating_add(1);
+        u.attempts
+    };
+    if attempt > MAX_CALLS_PER_RUN {
+        // Say so once; later refusals add nothing to the trace.
+        if attempt == MAX_CALLS_PER_RUN + 1 {
+            (up.record)(
+                json!({"type": "error", "content": format!("proxy refused a model request: the run's limit of {MAX_CALLS_PER_RUN} model calls is reached")}),
+            );
+        }
         return reply(
             StatusCode::TOO_MANY_REQUESTS,
             "this run's model call limit is reached",
@@ -371,11 +408,13 @@ async fn handle(up: Arc<Upstream>, req: Request<hyper::body::Incoming>) -> Respo
         Ok(b) => b.to_bytes().to_vec(),
         Err(_) => return reply(StatusCode::PAYLOAD_TOO_LARGE, "request too large"),
     };
-    let body = match vet_request(up.provider, &path, &up.model, &raw) {
+    let body = match vet_request_zdr(up.provider, &path, &up.model, &raw, up.openrouter_zdr) {
         Ok(b) => b,
         Err(why) => {
+            // Field names in `why` are request-chosen; keep the trace entry short.
+            let short: String = why.chars().take(120).collect();
             (up.record)(
-                json!({"type": "error", "content": format!("proxy refused a model request: {why}")}),
+                json!({"type": "error", "content": format!("proxy refused a model request: {short}")}),
             );
             return reply(StatusCode::FORBIDDEN, &why);
         }
@@ -396,6 +435,7 @@ async fn handle(up: Arc<Upstream>, req: Request<hyper::body::Incoming>) -> Respo
     }
     let host = crate::llm::endpoint(up.provider).0;
     let req_summary = summarize_request(&raw);
+    let _one_at_a_time = up.inflight.acquire().await;
     let resp = match up
         .net
         .request_full(

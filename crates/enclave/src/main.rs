@@ -476,7 +476,9 @@ fn json_resp(status: StatusCode, v: &Value) -> Resp {
     respond(
         status,
         "application/json",
-        serde_json::to_vec(v).unwrap_or_default(),
+        // Padded: the parent sees response sizes, and some responses (the
+        // auditee's trace) carry model-influenced content.
+        llm::pad_json(serde_json::to_vec(v).unwrap_or_default()),
     )
 }
 

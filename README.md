@@ -72,7 +72,11 @@ sandbox mode, so only confirmed addresses get mail. Agents poll instead. See
 - The auditee controls every byte the agent reads, so steering through the
   code is disclosed, not prevented. If the auditee operates the model
   endpoint, it controls which model answered. The certificate says so.
-- The model provider receives the code under the key owner's terms.
+- The model provider receives the code under the key owner's terms. If the
+  auditee approves the auditor's own key, the auditor can read what the
+  model saw through their provider account (logs, broadcast), before any
+  release. The auditee must opt in explicitly and the certificate says so;
+  for the strict setting, use the auditee's key.
 - The parent instance sees the size and timing of every encrypted model
   request and response. The enclave narrows this: the whole repository is
   loaded into enclave memory before a run (so the host learns nothing from
@@ -80,7 +84,10 @@ sandbox mode, so only confirmed addresses get mail. Agents poll instead. See
   1.25x apart), and a jailed harness gets at most 300 model calls. Response
   sizes come from the provider and can't be padded, so a model steered to
   vary its reply lengths could signal a few bits per call to whoever runs the
-  parent. If that matters, the auditee should run the enclave themselves
+  parent. The Codex harness runs arbitrary commands, so it can choose request
+  sizes and timing deliberately (bounded by the call cap, one call at a
+  time); the built-in harness only sends requests the enclave builds. API
+  responses to the browser and agents are padded the same way. If that matters, the auditee should run the enclave themselves
   (`deploy/self-host.sh`): then the parent is theirs.
 - Before release the auditor sees only a salted commitment to the code, not
   its tree hash, size or file count; each released certificate opens it.

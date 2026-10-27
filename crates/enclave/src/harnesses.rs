@@ -89,6 +89,7 @@ pub async fn run_codex(
     provider: Provider,
     model: &str,
     api_key: &str,
+    openrouter_zdr: bool,
     prompt: String,
     format: &AnswerFormat,
     timeout: Duration,
@@ -107,7 +108,17 @@ pub async fn run_codex(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (
-            net, run_id, bundle, provider, model, api_key, prompt, format, timeout, progress,
+            net,
+            run_id,
+            bundle,
+            provider,
+            model,
+            api_key,
+            openrouter_zdr,
+            prompt,
+            format,
+            timeout,
+            progress,
         );
         return fail("the codex harness needs a Linux enclave".into());
     }
@@ -122,6 +133,7 @@ pub async fn run_codex(
             provider,
             model.to_string(),
             api_key.to_string(),
+            openrouter_zdr,
             &socket,
             Arc::new(move |e| p2(vec![e])),
         )

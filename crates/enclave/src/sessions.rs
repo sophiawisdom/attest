@@ -82,6 +82,7 @@ struct State {
     runs: Vec<RunState>,
     events: Vec<Event>,
     notify: HashMap<Role, NotifyPrefs>,
+    event_counts: [u64; 2],
 }
 
 #[derive(Clone, Serialize)]
@@ -155,13 +156,14 @@ struct RunState {
 
 #[derive(Clone, Serialize)]
 struct Event {
+    /// This event's number in each role's own feed (0: not shown to it),
+    /// so private events leave no gaps in the other party's numbering.
+    #[serde(skip)]
+    seqs: [u64; 2],
     seq: u64,
     at_ms: u64,
     kind: String,
     text: String,
-    /// None: both parties.
-    #[serde(skip)]
-    to: Option<Role>,
     #[serde(skip)]
     important: bool,
 }
@@ -290,13 +292,19 @@ impl Session {
         by: Option<Role>,
         important: bool,
     ) {
-        let seq = st.events.len() as u64 + 1;
+        let mut seqs = [0u64; 2];
+        for r in [Role::Auditee, Role::Auditor] {
+            if to.map_or(true, |t| t == r) {
+                st.event_counts[ri(r)] += 1;
+                seqs[ri(r)] = st.event_counts[ri(r)];
+            }
+        }
         let ev = Event {
-            seq,
+            seqs,
+            seq: 0,
             at_ms: now_ms(),
             kind: kind.into(),
             text,
-            to,
             important,
         };
         st.events.push(ev.clone());
@@ -749,8 +757,8 @@ impl Session {
         let blinded = v["blinded"].as_bool().unwrap_or(false);
         let mut st = self.st.lock().unwrap();
         ensure!(
-            !st.runs.iter().any(|r| r.status == "running"),
-            "wait for the current run to finish"
+            !busy_for(&st, role),
+            "wait until the current run is released or declined"
         );
         let parent = st
             .runs
@@ -913,8 +921,14 @@ impl Session {
             },
             key_from: Some(m.key_from),
         };
-        let harness_job =
-            (m.agent == "codex").then(|| (m.provider, m.model.clone(), m.api_key.clone()));
+        let harness_job = (m.agent == "codex").then(|| {
+            (
+                m.provider,
+                m.model.clone(),
+                m.api_key.clone(),
+                m.openrouter_zdr,
+            )
+        });
 
         let (mut turns, mut messages, mut trace) = (Vec::new(), Vec::new(), Vec::new());
         let mut previous_verdict = None;
@@ -1054,10 +1068,14 @@ impl Session {
 
     pub fn view(&self, ctx: &Ctx, role: Role, since: u64) -> Value {
         let st = self.st.lock().unwrap();
-        let events: Vec<&Event> = st
+        let events: Vec<Event> = st
             .events
             .iter()
-            .filter(|e| e.seq > since && e.to.map_or(true, |t| t == role))
+            .filter(|e| e.seqs[ri(role)] > since)
+            .map(|e| Event {
+                seq: e.seqs[ri(role)],
+                ..e.clone()
+            })
             .collect();
         let runs: Vec<Value> = st.runs.iter().map(|r| run_view(r, role, &st)).collect();
         json!({
@@ -1083,7 +1101,7 @@ impl Session {
             "models": st.models.iter().map(|m| m.public()).collect::<Vec<_>>(),
             "runs": runs,
             "events": events,
-            "last_event_seq": st.events.len(),
+            "last_event_seq": st.event_counts[ri(role)],
             "notify": st.notify.get(&role).cloned().unwrap_or_default(),
             "email_available": ctx.email.is_some(),
             "status": status_line(&st, role),
@@ -1148,7 +1166,7 @@ struct RunJob {
     history: History,
     messages: Vec<MessageRecord>,
     /// For jailed harnesses: (provider, model, key), and the prompt.
-    harness_job: Option<(Provider, String, String)>,
+    harness_job: Option<(Provider, String, String, bool)>,
     harness_prompt: String,
 }
 
@@ -1186,7 +1204,7 @@ impl RunJob {
                 upstream_providers: vec![],
                 key_owner: None,
             },
-            (Ok(_), Some((provider, model, key))) => {
+            (Ok(_), Some((provider, model, key, zdr))) => {
                 let timeout =
                     Duration::from_secs((self.question.max_steps as u64 * 20).clamp(300, 1800));
                 crate::harnesses::run_codex(
@@ -1196,6 +1214,7 @@ impl RunJob {
                     *provider,
                     model,
                     key,
+                    *zdr,
                     self.harness_prompt.clone(),
                     &self.question.answer_format,
                     timeout,
@@ -1275,19 +1294,13 @@ impl RunJob {
             Err(e) => crate::log(&format!("run {}: signing failed: {e:#}", self.run_id)),
         }
         let n = self.number;
-        let what = match (&out.verdict, &out.outcome) {
-            (Some(_), _) => "the agent reached a verdict".to_string(),
-            (None, Outcome::StepLimit) => {
-                "the agent hit its step limit without a verdict".to_string()
-            }
-            (None, Outcome::Error { .. }) => "the run failed".to_string(),
-            (None, Outcome::Completed) => "the run ended".to_string(),
-        };
+        // The outcome (verdict, step limit, failure) is model-controlled, so
+        // it stays out of the event text, which can go out by email.
         self.session.event(
             &self.ctx,
             &mut st,
             "run_finished",
-            format!("Run {n} finished: {what}. Review it and decide whether to release it."),
+            format!("Run {n} finished. Review it and decide whether to release it."),
             Some(Role::Auditee),
             None,
             true,
@@ -1326,6 +1339,14 @@ fn minimize_for_strict_format(m: &mut Manifest) {
 /// Whether the auditor may see that a run finished (as opposed to its
 /// result, which is always gated on release). With strict formats they may
 /// not: how long a run takes is model-controlled and would be a side channel.
+/// Whether `role` should treat a run as still going. The auditor can't
+/// tell a finished-but-undecided run from a running one, through any API.
+fn busy_for(st: &State, role: Role) -> bool {
+    st.runs
+        .iter()
+        .any(|r| r.status == "running" || (role == Role::Auditor && r.status == "awaiting_release"))
+}
+
 fn auditor_sees_finish(_st: &State, _r: &RunState) -> bool {
     // Never: run duration is model-controlled. The auditor learns of a run's
     // end only from the auditee's release or decline.
@@ -1392,21 +1413,15 @@ pub fn affidavit_statement(
 
 fn status_line(st: &State, role: Role) -> String {
     let q = st.questions.last();
-    if st.runs.iter().any(|r| r.status == "running") {
+    if busy_for(st, role)
+        && (role == Role::Auditor || st.runs.iter().any(|r| r.status == "running"))
+    {
         return match role {
             Role::Auditee => "The agent is running. You can watch it.".into(),
             Role::Auditor => {
                 "The agent is running. You'll see the result if the auditee releases it.".into()
             }
         };
-    }
-    let hidden_finish = role == Role::Auditor
-        && st
-            .runs
-            .iter()
-            .any(|r| r.status == "awaiting_release" && !auditor_sees_finish(st, r));
-    if hidden_finish {
-        return "The agent is working. You'll see the result if the auditee releases it.".into();
     }
     if st.runs.iter().any(|r| r.status == "awaiting_release") {
         return match role {
@@ -1455,7 +1470,7 @@ fn next_actions(st: &State, role: Role, sid: &str) -> Vec<Value> {
     let base = format!("/api/sessions/{sid}");
     let mut out = Vec::new();
     let q = st.questions.last();
-    let running = st.runs.iter().any(|r| r.status == "running");
+    let running = busy_for(st, role);
     match role {
         Role::Auditor => {
             let can_ask = match q {
