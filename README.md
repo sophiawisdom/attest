@@ -42,8 +42,8 @@ hash), and counts of instruction-like text in the code.
 ## Use
 
 ```sh
-attest verify-service https://attest.sparrowsystems.co --pcrs measurements/<commit>.pcrs.json
-attest upload 'https://attest.sparrowsystems.co/s/ID#TOKEN' ~/repo --org "Example Lab" --pcrs ...
+attest verify-service https://32.190.88.43 --pcrs measurements/<commit>.pcrs.json
+attest upload 'https://32.190.88.43/s/ID#TOKEN' ~/repo --org "Example Lab" --pcrs ...
 attest verify certificate.json --pcrs ...
 ```
 
