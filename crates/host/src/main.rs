@@ -173,7 +173,7 @@ async fn config_server(args: Args) -> Result<()> {
         loop {
             let (mut s, _) = l.accept().await?;
             let _ = s.write_all(&body).await;
-            let _ = s.shutdown().await;
+            let _ = AsyncWriteExt::shutdown(&mut s).await;
         }
     }
     #[allow(unreachable_code)]
