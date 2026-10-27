@@ -102,6 +102,9 @@ pub struct EnclaveInfo {
     pub tls_spki_sha256: Option<String>,
     /// Host name the operator configured (informational).
     pub domain: Option<String>,
+    /// Who runs this server, as the operator states it (not verified).
+    #[serde(default)]
+    pub operator: Option<String>,
     pub harness: HarnessInfo,
 }
 

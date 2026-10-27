@@ -239,6 +239,7 @@ function landing() {
       <div class="panel s"><b>3. Release or decline</b><span class="muted small">You read the result and the full transcript first. The auditor gets a signed certificate if you release it.</span></div>
     </div>
     <div id="created"><div class="row"><button class="btn primary big" data-act="create">Start a session</button><span class="faint small">You'll be the auditee (the party whose code is examined).</span></div></div>
+    <div class="callout warn" id="notice"><span class="ic">!</span><span>${S.info?.operator ? `This server is run by <b>${esc(S.info.operator)}</b> (their own description) as` : "This server is run"} a convenience, with no guarantees. Sessions live only in the enclave's memory and end whenever the server is updated, so don't count on one lasting more than about a day. If you need more than that, <a href="https://github.com/sophiawisdom/attest/blob/main/SELF_HOSTING.md" target="_blank" rel="noopener">run your own</a>: it's one script, and an agent can do it for you.</span></div>
     <div class="foot"><a href="/agents.md">Guide for agents</a><a href="https://github.com/sophiawisdom/attest" target="_blank" rel="noopener">Source on GitHub</a><a href="#" data-act="show-verify">Verify this service</a></div>
     <div id="landingVerify"></div>
   </div>`;

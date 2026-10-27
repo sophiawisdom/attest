@@ -67,6 +67,8 @@ struct HostConfig {
     email: Option<notify::EmailConfig>,
     max_code_mib: Option<usize>,
     max_total_code_mib: Option<usize>,
+    /// Shown on the landing page as "run by ...". Unverified.
+    operator: Option<String>,
 }
 
 pub fn log(msg: &str) {
@@ -136,6 +138,7 @@ async fn main() -> Result<()> {
         signing_public_key: hex::encode(signing.verifying_key().to_bytes()),
         tls_spki_sha256: tls.as_ref().map(|t| t.spki_sha256.clone()),
         domain: domain.clone(),
+        operator: cfg.operator.clone().map(|o| o.chars().take(120).collect()),
         harness: HarnessInfo {
             version: HARNESS_VERSION.into(),
             system_prompt_sha256: harness::system_prompt_sha256(),

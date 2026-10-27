@@ -9,6 +9,12 @@ answer. Every step can be done through this HTTP API, by a person or an agent.
 Source: https://github.com/sophiawisdom/attest. This page, the web app and
 the API are served by the enclave itself, over TLS that ends inside it.
 
+**Stability.** A server is provided by its operator as-is (`operator` in
+`/api/info`). Sessions live only in enclave memory and end whenever the
+server is updated, so don't rely on one lasting more than about a day. For
+anything longer, run your own instance: `SELF_HOSTING.md` in the repository
+is written for an agent to follow, and takes one script.
+
 ## Roles and links
 
 - `POST /api/sessions` creates a session and returns two links:
