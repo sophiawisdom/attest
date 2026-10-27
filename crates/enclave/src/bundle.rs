@@ -77,6 +77,7 @@ impl Bundle {
             file_count: files.len() as u64,
             text_file_count: files.values().filter(|f| f.text.is_some()).count() as u64,
             total_bytes: files.values().map(|f| f.bytes.len() as u64).sum(),
+            uploaded_at_ms: attest_core::now_ms(),
         };
         Ok(Self { files, dirs, info })
     }
@@ -299,11 +300,12 @@ pub fn tool_schemas() -> Vec<(&'static str, &'static str, serde_json::Value)> {
             json!({"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]})),
         ("grep", "Search file contents line by line with a regular expression (Rust regex syntax). Optionally restrict to a directory prefix.",
             json!({"type":"object","properties":{"pattern":{"type":"string"},"path_prefix":{"type":"string"},"case_insensitive":{"type":"boolean"},"max_results":{"type":"integer"}},"required":["pattern"]})),
-        ("submit_verdict", "Finish the audit. Call exactly once.",
+        ("submit_verdict", "Finish: record your verdict for the auditor (released only if the auditee approves).",
             json!({"type":"object","properties":{
-                "answer":{"type":"string","enum":["yes","no","inconclusive"]},
+                "answer":{"type":"string","enum":["yes","no","inconclusive","needs_clarification"]},
                 "confidence":{"type":"number","description":"0 to 1"},
-                "summary":{"type":"string","description":"For the auditor. Answer the question and explain the basis at a high level. No code, secrets or file contents."}
+                "summary":{"type":"string","description":"For the auditor. Answer the question and explain the basis at a high level. No code, secrets or file contents."},
+                "clarification_request":{"type":"string","description":"Only with needs_clarification: what the auditor should change about the question."}
             },"required":["answer","confidence","summary"]})),
     ]
 }

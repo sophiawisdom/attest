@@ -29,7 +29,7 @@ case "${ARCH:-$(uname -m)}" in
   *) echo "unsupported architecture" >&2; exit 1 ;;
 esac
 echo "== platform $PLATFORM"
-COMMON=(--builder "$BUILDER" --file build/Dockerfile --build-arg SOURCE_DATE_EPOCH=0 --platform "$PLATFORM")
+COMMON=(--builder "$BUILDER" --file build/Dockerfile --build-arg SOURCE_DATE_EPOCH=0 --build-arg "ATTEST_GIT_SHA=$GIT_SHA" --platform "$PLATFORM")
 
 echo "== binaries"
 docker buildx build "${COMMON[@]}" --target artifacts --output "type=local,dest=$OUT/bin" .

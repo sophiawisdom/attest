@@ -1,44 +1,39 @@
-//! One audit run: the agent loop over the bundle, then the manifest.
+//! The agent loop: a model with read-only tools over the bundle.
 
 use crate::bundle::{tool_schemas, Bundle, Tools};
-use crate::llm::{self, fit_context, Client, Turn};
-use attest_core::harness::{self, MAX_STEPS_CAP, SYSTEM_PROMPT};
+use crate::llm::{fit_context, Client, Turn};
+use attest_core::harness::{MAX_STEPS_CAP, SYSTEM_PROMPT};
 use attest_core::*;
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Roughly 150k tokens of conversation.
 const CONTEXT_BUDGET_CHARS: usize = 600_000;
 const MAX_NUDGES: u32 = 3;
 
-pub struct RunInput {
-    pub run_id: String,
-    pub boot_id: String,
-    pub harness: HarnessInfo,
-    pub submitted_at_ms: u64,
-    pub question: Signed,
-    pub question_body: QuestionBody,
-    pub affidavit: Signed,
-    pub bundle: Bundle,
-    pub client: Client,
-    pub history: History,
+pub struct AgentOutput {
+    /// Full conversation, for continuing with a follow-up later.
+    pub turns: Vec<Turn>,
+    pub verdict: Option<Verdict>,
+    pub outcome: Outcome,
+    pub activity: Activity,
+    pub files_read: BTreeMap<String, [u8; 32]>,
+    pub response_models: Vec<String>,
+    pub upstream_providers: Vec<String>,
+    pub key_owner: Option<String>,
 }
 
-pub async fn execute(input: RunInput, steps: Arc<AtomicU32>) -> (CertificateBody, Vec<Value>) {
-    let started_at_ms = now_ms();
-    let b = &input.bundle;
+/// Run until the model submits a verdict, errors, or hits `max_steps`.
+/// `progress` receives trace entries as they happen (auditee-visible).
+pub async fn agent_loop(
+    client: &Client,
+    bundle: &Bundle,
+    mut turns: Vec<Turn>,
+    max_steps: u32,
+    progress: &(dyn Fn(Vec<Value>) + Send + Sync),
+) -> AgentOutput {
     let schemas = tool_schemas();
-    let mut tools = Tools::new(b);
-    let mut trace: Vec<Value> = vec![
-        json!({"type": "system", "content": SYSTEM_PROMPT}),
-    ];
-    let user = harness::user_prompt(&input.question_body.text, b.info.file_count, b.info.total_bytes);
-    trace.push(json!({"type": "user", "content": user}));
-    let mut turns = vec![Turn::User(user)];
-
-    let max_steps = input.question_body.policy.max_steps.clamp(1, MAX_STEPS_CAP);
+    let mut tools = Tools::new(bundle);
     let mut activity = Activity::default();
     let mut response_models = BTreeSet::new();
     let mut upstream = BTreeSet::new();
@@ -47,21 +42,20 @@ pub async fn execute(input: RunInput, steps: Arc<AtomicU32>) -> (CertificateBody
     let mut outcome = Outcome::StepLimit;
     let mut nudges = 0;
 
-    for _ in 0..max_steps {
+    for _ in 0..max_steps.clamp(1, MAX_STEPS_CAP) {
         fit_context(&mut turns, CONTEXT_BUDGET_CHARS);
-        let reply = match input.client.complete(SYSTEM_PROMPT, &turns, &schemas).await {
+        let reply = match client.complete(SYSTEM_PROMPT, &turns, &schemas).await {
             Ok(r) => r,
             Err(e) => {
                 let msg = format!("{e:#}");
-                trace.push(json!({"type": "error", "content": msg}));
-                // The manifest gets only the first line: provider error bodies
-                // can echo request content.
-                let short: String = msg.lines().next().unwrap_or("").chars().take(200).collect();
+                progress(vec![json!({"type": "error", "content": msg})]);
+                // Only the first line goes in the manifest: provider error
+                // bodies can echo request content.
+                let short: String = msg.lines().next().unwrap_or("").chars().take(300).collect();
                 outcome = Outcome::Error { message: short };
                 break;
             }
         };
-        steps.fetch_add(1, Ordering::Relaxed);
         activity.llm_calls += 1;
         activity.input_tokens += reply.input_tokens;
         activity.output_tokens += reply.output_tokens;
@@ -74,22 +68,24 @@ pub async fn execute(input: RunInput, steps: Arc<AtomicU32>) -> (CertificateBody
         if key_owner.is_none() {
             key_owner = reply.key_owner.clone();
         }
-        trace.push(json!({
+        let mut events = vec![json!({
             "type": "assistant",
             "text": reply.text,
             "tool_calls": reply.calls.iter().map(|c| json!({"id": c.id, "name": c.name, "args": c.args})).collect::<Vec<_>>(),
             "model": reply.model,
-        }));
-
+        })];
         turns.push(Turn::Assistant { raw: reply.raw_message.clone() });
+
         if reply.calls.is_empty() {
             nudges += 1;
             if nudges > MAX_NUDGES {
-                outcome = Outcome::Error { message: "model stopped without submitting a verdict".into() };
+                progress(events);
+                outcome = Outcome::Error { message: "the model stopped without submitting a verdict".into() };
                 break;
             }
             let nudge = "Continue investigating with the tools. When you are done, call submit_verdict.";
-            trace.push(json!({"type": "harness", "content": nudge}));
+            events.push(json!({"type": "harness", "content": nudge}));
+            progress(events);
             turns.push(Turn::User(nudge.into()));
             continue;
         }
@@ -108,14 +104,17 @@ pub async fn execute(input: RunInput, steps: Arc<AtomicU32>) -> (CertificateBody
             } else {
                 tools.call(&call.name, &call.args)
             };
-            trace.push(json!({"type": "tool_result", "id": call.id, "name": call.name, "content": out}));
+            events.push(json!({"type": "tool_result", "id": call.id, "name": call.name, "content": out}));
             results.push((call.id.clone(), out));
         }
+        progress(events);
+        // Keep the tool results in the conversation even when finishing, so a
+        // follow-up can continue from a well-formed state.
+        turns.push(Turn::ToolResults(results));
         if verdict.is_some() {
             outcome = Outcome::Completed;
             break;
         }
-        turns.push(Turn::ToolResults(results));
     }
 
     activity.files_read = tools.files_read.len() as u64;
@@ -124,44 +123,18 @@ pub async fn execute(input: RunInput, steps: Arc<AtomicU32>) -> (CertificateBody
     activity.find_calls = tools.counts.find;
     activity.read_calls = tools.counts.read;
     activity.grep_calls = tools.counts.grep;
-
-    let instruction_scan = InstructionScan {
-        patterns_version: scan::PATTERNS_VERSION.into(),
-        whole_bundle: b.scan_all(),
-        files_read: b.scan_paths(tools.files_read.keys()),
-    };
-    let provider = input.client.provider;
-    let manifest = Manifest {
-        schema: "attest/manifest/v1".into(),
-        run_id: input.run_id.clone(),
-        boot_id: input.boot_id.clone(),
-        submitted_at_ms: input.submitted_at_ms,
-        started_at_ms,
-        finished_at_ms: now_ms(),
-        question_id: input.question.id(),
-        question_text_sha256: sha256_hex(input.question_body.text.as_bytes()),
-        question: input.question.clone(),
-        auditee_public_key: input.affidavit.public_key.clone(),
-        affidavit: input.affidavit.clone(),
-        code: b.info.clone(),
-        model: ModelInfo {
-            provider,
-            endpoint: llm::endpoint(provider).0.to_string(),
-            requested_model: input.client.model.clone(),
-            fine_tuned: llm::is_fine_tuned(provider, &input.client.model),
-            response_models: response_models.into_iter().collect(),
-            key_owner,
-            upstream_providers: upstream.into_iter().collect(),
-            openrouter_zdr: (provider == Provider::Openrouter).then_some(input.client.openrouter_zdr),
-        },
-        harness: input.harness.clone(),
-        activity,
-        instruction_scan,
-        history: input.history.clone(),
+    let files_read = tools.files_read.clone();
+    progress(vec![json!({"type": "files_read", "paths": files_read.keys().collect::<Vec<_>>()})]);
+    AgentOutput {
+        turns,
+        verdict,
         outcome,
-    };
-    trace.push(json!({"type": "files_read", "paths": tools.files_read.keys().collect::<Vec<_>>()}));
-    (CertificateBody { manifest, verdict }, trace)
+        activity,
+        files_read,
+        response_models: response_models.into_iter().collect(),
+        upstream_providers: upstream.into_iter().collect(),
+        key_owner,
+    }
 }
 
 fn parse_verdict(args: &Value) -> anyhow::Result<Verdict> {
@@ -169,10 +142,18 @@ fn parse_verdict(args: &Value) -> anyhow::Result<Verdict> {
         Some("yes") => Answer::Yes,
         Some("no") => Answer::No,
         Some("inconclusive") => Answer::Inconclusive,
-        other => anyhow::bail!("answer must be yes, no or inconclusive (got {other:?})"),
+        Some("needs_clarification") => Answer::NeedsClarification,
+        other => anyhow::bail!("answer must be yes, no, inconclusive or needs_clarification (got {other:?})"),
     };
     let confidence = args["confidence"].as_f64().unwrap_or(0.0).clamp(0.0, 1.0);
     let summary: String = args["summary"].as_str().unwrap_or_default().chars().take(20_000).collect();
     anyhow::ensure!(!summary.trim().is_empty(), "summary is required");
-    Ok(Verdict { answer, confidence, summary })
+    let clarification_request: Option<String> = args["clarification_request"]
+        .as_str()
+        .map(|s| s.chars().take(5_000).collect::<String>())
+        .filter(|s| !s.trim().is_empty());
+    if answer == Answer::NeedsClarification && clarification_request.is_none() {
+        anyhow::bail!("needs_clarification requires clarification_request");
+    }
+    Ok(Verdict { answer, confidence, summary, clarification_request })
 }

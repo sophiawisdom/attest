@@ -189,18 +189,23 @@ fn parse_openai(resp: &HttpResponse) -> Result<Reply> {
 // ------------------------------------------------------------------ Anthropic
 
 fn anthropic_body(model: &str, system: &str, turns: &[Turn], tools: &[(&str, &str, Value)]) -> Value {
-    let mut messages = Vec::new();
+    // Consecutive user turns (tool results, then a follow-up message) are
+    // merged into one user message of content blocks.
+    let mut messages: Vec<Value> = Vec::new();
     for t in turns {
-        match t {
-            Turn::User(s) => messages.push(json!({"role": "user", "content": s})),
-            Turn::Assistant { raw, .. } => messages.push(json!({"role": "assistant", "content": raw.clone()})),
-            Turn::ToolResults(rs) => {
-                let blocks: Vec<Value> = rs
-                    .iter()
-                    .map(|(id, c)| json!({"type": "tool_result", "tool_use_id": id, "content": c}))
-                    .collect();
-                messages.push(json!({"role": "user", "content": blocks}));
+        let (role, blocks): (&str, Vec<Value>) = match t {
+            Turn::User(s) => ("user", vec![json!({"type": "text", "text": s})]),
+            Turn::Assistant { raw, .. } => ("assistant", raw.as_array().cloned().unwrap_or_default()),
+            Turn::ToolResults(rs) => (
+                "user",
+                rs.iter().map(|(id, c)| json!({"type": "tool_result", "tool_use_id": id, "content": c})).collect(),
+            ),
+        };
+        match messages.last_mut() {
+            Some(last) if last["role"] == role => {
+                last["content"].as_array_mut().unwrap().extend(blocks);
             }
+            _ => messages.push(json!({"role": role, "content": blocks})),
         }
     }
     let tools: Vec<Value> = tools.iter().map(|(n, d, p)| json!({"name": n, "description": d, "input_schema": p})).collect();

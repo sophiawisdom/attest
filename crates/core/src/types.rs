@@ -1,17 +1,15 @@
-//! Wire and certificate types shared by the enclave, host and CLI.
+//! Types shared by the enclave and the CLI.
 //!
-//! Anything signed is carried as a `Signed` envelope holding the exact JSON
-//! bytes that were signed, so verifiers never re-serialize before checking.
+//! There are no long-term party keys. A party is whoever holds a session
+//! link; the parties are expected to know each other and exchange links over
+//! a channel they trust. The only signing key is the enclave's, generated at
+//! boot and bound to its attestation document.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const DOMAIN_QUESTION: &str = "attest/question/v1";
-pub const DOMAIN_AFFIDAVIT: &str = "attest/affidavit/v1";
-pub const DOMAIN_CERTIFICATE: &str = "attest/certificate/v1";
-pub const DOMAIN_RUN_LOG: &str = "attest/run-log/v1";
-
-pub const SUBMISSION_MAGIC: &[u8] = b"ATTEST-SUBMISSION-1\n";
+pub const DOMAIN_CERTIFICATE: &str = "attest/certificate/v2";
+pub const SOURCE_REPO: &str = "https://github.com/sophiawisdom/attest";
 
 /// Detached ed25519 signature over `domain || "\n" || body`.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -25,41 +23,26 @@ pub struct Signed {
     pub signature: String,
 }
 
-// ---------------------------------------------------------------- auditor side
-
-/// What the auditor asks. Signed by the auditor's key.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct QuestionBody {
-    pub text: String,
-    /// Random, so two auditors asking the same text get different ids.
-    pub nonce: String,
-    pub created_at_ms: u64,
-    pub policy: QuestionPolicy,
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    Auditee,
+    Auditor,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct QuestionPolicy {
-    /// Accept fine-tuned model ids (e.g. OpenAI `ft:...`). A fine-tune under
-    /// the auditee's own account is the cheapest way to get a model that
-    /// answers one question wrongly, so the default is to refuse them.
-    pub allow_fine_tuned: bool,
-    /// Upper bound on model calls for the run (the enclave also has a cap).
-    pub max_steps: u32,
-}
-
-// ---------------------------------------------------------------- auditee side
-
-/// The auditee's sworn statement about the code bundle. Signed by the
-/// auditee's key; the enclave checks the tree hash against the bundle.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct AffidavitBody {
-    pub statement: String,
-    pub organization: String,
-    pub question_id: String,
-    pub code_tree_sha256: String,
-    pub repo_url: Option<String>,
-    pub git_commit: Option<String>,
-    pub signed_at_ms: u64,
+impl Role {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Role::Auditee => "auditee",
+            Role::Auditor => "auditor",
+        }
+    }
+    pub fn other(&self) -> Role {
+        match self {
+            Role::Auditee => Role::Auditor,
+            Role::Auditor => Role::Auditee,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -96,29 +79,7 @@ impl std::str::FromStr for Provider {
     }
 }
 
-/// Plaintext header of a submission. The whole submission
-/// (`SUBMISSION_MAGIC || u64le(header_len) || header_json || tar`) is
-/// age-encrypted to the enclave's attested recipient.
-#[derive(Serialize, Deserialize, Clone)]
-pub struct SubmissionHeader {
-    pub question: Signed,
-    pub affidavit: Signed,
-    pub provider: Provider,
-    pub model: String,
-    /// The auditee's own inference key. Never leaves the enclave except to
-    /// the provider endpoint, and never appears in any output.
-    pub api_key: String,
-    /// age recipient the result (certificate + full trace) is encrypted to.
-    pub reply_recipient: String,
-    /// OpenRouter only: ask OpenRouter to route to zero-data-retention endpoints.
-    #[serde(default)]
-    pub openrouter_zdr: bool,
-    /// Mock provider only (dev): host:port of the local OpenAI-compatible server.
-    #[serde(default)]
-    pub mock_endpoint: Option<String>,
-}
-
-// ---------------------------------------------------------------- enclave side
+// ---------------------------------------------------------------- enclave identity
 
 /// Everything the enclave commits to at boot. Its SHA-256 is the Nitro
 /// attestation document's `user_data`; the ed25519 key is its `public_key`.
@@ -126,12 +87,21 @@ pub struct SubmissionHeader {
 pub struct EnclaveInfo {
     pub service: String,
     pub version: String,
+    /// Source repository and commit this image was built from. Self-reported;
+    /// what makes it true is that PCR0 matches a reproducible build of it.
+    pub source_repo: String,
+    pub source_commit: String,
     /// "nitro" or "dev". Dev enclaves carry no security claim at all.
     pub mode: String,
     pub boot_id: String,
     pub booted_at_ms: u64,
     pub signing_public_key: String,
-    pub age_recipient: String,
+    /// sha256 of the DER SubjectPublicKeyInfo of the TLS key the enclave
+    /// serves with. The key never leaves the enclave, so a TLS connection
+    /// whose peer has this SPKI terminates inside this enclave. None in dev.
+    pub tls_spki_sha256: Option<String>,
+    /// Host name the operator configured (informational).
+    pub domain: Option<String>,
     pub harness: HarnessInfo,
 }
 
@@ -141,54 +111,27 @@ pub struct HarnessInfo {
     pub system_prompt_sha256: String,
     pub tools: Vec<String>,
     pub max_steps_cap: u32,
-    /// Hostnames the enclave will send inference requests to, per provider.
+    /// Inference endpoints per provider. Fixed in the image.
     pub endpoints: BTreeMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AttestationResponse {
     pub enclave_info_json: String,
-    /// Attestation document produced at boot (no nonce). Embedded in
-    /// certificates so they can be checked later, offline.
-    pub boot_document_b64: Option<String>,
-    /// Fresh document over the caller's nonce, when one was given.
-    pub fresh_document_b64: Option<String>,
+    /// Fresh document over the caller's nonce (or the boot document if no
+    /// nonce was given). None in dev mode.
+    pub document_b64: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct SubmitResponse {
-    pub run_id: String,
-}
+// ---------------------------------------------------------------- certificate
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum RunStatus {
-    Queued,
-    Running,
-    Done,
-    Failed,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct RunStatusResponse {
-    pub run_id: String,
-    pub status: RunStatus,
-    pub steps: u32,
-    /// age ciphertext (to the submission's reply recipient) of `RunResult`.
-    pub result_age_b64: Option<String>,
-}
-
-/// Decrypted by the auditee only.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct RunResult {
-    pub certificate: Certificate,
-    pub trace: Vec<serde_json::Value>,
-}
-
-/// What the auditee may hand to the auditor.
+/// What a finished run produces. The auditee always gets it; the auditor
+/// gets it only if the auditee releases the run.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Certificate {
     pub enclave_info_json: String,
+    /// Attestation document produced at boot, so the certificate can be
+    /// checked offline, later.
     pub boot_document_b64: Option<String>,
     /// DOMAIN_CERTIFICATE, signed by the enclave key; body is `CertificateBody`.
     pub signed: Signed,
@@ -201,38 +144,45 @@ pub struct CertificateBody {
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Answer {
     Yes,
     No,
     Inconclusive,
+    /// The agent wants the auditor to rephrase or narrow the question.
+    NeedsClarification,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Verdict {
     pub answer: Answer,
     pub confidence: f64,
-    /// Written by the model for the auditor. The auditee reads it before
-    /// deciding whether to release.
+    /// Written by the agent for the auditor.
     pub summary: String,
+    /// With `needs_clarification`: what the auditor should change.
+    pub clarification_request: Option<String>,
 }
 
-/// Everything the enclave discloses about how the verdict was produced.
-/// It enforces almost nothing beyond the harness itself; the point is that
-/// the auditor can see what the auditee chose and price it in.
+/// Everything the enclave discloses about how a verdict was produced. It
+/// enforces the harness; everything else is what the parties chose, recorded
+/// so the other side can weigh it.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Manifest {
     pub schema: String,
+    pub session_id: String,
     pub run_id: String,
+    /// 1-based position of this run within the session.
+    pub run_number: u32,
+    /// For follow-up runs: the run whose conversation this continues.
+    pub parent_run_id: Option<String>,
     pub boot_id: String,
-    pub submitted_at_ms: u64,
     pub started_at_ms: u64,
     pub finished_at_ms: u64,
-    pub question: Signed,
-    pub question_id: String,
-    pub question_text_sha256: String,
-    pub affidavit: Signed,
-    pub auditee_public_key: String,
+    pub question: QuestionRecord,
+    /// Messages the auditor sent the agent in this run's conversation
+    /// (including ones inherited from parent runs).
+    pub auditor_messages: Vec<MessageRecord>,
+    pub affidavit: AffidavitRecord,
     pub code: CodeInfo,
     pub model: ModelInfo,
     pub harness: HarnessInfo,
@@ -243,11 +193,43 @@ pub struct Manifest {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct QuestionRecord {
+    pub version: u32,
+    pub text: String,
+    pub text_sha256: String,
+    pub max_steps: u32,
+    pub allow_fine_tuned: bool,
+    pub asked_at_ms: u64,
+    pub accepted_at_ms: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct MessageRecord {
+    pub sent_at_ms: u64,
+    pub blinded: bool,
+    pub text_sha256: String,
+    /// Present only for messages that were not blinded. The auditor can
+    /// check a blinded message against its hash.
+    pub text: Option<String>,
+}
+
+/// Confirmed by the holder of the auditee link.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AffidavitRecord {
+    pub organization: String,
+    pub repo_url: Option<String>,
+    pub git_commit: Option<String>,
+    pub statement: String,
+    pub confirmed_at_ms: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CodeInfo {
     pub tree_sha256: String,
     pub file_count: u64,
     pub text_file_count: u64,
     pub total_bytes: u64,
+    pub uploaded_at_ms: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -256,6 +238,9 @@ pub struct ModelInfo {
     pub endpoint: String,
     pub requested_model: String,
     pub fine_tuned: bool,
+    /// Who proposed this model and key.
+    pub proposed_by: Role,
+    pub approved_at_ms: u64,
     /// Distinct `model` values the provider reported in its responses.
     pub response_models: Vec<String>,
     /// Organization the API key belongs to, from provider response headers
@@ -273,9 +258,8 @@ pub struct Activity {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub files_read: u64,
-    /// sha256 over sorted `path \0 sha256(content) \n` for every file the
-    /// model read. Lets the auditee later prove exactly which files were read
-    /// without disclosing them now.
+    /// sha256 tree hash over every file the agent read (path and content
+    /// hash), so the auditee can later prove exactly which files were read.
     pub files_read_commitment: String,
     pub grep_calls: u32,
     pub find_calls: u32,
@@ -286,10 +270,7 @@ pub struct Activity {
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct InstructionScan {
     pub patterns_version: String,
-    /// Over every text file in the bundle.
     pub whole_bundle: ScanCounts,
-    /// Over files the model actually read (all of each file, not just the
-    /// lines it requested).
     pub files_read: ScanCounts,
 }
 
@@ -299,15 +280,17 @@ pub struct ScanCounts {
     pub matches_by_category: BTreeMap<String, u64>,
 }
 
-/// Runs seen by this enclave instance (since `boot_id`) before this one.
+/// What happened before this run.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct History {
-    pub prior_runs_same_question_text: u64,
-    pub prior_runs_same_question_id: u64,
-    pub prior_runs_same_auditee: u64,
-    /// Distinct code tree hashes submitted earlier against the same question
-    /// text. More than one means the code changed between attempts.
-    pub prior_code_hashes_same_question_text: Vec<String>,
+    pub prior_runs_in_session: u32,
+    pub prior_question_versions: u32,
+    /// Distinct code tree hashes earlier runs in this session used. More
+    /// than one means the code changed between attempts.
+    pub prior_code_trees_in_session: Vec<String>,
+    /// Runs of identical question text in other sessions on this enclave
+    /// boot (a cheap probe-from-another-session signal).
+    pub same_question_text_other_sessions: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -316,41 +299,4 @@ pub enum Outcome {
     Completed,
     StepLimit,
     Error { message: String },
-}
-
-// ---------------------------------------------------------------- run log
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct RunLogEntry {
-    pub run_id: String,
-    pub submitted_at_ms: u64,
-    pub question_id: String,
-    pub question_text_sha256: String,
-    pub auditee_public_key: String,
-    pub code_tree_sha256: String,
-    pub provider: Provider,
-    pub model: String,
-    pub status: RunStatus,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct RunLogBody {
-    pub boot_id: String,
-    pub booted_at_ms: u64,
-    pub generated_at_ms: u64,
-    pub query: RunLogQuery,
-    pub entries: Vec<RunLogEntry>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct RunLogQuery {
-    pub question_text_sha256: Option<String>,
-    pub auditee_public_key: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct RunLogResponse {
-    pub enclave_info_json: String,
-    pub boot_document_b64: Option<String>,
-    pub signed: Signed,
 }

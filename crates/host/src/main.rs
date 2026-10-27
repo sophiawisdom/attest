@@ -1,27 +1,26 @@
-//! Untrusted parent-instance daemon. It is not part of the trusted base:
-//! submissions are encrypted to the enclave, results to the auditee, and
-//! everything the enclave says is signed. It does two things:
+//! Untrusted parent-instance daemon. Not part of the trusted base: TLS ends
+//! inside the enclave, so this only moves ciphertext.
 //!
-//!   * TCP :8080           -> enclave vsock 5000   (client API)
-//!   * vsock 5001 CONNECT  -> TCP host:443          (inference calls; TLS ends in the enclave)
+//!   TCP :443              -> enclave vsock 5000   (HTTPS, terminated in the enclave)
+//!   vsock 5001 CONNECT    -> TCP host:443          (enclave's outbound TLS)
+//!   vsock 5002            -> boot config JSON      (domain, email API key)
 //!
-//! The tunnel allowlist here is defense in depth; the enclave enforces its
-//! own fixed endpoints.
+//! Outbound tunnels may go to any public address on port 443 (webhooks can
+//! point anywhere); the enclave decides where it connects.
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+use std::net::IpAddr;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-
-const ALLOWED: &[&str] = &["api.openai.com", "api.anthropic.com", "openrouter.ai"];
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "attest-host")]
 struct Args {
-    /// Loopback TCP instead of vsock; also allows tunnels to 127.0.0.1 (mock provider).
+    /// Loopback TCP instead of vsock; also allows tunnels to loopback (mock provider).
     #[arg(long)]
     dev: bool,
-    #[arg(long, default_value = "0.0.0.0:8080")]
+    #[arg(long, default_value = "0.0.0.0:443")]
     listen: String,
     #[arg(long, default_value_t = 16)]
     enclave_cid: u32,
@@ -29,12 +28,17 @@ struct Args {
     enclave_port: u32,
     #[arg(long, default_value_t = 5001)]
     tunnel_port: u32,
-    /// Dev only: enclave API address.
-    #[arg(long, default_value = "127.0.0.1:5000")]
-    dev_enclave: String,
+    #[arg(long, default_value_t = 5002)]
+    config_port: u32,
+    /// JSON handed to the enclave at boot: {"domain", "email": {"resend_api_key", "from"}, ...}.
+    #[arg(long)]
+    config: Option<String>,
     /// Dev only: address to accept tunnel requests on.
     #[arg(long, default_value = "127.0.0.1:5001")]
     dev_tunnel: String,
+    /// Don't forward inbound connections (dev, where the enclave serves HTTP itself).
+    #[arg(long)]
+    no_forward: bool,
 }
 
 trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -47,27 +51,21 @@ fn log(m: &str) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let mut tasks = tokio::task::JoinSet::new();
     let a = args.clone();
-    let tunnel = tokio::spawn(async move { tunnel_server(a).await });
-    let fwd = tokio::spawn(async move { forward_server(args).await });
-    tokio::select! {
-        r = tunnel => r??,
-        r = fwd => r??,
+    tasks.spawn(async move { tunnel_server(a).await });
+    if !args.dev {
+        let a = args.clone();
+        tasks.spawn(async move { config_server(a).await });
+    }
+    if !args.no_forward {
+        let a = args.clone();
+        tasks.spawn(async move { forward_server(a).await });
+    }
+    if let Some(r) = tasks.join_next().await {
+        r??;
     }
     Ok(())
-}
-
-async fn dial_enclave(args: &Args) -> Result<Box<dyn Io>> {
-    if args.dev {
-        return Ok(Box::new(TcpStream::connect(&args.dev_enclave).await?));
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let s = tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(args.enclave_cid, args.enclave_port)).await?;
-        Ok(Box::new(s))
-    }
-    #[cfg(not(target_os = "linux"))]
-    bail!("vsock requires linux; use --dev")
 }
 
 async fn forward_server(args: Args) -> Result<()> {
@@ -77,21 +75,29 @@ async fn forward_server(args: Args) -> Result<()> {
         let (mut client, peer) = l.accept().await?;
         let args = args.clone();
         tokio::spawn(async move {
-            match dial_enclave(&args).await {
-                Ok(mut e) => {
-                    let _ = tokio::io::copy_bidirectional(&mut client, &mut e).await;
+            #[cfg(target_os = "linux")]
+            {
+                match tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(args.enclave_cid, args.enclave_port)).await {
+                    Ok(mut e) => {
+                        let _ = tokio::io::copy_bidirectional(&mut client, &mut e).await;
+                    }
+                    Err(err) => log(&format!("{peer}: enclave unreachable: {err}")),
                 }
-                Err(err) => log(&format!("{peer}: enclave unreachable: {err:#}")),
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (&mut client, peer, args);
+                log("vsock forwarding requires linux");
             }
         });
     }
 }
 
-fn allowed(args: &Args, host: &str, port: u16) -> bool {
-    if ALLOWED.contains(&host) && port == 443 {
-        return true;
+fn public(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v) => !(v.is_private() || v.is_loopback() || v.is_link_local() || v.is_unspecified() || v.is_broadcast() || v.octets()[0] == 100 && (v.octets()[1] & 0xc0) == 64),
+        IpAddr::V6(v) => !(v.is_loopback() || v.is_unspecified() || (v.segments()[0] & 0xfe00) == 0xfc00 || (v.segments()[0] & 0xffc0) == 0xfe80),
     }
-    args.dev && (host == "127.0.0.1" || host == "localhost")
 }
 
 async fn handle_tunnel<S: Io>(args: Args, s: S) -> Result<()> {
@@ -101,11 +107,13 @@ async fn handle_tunnel<S: Io>(args: Args, s: S) -> Result<()> {
     let target = line.trim().strip_prefix("CONNECT ").context("expected CONNECT")?.to_string();
     let (host, port) = target.rsplit_once(':').context("expected host:port")?;
     let port: u16 = port.parse()?;
-    if !allowed(&args, host, port) {
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port)).await.map(|a| a.collect()).unwrap_or_default();
+    let ok_addr = addrs.into_iter().find(|a| (port == 443 && public(a.ip())) || (args.dev && a.ip().is_loopback()));
+    let Some(addr) = ok_addr else {
         r.get_mut().write_all(b"ERR destination not allowed\n").await?;
         bail!("refused tunnel to {target}");
-    }
-    let mut up = match TcpStream::connect((host, port)).await {
+    };
+    let mut up = match TcpStream::connect(addr).await {
         Ok(u) => u,
         Err(e) => {
             r.get_mut().write_all(format!("ERR {e}\n").as_bytes()).await?;
@@ -113,7 +121,6 @@ async fn handle_tunnel<S: Io>(args: Args, s: S) -> Result<()> {
         }
     };
     r.get_mut().write_all(b"OK\n").await?;
-    // Nothing follows the CONNECT line until our OK, so the buffer is empty.
     let mut s = r.into_inner();
     tokio::io::copy_bidirectional(&mut s, &mut up).await?;
     Ok(())
@@ -151,4 +158,36 @@ async fn tunnel_server(args: Args) -> Result<()> {
     {
         bail!("vsock requires linux; use --dev")
     }
+}
+
+async fn config_server(args: Args) -> Result<()> {
+    let body = match &args.config {
+        Some(p) => std::fs::read(p).with_context(|| format!("reading {p}"))?,
+        None => b"{}".to_vec(),
+    };
+    serde_json_check(&body)?;
+    #[cfg(target_os = "linux")]
+    {
+        let l = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_ANY, args.config_port))?;
+        log(&format!("config on vsock {}", args.config_port));
+        loop {
+            let (mut s, _) = l.accept().await?;
+            let _ = s.write_all(&body).await;
+            let _ = s.shutdown().await;
+        }
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = (body, args.config_port);
+        bail!("vsock requires linux")
+    }
+}
+
+fn serde_json_check(b: &[u8]) -> Result<()> {
+    // Minimal sanity check without a JSON dependency.
+    let t = String::from_utf8_lossy(b);
+    if !t.trim_start().starts_with('{') {
+        bail!("config must be a JSON object");
+    }
+    Ok(())
 }

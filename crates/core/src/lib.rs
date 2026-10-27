@@ -23,24 +23,9 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Split an encrypted submission's plaintext into header and tar bytes.
-pub fn split_submission(plain: &[u8]) -> anyhow::Result<(SubmissionHeader, &[u8])> {
-    let rest = plain
-        .strip_prefix(SUBMISSION_MAGIC)
-        .ok_or_else(|| anyhow::anyhow!("not an attest submission"))?;
-    anyhow::ensure!(rest.len() >= 8, "truncated submission");
-    let len = u64::from_le_bytes(rest[..8].try_into().unwrap()) as usize;
-    anyhow::ensure!(rest.len() >= 8 + len, "truncated submission header");
-    let header: SubmissionHeader = serde_json::from_slice(&rest[8..8 + len])?;
-    Ok((header, &rest[8 + len..]))
-}
 
-pub fn join_submission(header: &SubmissionHeader, tar: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let h = serde_json::to_vec(header)?;
-    let mut out = Vec::with_capacity(SUBMISSION_MAGIC.len() + 8 + h.len() + tar.len());
-    out.extend_from_slice(SUBMISSION_MAGIC);
-    out.extend_from_slice(&(h.len() as u64).to_le_bytes());
-    out.extend_from_slice(&h);
-    out.extend_from_slice(tar);
-    Ok(out)
+/// sha256 hex of a DER certificate's SubjectPublicKeyInfo.
+pub fn spki_sha256_of_cert(der: &[u8]) -> anyhow::Result<String> {
+    let (_, cert) = x509_parser::parse_x509_certificate(der).map_err(|e| anyhow::anyhow!("certificate: {e}"))?;
+    Ok(sha256_hex(cert.public_key().raw))
 }

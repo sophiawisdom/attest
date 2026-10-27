@@ -28,9 +28,10 @@ RUN case "$TARGETARCH" in \
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-COPY vendor ./vendor
 
-ENV SOURCE_DATE_EPOCH=0 \
+ARG ATTEST_GIT_SHA=unknown
+ENV ATTEST_GIT_SHA=$ATTEST_GIT_SHA \
+    SOURCE_DATE_EPOCH=0 \
     CARGO_INCREMENTAL=0 \
     CARGO_HOME=/cargo \
     RUSTFLAGS="--remap-path-prefix=/src=/build --remap-path-prefix=/cargo=/cargo-home --remap-path-prefix=/usr/local/rustup=/rustup -C target-feature=+crt-static"

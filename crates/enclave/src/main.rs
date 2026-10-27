@@ -1,18 +1,23 @@
-//! attest enclave: runs a read-only LLM audit over code it never discloses,
-//! and signs a manifest of what the auditee chose.
+//! attest enclave: hosts two-party audit sessions. A model with read-only
+//! tools reads the auditee's code and answers the auditor's question; the
+//! auditee decides whether the auditor sees the answer.
 //!
-//! HTTP API (served over vsock, forwarded by the untrusted host):
-//!   GET  /v1/attestation[?nonce=hex]   enclave info + attestation documents
-//!   POST /v1/runs                      age-encrypted submission -> run id
-//!   GET  /v1/runs/{id}                 status; result encrypted to the auditee
-//!   GET  /v1/log?question_text_sha256=..|auditee=..   signed run log
+//! TLS terminates inside the enclave with a key generated at boot and bound
+//! to the attestation document, so the web page and API come from the
+//! measured image. See web/agents.md for the protocol.
 
+mod acme;
 mod bundle;
 mod llm;
 mod net;
+mod notify;
 mod nsm;
 mod run;
+mod sessions;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod tls;
 
+#[allow(unused_imports)]
 use anyhow::{anyhow, bail, Context, Result};
 use attest_core::harness::{self, HARNESS_VERSION, MAX_STEPS_CAP, TOOLS};
 use attest_core::*;
@@ -23,84 +28,105 @@ use ed25519_dalek::SigningKey;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use serde_json::{json, Value};
+use sessions::Ctx;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::Duration;
 
 const LISTEN_VSOCK_PORT: u32 = 5000;
+const CONFIG_VSOCK_PORT: u32 = 5002;
+const INDEX_HTML: &str = include_str!("../web/index.html");
+const AGENTS_MD: &str = include_str!("../web/agents.md");
+const LETS_ENCRYPT: &str = "https://acme-v02.api.letsencrypt.org/directory";
 
 #[derive(Parser, Debug)]
 #[command(name = "attest-enclave")]
 struct Args {
-    /// Local development: TCP instead of vsock, no attestation, mock provider allowed.
+    /// Local development: plain HTTP on loopback, no attestation, mock provider allowed.
     #[arg(long)]
     dev: bool,
-    /// Dev only: address to listen on.
-    #[arg(long, default_value = "127.0.0.1:5000")]
+    #[arg(long, default_value = "127.0.0.1:8080")]
     dev_listen: String,
-    /// Dev only: address of the host's CONNECT tunnel.
     #[arg(long, default_value = "127.0.0.1:5001")]
     dev_tunnel: String,
-    /// Largest accepted (encrypted) submission.
-    #[arg(long, default_value_t = 1 << 30)]
-    max_submission_bytes: usize,
-    /// Audits running at once.
+    /// Dev only: host config JSON (what the parent serves over vsock in production).
+    #[arg(long)]
+    dev_config: Option<String>,
     #[arg(long, default_value_t = 4)]
     concurrency: usize,
 }
 
-struct RunRecord {
-    status: RunStatus,
-    steps: Arc<AtomicU32>,
-    result_age_b64: Option<String>,
+/// Supplied by the untrusted parent at boot. Nothing in it is trusted for
+/// security: the domain only affects which certificate is requested, and
+/// the email key only lets the enclave send mail.
+#[derive(serde::Deserialize, Default, Debug)]
+struct HostConfig {
+    domain: Option<String>,
+    acme_directory: Option<String>,
+    email: Option<notify::EmailConfig>,
+    max_code_mib: Option<usize>,
+    max_total_code_mib: Option<usize>,
 }
 
-struct State {
-    dev: bool,
-    info: EnclaveInfo,
-    info_json: String,
-    boot_doc_b64: Option<String>,
-    signing: SigningKey,
-    age_identity: age::x25519::Identity,
-    attester: nsm::Attester,
-    net: net::Net,
-    runs: Mutex<HashMap<String, RunRecord>>,
-    log: Mutex<Vec<RunLogEntry>>,
-    slots: tokio::sync::Semaphore,
-    max_submission_bytes: usize,
-}
-
-fn random_hex(n: usize) -> String {
-    let mut b = vec![0u8; n];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut b);
-    hex::encode(b)
-}
-
-fn log(msg: &str) {
+pub fn log(msg: &str) {
     eprintln!("[attest-enclave] {msg}");
+}
+
+async fn read_host_config(args: &Args) -> Result<HostConfig> {
+    if args.dev {
+        return match &args.dev_config {
+            Some(p) => Ok(serde_json::from_str(&std::fs::read_to_string(p)?)?),
+            None => Ok(HostConfig::default()),
+        };
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use tokio::io::AsyncReadExt;
+        let addr = tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_HOST, CONFIG_VSOCK_PORT);
+        let mut s = tokio::time::timeout(Duration::from_secs(30), tokio_vsock::VsockStream::connect(addr))
+            .await
+            .map_err(|_| anyhow!("timeout reaching parent config service"))??;
+        let mut buf = Vec::new();
+        (&mut s).take(1 << 20).read_to_end(&mut buf).await?;
+        Ok(serde_json::from_slice(&buf).context("host config JSON")?)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = CONFIG_VSOCK_PORT;
+        bail!("vsock requires linux; run with --dev")
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
     let attester = nsm::Attester::new(args.dev)?;
+    let cfg = read_host_config(&args).await?;
+    log(&format!("config: domain={:?} email={}", cfg.domain, cfg.email.is_some()));
+    let domain = cfg.domain.clone().filter(|_| !args.dev);
+    let tls = if args.dev { None } else { Some(Arc::new(tls::ServerIdentity::generate(domain.as_slice())?)) };
+
     // Inside Nitro the kernel RNG is fed by the NSM hardware RNG.
     let signing = SigningKey::generate(&mut rand::rngs::OsRng);
-    let age_identity = age::x25519::Identity::generate();
-
     let mut endpoints = BTreeMap::new();
     for p in [Provider::Openai, Provider::Anthropic, Provider::Openrouter] {
         let (h, path) = llm::endpoint(p);
         endpoints.insert(p.as_str().to_string(), format!("https://{h}{path}"));
     }
+    let mut boot = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut boot);
     let info = EnclaveInfo {
         service: "attest".into(),
         version: env!("CARGO_PKG_VERSION").into(),
+        source_repo: SOURCE_REPO.into(),
+        source_commit: option_env!("ATTEST_GIT_SHA").unwrap_or("unknown").into(),
         mode: if args.dev { "dev" } else { "nitro" }.into(),
-        boot_id: random_hex(16),
+        boot_id: hex::encode(boot),
         booted_at_ms: now_ms(),
         signing_public_key: hex::encode(signing.verifying_key().to_bytes()),
-        age_recipient: age_identity.to_public().to_string(),
+        tls_spki_sha256: tls.as_ref().map(|t| t.spki_sha256.clone()),
+        domain: domain.clone(),
         harness: HarnessInfo {
             version: HARNESS_VERSION.into(),
             system_prompt_sha256: harness::system_prompt_sha256(),
@@ -111,301 +137,251 @@ async fn main() -> Result<()> {
     };
     let info_json = serde_json::to_string(&info)?;
     let boot_doc = attester.attest(&sha256(info_json.as_bytes()), &signing.verifying_key().to_bytes(), None)?;
-    let b64 = base64::engine::general_purpose::STANDARD;
-
-    let state = Arc::new(State {
+    let net = net::Net::new(args.dev, args.dev_tunnel.clone())?;
+    let ctx = Arc::new(Ctx {
         dev: args.dev,
-        boot_doc_b64: boot_doc.map(|d| b64.encode(d)),
+        net: net.clone(),
+        boot_doc_b64: boot_doc.map(|d| base64::engine::general_purpose::STANDARD.encode(d)),
         info,
         info_json,
         signing,
-        age_identity,
-        attester,
-        net: net::Net::new(args.dev, args.dev_tunnel.clone())?,
-        runs: Mutex::new(HashMap::new()),
-        log: Mutex::new(Vec::new()),
+        email: cfg.email,
+        max_code_bytes: cfg.max_code_mib.unwrap_or(1024) << 20,
+        max_total_code_bytes: cfg.max_total_code_mib.unwrap_or(4096) << 20,
         slots: tokio::sync::Semaphore::new(args.concurrency),
-        max_submission_bytes: args.max_submission_bytes,
+        store: sessions::Store::default(),
     });
-    log(&format!("boot {} mode={} key={}", state.info.boot_id, state.info.mode, state.info.signing_public_key));
-    serve(args, state).await
+    let app = Arc::new(App { ctx: ctx.clone(), attester });
+    log(&format!("boot {} mode={} commit={}", ctx.info.boot_id, ctx.info.mode, ctx.info.source_commit));
+
+    if let (Some(t), Some(d)) = (&tls, &domain) {
+        tokio::spawn(acme::run(net, t.clone(), d.clone(), cfg.acme_directory.unwrap_or_else(|| LETS_ENCRYPT.into())));
+    }
+    serve(args, app, tls).await
 }
 
-async fn serve(args: Args, state: Arc<State>) -> Result<()> {
-    macro_rules! spawn_conn {
-        ($io:expr) => {{
-            let st = state.clone();
-            tokio::spawn(async move {
-                let svc = hyper::service::service_fn(move |req| {
-                    let st = st.clone();
-                    async move { Ok::<_, std::convert::Infallible>(handle(st, req).await) }
-                });
-                let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new($io), svc).await;
-            });
-        }};
-    }
+struct App {
+    ctx: Arc<Ctx>,
+    attester: nsm::Attester,
+}
+
+async fn serve(args: Args, app: Arc<App>, tls: Option<Arc<tls::ServerIdentity>>) -> Result<()> {
     if args.dev {
         let l = tokio::net::TcpListener::bind(&args.dev_listen).await?;
-        log(&format!("dev: listening on {}", args.dev_listen));
+        log(&format!("dev: http://{}/", args.dev_listen));
         loop {
             let (s, _) = l.accept().await?;
-            spawn_conn!(s);
+            let app = app.clone();
+            tokio::spawn(async move { serve_http(app, s).await });
         }
     }
     #[cfg(target_os = "linux")]
     {
+        let tls = tls.ok_or_else(|| anyhow!("no TLS identity"))?;
+        let acceptor = tokio_rustls::TlsAcceptor::from(tls.server_config());
         let l = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_ANY, LISTEN_VSOCK_PORT))
             .context("binding vsock")?;
-        log(&format!("listening on vsock port {LISTEN_VSOCK_PORT}"));
+        log(&format!("listening on vsock port {LISTEN_VSOCK_PORT} (TLS)"));
         loop {
             let (s, _) = l.accept().await?;
-            spawn_conn!(s);
+            let (app, acceptor) = (app.clone(), acceptor.clone());
+            tokio::spawn(async move {
+                let Ok(Ok(stream)) = tokio::time::timeout(Duration::from_secs(20), acceptor.accept(s)).await else { return };
+                // ACME validation connections only need the handshake.
+                if stream.get_ref().1.alpn_protocol() == Some(tls::ACME_ALPN) {
+                    return;
+                }
+                serve_http(app, stream).await
+            });
         }
     }
     #[allow(unreachable_code)]
     {
-        let _ = LISTEN_VSOCK_PORT;
+        let _ = (tls, LISTEN_VSOCK_PORT);
         bail!("vsock requires linux; run with --dev")
     }
 }
 
-fn json_response<T: serde::Serialize>(status: StatusCode, v: &T) -> Response<Full<Bytes>> {
+async fn serve_http<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>(app: Arc<App>, s: S) {
+    let svc = hyper::service::service_fn(move |req| {
+        let app = app.clone();
+        async move { Ok::<_, std::convert::Infallible>(handle(app, req).await) }
+    });
+    let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(s), svc).await;
+}
+
+// ------------------------------------------------------------------ HTTP
+
+type Resp = Response<Full<Bytes>>;
+
+fn respond(status: StatusCode, ctype: &str, body: impl Into<Bytes>) -> Resp {
     Response::builder()
         .status(status)
-        .header("content-type", "application/json")
+        .header("content-type", ctype)
         .header("cache-control", "no-store")
-        .body(Full::new(Bytes::from(serde_json::to_vec(v).unwrap_or_default())))
+        .header("x-content-type-options", "nosniff")
+        .header("referrer-policy", "no-referrer")
+        .header("x-frame-options", "DENY")
+        .header(
+            "content-security-policy",
+            "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+        )
+        .body(Full::new(body.into()))
         .unwrap()
 }
 
-fn error(status: StatusCode, msg: impl std::fmt::Display) -> Response<Full<Bytes>> {
-    json_response(status, &serde_json::json!({"error": msg.to_string()}))
+fn json_resp(status: StatusCode, v: &Value) -> Resp {
+    respond(status, "application/json", serde_json::to_vec(v).unwrap_or_default())
+}
+
+struct ApiError(StatusCode, String);
+
+impl From<anyhow::Error> for ApiError {
+    fn from(e: anyhow::Error) -> Self {
+        ApiError(StatusCode::BAD_REQUEST, format!("{e:#}"))
+    }
 }
 
 fn query(req: &Request<hyper::body::Incoming>) -> HashMap<String, String> {
-    req.uri()
-        .query()
-        .map(|q| url::form_urlencoded::parse(q.as_bytes()).into_owned().collect())
-        .unwrap_or_default()
+    req.uri().query().map(|q| url::form_urlencoded::parse(q.as_bytes()).into_owned().collect()).unwrap_or_default()
 }
 
-async fn handle(st: Arc<State>, req: Request<hyper::body::Incoming>) -> Response<Full<Bytes>> {
-    let path = req.uri().path().to_string();
-    let method = req.method().clone();
-    let r = match (method.as_str(), path.as_str()) {
-        ("GET", "/healthz") => Ok(json_response(StatusCode::OK, &serde_json::json!({"ok": true}))),
-        ("GET", "/v1/attestation") => attestation(&st, &query(&req)),
-        ("POST", "/v1/runs") => submit(st.clone(), req).await,
-        ("GET", "/v1/log") => run_log(&st, &query(&req)),
-        ("GET", p) if p.starts_with("/v1/runs/") => run_status(&st, &p["/v1/runs/".len()..]),
-        _ => Ok(error(StatusCode::NOT_FOUND, "not found")),
-    };
-    r.unwrap_or_else(|e| error(StatusCode::BAD_REQUEST, format!("{e:#}")))
-}
-
-fn attestation(st: &State, q: &HashMap<String, String>) -> Result<Response<Full<Bytes>>> {
-    let fresh = match q.get("nonce") {
-        Some(n) => {
-            let nonce = hex::decode(n).context("nonce must be hex")?;
-            if nonce.len() > 64 {
-                bail!("nonce too long");
-            }
-            st.attester
-                .attest(&sha256(st.info_json.as_bytes()), &st.signing.verifying_key().to_bytes(), Some(&nonce))?
-                .map(|d| base64::engine::general_purpose::STANDARD.encode(d))
-        }
-        None => None,
-    };
-    Ok(json_response(
-        StatusCode::OK,
-        &AttestationResponse {
-            enclave_info_json: st.info_json.clone(),
-            boot_document_b64: st.boot_doc_b64.clone(),
-            fresh_document_b64: fresh,
-        },
-    ))
-}
-
-async fn submit(st: Arc<State>, req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>> {
-    let submitted_at_ms = now_ms();
-    let body = http_body_util::Limited::new(req.into_body(), st.max_submission_bytes)
+async fn body_json(req: Request<hyper::body::Incoming>) -> Result<Value, ApiError> {
+    let b = http_body_util::Limited::new(req.into_body(), 1 << 20)
         .collect()
         .await
-        .map_err(|e| anyhow!("reading submission: {e}"))?
+        .map_err(|_| ApiError(StatusCode::PAYLOAD_TOO_LARGE, "request body too large".into()))?
         .to_bytes();
-    let plain = age::decrypt(&st.age_identity, &body).map_err(|_| anyhow!("submission is not encrypted to this enclave boot"))?;
-    drop(body);
-    let (header, tar) = split_submission(&plain)?;
-
-    // Question and affidavit must be signed, and the affidavit must bind this
-    // exact question and code.
-    let question_body: QuestionBody = header.question.open(DOMAIN_QUESTION)?;
-    let affidavit_body: AffidavitBody = header.affidavit.open(DOMAIN_AFFIDAVIT)?;
-    let question_id = header.question.id();
-    if affidavit_body.question_id != question_id {
-        bail!("affidavit names a different question");
+    if b.is_empty() {
+        return Ok(Value::Null);
     }
-    if header.provider == Provider::Mock && !st.dev {
-        bail!("mock provider is only available in dev mode");
-    }
-    if llm::is_fine_tuned(header.provider, &header.model) && !question_body.policy.allow_fine_tuned {
-        bail!("the auditor's question does not allow fine-tuned models");
-    }
-    if header.model.trim().is_empty() || header.api_key.trim().is_empty() {
-        bail!("model and api_key are required");
-    }
-    let reply_to: age::x25519::Recipient = header.reply_recipient.parse().map_err(|e| anyhow!("reply recipient: {e}"))?;
-    let bundle = bundle::Bundle::from_tar(tar)?;
-    if bundle.info.tree_sha256 != affidavit_body.code_tree_sha256 {
-        bail!("code bundle does not match the tree hash in the affidavit");
-    }
-    let client = llm::Client::new(
-        st.net.clone(),
-        header.provider,
-        header.model.clone(),
-        header.api_key.clone(),
-        header.openrouter_zdr,
-        header.mock_endpoint.clone(),
-    )?;
-    drop(plain);
-
-    // Record the run before it starts: it counts even if it never finishes.
-    let run_id = random_hex(16);
-    let question_text_sha256 = sha256_hex(question_body.text.as_bytes());
-    let auditee = header.affidavit.public_key.clone();
-    let history = {
-        let mut log = st.log.lock().unwrap();
-        let same_text: Vec<&RunLogEntry> = log.iter().filter(|e| e.question_text_sha256 == question_text_sha256).collect();
-        let mut hashes: Vec<String> = same_text.iter().map(|e| e.code_tree_sha256.clone()).collect();
-        hashes.sort();
-        hashes.dedup();
-        let h = History {
-            prior_runs_same_question_text: same_text.len() as u64,
-            prior_runs_same_question_id: log.iter().filter(|e| e.question_id == question_id).count() as u64,
-            prior_runs_same_auditee: log.iter().filter(|e| e.auditee_public_key == auditee).count() as u64,
-            prior_code_hashes_same_question_text: hashes,
-        };
-        log.push(RunLogEntry {
-            run_id: run_id.clone(),
-            submitted_at_ms,
-            question_id: question_id.clone(),
-            question_text_sha256,
-            auditee_public_key: auditee,
-            code_tree_sha256: bundle.info.tree_sha256.clone(),
-            provider: header.provider,
-            model: header.model.clone(),
-            status: RunStatus::Queued,
-        });
-        h
-    };
-    let steps = Arc::new(AtomicU32::new(0));
-    st.runs.lock().unwrap().insert(
-        run_id.clone(),
-        RunRecord { status: RunStatus::Queued, steps: steps.clone(), result_age_b64: None },
-    );
-    log(&format!("run {run_id}: queued ({} files, provider {})", bundle.info.file_count, header.provider.as_str()));
-
-    let input = run::RunInput {
-        run_id: run_id.clone(),
-        boot_id: st.info.boot_id.clone(),
-        harness: st.info.harness.clone(),
-        submitted_at_ms,
-        question: header.question.clone(),
-        question_body,
-        affidavit: header.affidavit.clone(),
-        bundle,
-        client,
-        history,
-    };
-    let st2 = st.clone();
-    let id2 = run_id.clone();
-    tokio::spawn(async move {
-        let _permit = st2.slots.acquire().await;
-        set_status(&st2, &id2, RunStatus::Running, None);
-        let (body, trace) = run::execute(input, steps).await;
-        let failed = matches!(body.manifest.outcome, Outcome::Error { .. });
-        let result = (|| -> Result<String> {
-            let signed = sign::sign(&st2.signing, DOMAIN_CERTIFICATE, &body)?;
-            let certificate = Certificate {
-                enclave_info_json: st2.info_json.clone(),
-                boot_document_b64: st2.boot_doc_b64.clone(),
-                signed,
-            };
-            let plain = serde_json::to_vec(&RunResult { certificate, trace })?;
-            let ct = age::encrypt(&reply_to, &plain)?;
-            Ok(base64::engine::general_purpose::STANDARD.encode(ct))
-        })();
-        match result {
-            Ok(r) => {
-                let status = if failed { RunStatus::Failed } else { RunStatus::Done };
-                log(&format!("run {id2}: {status:?}"));
-                set_status(&st2, &id2, status, Some(r));
-            }
-            Err(e) => {
-                log(&format!("run {id2}: could not seal result: {e:#}"));
-                set_status(&st2, &id2, RunStatus::Failed, None);
-            }
-        }
-    });
-    Ok(json_response(StatusCode::OK, &SubmitResponse { run_id }))
+    serde_json::from_slice(&b).map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("body is not JSON: {e}")))
 }
 
-fn set_status(st: &State, id: &str, status: RunStatus, result: Option<String>) {
-    if let Some(r) = st.runs.lock().unwrap().get_mut(id) {
-        r.status = status.clone();
-        if result.is_some() {
-            r.result_age_b64 = result;
+async fn handle(app: Arc<App>, req: Request<hyper::body::Incoming>) -> Resp {
+    let path = req.uri().path().to_string();
+    let method = req.method().as_str().to_string();
+    let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+    let r: Result<Resp, ApiError> = match (method.as_str(), parts.as_slice()) {
+        ("GET", [""]) | ("GET", ["s", _]) => Ok(respond(StatusCode::OK, "text/html; charset=utf-8", INDEX_HTML)),
+        ("GET", ["agents.md"]) | ("GET", ["llms.txt"]) => Ok(respond(StatusCode::OK, "text/markdown; charset=utf-8", AGENTS_MD)),
+        ("GET", ["healthz"]) => Ok(json_resp(StatusCode::OK, &json!({"ok": true}))),
+        ("GET", ["api", "attestation"]) => attestation(&app, &query(&req)),
+        ("GET", ["api", "info"]) => Ok(json_resp(StatusCode::OK, &serde_json::to_value(&app.ctx.info).unwrap_or_default())),
+        ("POST", ["api", "sessions"]) => create_session(&app, &req),
+        (_, ["api", "sessions", id, rest @ ..]) => session_route(&app, id, rest, req).await,
+        _ => Err(ApiError(StatusCode::NOT_FOUND, format!("not found: {method} {path} (see /agents.md)"))),
+    };
+    r.unwrap_or_else(|ApiError(s, m)| json_resp(s, &json!({"error": m})))
+}
+
+fn attestation(app: &App, q: &HashMap<String, String>) -> Result<Resp, ApiError> {
+    let doc = match q.get("nonce") {
+        Some(n) => {
+            let nonce = hex::decode(n).map_err(|_| anyhow!("nonce must be hex"))?;
+            if nonce.is_empty() || nonce.len() > 64 {
+                return Err(anyhow!("nonce must be 1-64 bytes").into());
+            }
+            let ctx = &app.ctx;
+            app.attester
+                .attest(&sha256(ctx.info_json.as_bytes()), &ctx.signing.verifying_key().to_bytes(), Some(&nonce))?
+                .map(|d| base64::engine::general_purpose::STANDARD.encode(d))
         }
-    }
-    if let Some(e) = st.log.lock().unwrap().iter_mut().find(|e| e.run_id == id) {
-        e.status = status;
+        None => app.ctx.boot_doc_b64.clone(),
+    };
+    let r = AttestationResponse { enclave_info_json: app.ctx.info_json.clone(), document_b64: doc };
+    Ok(json_resp(StatusCode::OK, &serde_json::to_value(r).unwrap_or_default()))
+}
+
+fn base_url(app: &App, req: &Request<hyper::body::Incoming>) -> String {
+    match &app.ctx.info.domain {
+        Some(d) => format!("https://{d}"),
+        None => {
+            let host = req.headers().get("host").and_then(|h| h.to_str().ok()).unwrap_or("127.0.0.1:8080");
+            format!("{}://{host}", if app.ctx.dev { "http" } else { "https" })
+        }
     }
 }
 
-fn run_status(st: &State, id: &str) -> Result<Response<Full<Bytes>>> {
-    let runs = st.runs.lock().unwrap();
-    let Some(r) = runs.get(id) else {
-        return Ok(error(StatusCode::NOT_FOUND, "no such run"));
-    };
-    Ok(json_response(
+fn create_session(app: &App, req: &Request<hyper::body::Incoming>) -> Result<Resp, ApiError> {
+    let (s, auditee, auditor) = app.ctx.store.create()?;
+    let base = base_url(app, req);
+    log(&format!("session {} created", &s.id[..8]));
+    Ok(json_resp(
         StatusCode::OK,
-        &RunStatusResponse {
-            run_id: id.to_string(),
-            status: r.status.clone(),
-            steps: r.steps.load(Ordering::Relaxed),
-            result_age_b64: r.result_age_b64.clone(),
-        },
+        &json!({
+            "session_id": s.id,
+            "auditee_token": auditee,
+            "auditor_token": auditor,
+            "auditee_link": format!("{base}/s/{}#{auditee}", s.id),
+            "auditor_link": format!("{base}/s/{}#{auditor}", s.id),
+            "note": "Keep the auditee link. Send the auditor link to the auditor over a channel you trust. Anyone with a link acts as that party.",
+        }),
     ))
 }
 
-fn run_log(st: &State, q: &HashMap<String, String>) -> Result<Response<Full<Bytes>>> {
-    let text = q.get("question_text_sha256").cloned();
-    let auditee = q.get("auditee").cloned();
-    if text.is_none() && auditee.is_none() {
-        bail!("give question_text_sha256 or auditee");
-    }
-    let entries: Vec<RunLogEntry> = st
-        .log
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|e| text.as_ref().map_or(true, |t| &e.question_text_sha256 == t))
-        .filter(|e| auditee.as_ref().map_or(true, |a| &e.auditee_public_key == a))
-        .cloned()
-        .collect();
-    let body = RunLogBody {
-        boot_id: st.info.boot_id.clone(),
-        booted_at_ms: st.info.booted_at_ms,
-        generated_at_ms: now_ms(),
-        query: RunLogQuery { question_text_sha256: text, auditee_public_key: auditee },
-        entries,
-    };
-    Ok(json_response(
-        StatusCode::OK,
-        &RunLogResponse {
-            enclave_info_json: st.info_json.clone(),
-            boot_document_b64: st.boot_doc_b64.clone(),
-            signed: sign::sign(&st.signing, DOMAIN_RUN_LOG, &body)?,
-        },
-    ))
+fn bearer(req: &Request<hyper::body::Incoming>) -> Option<String> {
+    req.headers()
+        .get("authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .map(|t| t.trim().to_string())
 }
+
+async fn session_route(app: &Arc<App>, id: &str, rest: &[&str], req: Request<hyper::body::Incoming>) -> Result<Resp, ApiError> {
+    let ctx = &app.ctx;
+    let token = bearer(&req).ok_or_else(|| ApiError(StatusCode::UNAUTHORIZED, "send the token from your link as 'Authorization: Bearer <token>'".into()))?;
+    let (s, role) = ctx.store.auth(id, &token).map_err(|e| ApiError(StatusCode::NOT_FOUND, e.to_string()))?;
+    s.touch(ctx, role);
+    let method = req.method().as_str().to_string();
+    let q = query(&req);
+    let ok = |v: Value| Ok(json_resp(StatusCode::OK, &v));
+    match (method.as_str(), rest) {
+        ("GET", []) => {
+            // Long-poll: ?version=N&wait=25 returns once the session changes past N.
+            if let Some(v) = q.get("version").and_then(|v| v.parse::<u64>().ok()) {
+                let wait = q.get("wait").and_then(|w| w.parse::<u64>().ok()).unwrap_or(0).min(30);
+                if wait > 0 {
+                    sessions::wait_for_change(&s, v, Duration::from_secs(wait)).await;
+                }
+            }
+            let since = q.get("since").and_then(|v| v.parse().ok()).unwrap_or(0);
+            ok(s.view(ctx, role, since))
+        }
+        ("POST", ["question"]) => ok(s.propose_question(ctx, role, &body_json(req).await?)?),
+        ("POST", ["question", "decision"]) => ok(s.decide_question(ctx, role, &body_json(req).await?)?),
+        ("PUT", ["code"]) => {
+            if role != Role::Auditee {
+                return Err(anyhow!("only the auditee uploads code").into());
+            }
+            let used = ctx.store.total_code_bytes() as usize;
+            let room = ctx.max_total_code_bytes.saturating_sub(used);
+            let limit = ctx.max_code_bytes.min(room);
+            if limit < 1024 {
+                return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "this server is out of room for code right now".into()));
+            }
+            let tar = http_body_util::Limited::new(req.into_body(), limit)
+                .collect()
+                .await
+                .map_err(|_| ApiError(StatusCode::PAYLOAD_TOO_LARGE, format!("code archive is larger than {} MiB", limit >> 20)))?
+                .to_bytes();
+            ok(s.upload_code(ctx, role, &tar)?)
+        }
+        ("POST", ["affidavit"]) => ok(s.confirm_affidavit(ctx, role, &body_json(req).await?)?),
+        ("POST", ["models"]) => ok(s.propose_model(ctx, role, &body_json(req).await?)?),
+        ("POST", ["models", mid, "decision"]) => {
+            let mid: u32 = mid.parse().map_err(|_| anyhow!("bad model id"))?;
+            ok(s.decide_model(ctx, role, mid, &body_json(req).await?)?)
+        }
+        ("GET", ["runs", rid, "trace"]) => {
+            let after = q.get("after").and_then(|v| v.parse().ok()).unwrap_or(0);
+            ok(s.trace(role, rid, after)?)
+        }
+        ("POST", ["runs", rid, "release"]) => ok(s.decide_release(ctx, role, rid, &body_json(req).await?)?),
+        ("POST", ["runs", rid, "followup"]) => ok(s.followup(ctx, role, rid, &body_json(req).await?)?),
+        ("GET", ["runs", rid, "certificate"]) => ok(serde_json::to_value(s.certificate(role, rid)?).map_err(anyhow::Error::from)?),
+        ("POST", ["notify"]) => ok(s.set_notify(role, &body_json(req).await?, ctx.email.is_some())?),
+        _ => Err(ApiError(StatusCode::NOT_FOUND, format!("not found: {method} /api/sessions/{id}/{} (see /agents.md)", rest.join("/")))),
+    }
+}
+

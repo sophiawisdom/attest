@@ -1,25 +1,26 @@
-//! attest CLI.
-//!
-//! Auditor:  keygen, question, log, verify
-//! Auditee:  keygen, submit, fetch
-//! Both:     ui (local web app)
+//! attest CLI: verify the service, upload code into a session, verify
+//! certificates. Everything else happens in the web app or over the HTTP API
+//! (see /agents.md on any attest server).
 
 mod bundle;
-mod ops;
-mod report;
-mod ui;
 
 use anyhow::{anyhow, bail, Context, Result};
 use attest_core::nitro::ExpectedPcrs;
-use attest_core::verify::{EnclavePolicy, VerifiedEnclave};
+use attest_core::verify::{verify_certificate, verify_enclave, EnclavePolicy, VerifiedEnclave};
 use attest_core::*;
+use bytes::Bytes;
 use clap::{Args, Parser, Subcommand};
-use ops::{read_json, write_json};
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use http_body_util::{BodyExt, Full};
+use hyper::client::conn::http1::SendRequest;
+use hyper_util::rt::TokioIo;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use serde_json::{json, Value};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 #[derive(Parser)]
-#[command(name = "attest", about = "Attested LLM code audits: the auditee keeps the code, the auditor gets a signed verdict")]
+#[command(name = "attest", about = "Attested LLM code audits. See /agents.md on the server for the protocol.")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -27,10 +28,10 @@ struct Cli {
 
 #[derive(Args, Clone)]
 struct PolicyArgs {
-    /// Expected enclave measurements (nitro-cli build output).
+    /// Expected enclave measurements (nitro-cli build output, e.g. measurements/*.pcrs.json).
     #[arg(long)]
     pcrs: Option<PathBuf>,
-    /// Accept a dev-mode enclave (proves nothing; for testing).
+    /// Accept a dev-mode server (proves nothing; for testing).
     #[arg(long)]
     allow_dev: bool,
     /// Accept any genuine Nitro enclave without checking which build it runs.
@@ -41,7 +42,7 @@ struct PolicyArgs {
 impl PolicyArgs {
     fn policy(&self) -> Result<EnclavePolicy> {
         let expected = match &self.pcrs {
-            Some(p) => Some(ExpectedPcrs::from_json(&std::fs::read_to_string(p)?)?),
+            Some(p) => Some(ExpectedPcrs::from_json(&std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?)?),
             None => None,
         };
         Ok(EnclavePolicy { expected, allow_dev: self.allow_dev, skip_measurement: self.skip_measurement })
@@ -50,295 +51,256 @@ impl PolicyArgs {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Create a signing key (and an age key for receiving results).
-    Keygen {
-        #[arg(long)]
-        out: PathBuf,
-    },
-    /// Auditor: write and sign a question.
-    Question {
-        #[arg(long)]
-        key: PathBuf,
-        #[arg(long, conflicts_with = "text_file")]
-        text: Option<String>,
-        #[arg(long)]
-        text_file: Option<PathBuf>,
-        #[arg(long)]
-        allow_fine_tuned: bool,
-        #[arg(long, default_value_t = 150)]
-        max_steps: u32,
-        #[arg(long)]
-        out: PathBuf,
-    },
-    /// Check an enclave's attestation and print what it commits to.
-    Info {
-        #[arg(long)]
-        enclave: String,
+    /// Check that a server is a genuine attest enclave running the expected build,
+    /// and that TLS to it terminates inside that enclave.
+    VerifyService {
+        url: String,
         #[command(flatten)]
         policy: PolicyArgs,
+        #[arg(long)]
+        json: bool,
     },
-    /// Auditee: sign the affidavit, encrypt the code to the enclave, and start a run.
-    Submit {
-        #[arg(long)]
-        enclave: String,
-        #[arg(long)]
-        key: PathBuf,
-        #[arg(long)]
-        question: PathBuf,
-        /// Repository to audit. In a git checkout, only tracked files are sent.
-        #[arg(long)]
+    /// Auditee: upload a repository into a session (git-tracked files only),
+    /// after verifying the server.
+    Upload {
+        /// Your auditee session link (https://HOST/s/ID#TOKEN).
+        link: String,
         dir: PathBuf,
-        /// Organization making the affidavit.
+        /// Also confirm the affidavit, on behalf of this organization.
         #[arg(long)]
-        org: String,
-        /// openai | anthropic | openrouter
-        #[arg(long)]
-        provider: Provider,
-        #[arg(long)]
-        model: String,
-        /// Environment variable holding the API key.
-        #[arg(long, default_value = "ATTEST_API_KEY")]
-        api_key_env: String,
+        org: Option<String>,
         /// Defaults to `git remote get-url origin`.
         #[arg(long)]
         repo_url: Option<String>,
         /// Defaults to `git rev-parse HEAD`.
         #[arg(long)]
         git_commit: Option<String>,
-        /// Allow uncommitted changes to tracked files (the affidavit's commit claim would then be false).
+        /// Upload even if tracked files have uncommitted changes.
         #[arg(long)]
         allow_dirty: bool,
-        /// OpenRouter: route only to zero-data-retention endpoints.
-        #[arg(long)]
-        zdr: bool,
-        /// Dev only: host:port of a local OpenAI-compatible server (with --provider mock).
-        #[arg(long)]
-        mock_endpoint: Option<String>,
-        /// Do not ask for confirmation before signing.
-        #[arg(long)]
-        yes: bool,
-        /// Wait for the run and fetch the result.
-        #[arg(long)]
-        wait: bool,
-        /// Where `--wait` writes results.
-        #[arg(long, default_value = "attest-runs")]
-        out_dir: PathBuf,
         #[command(flatten)]
         policy: PolicyArgs,
     },
-    /// Auditee: wait for a run, decrypt the result, write certificate and transcript.
-    Fetch {
-        #[arg(long)]
-        enclave: String,
-        #[arg(long)]
-        key: PathBuf,
-        #[arg(long)]
-        run: String,
-        #[arg(long, default_value = "attest-runs")]
-        out_dir: PathBuf,
-        #[command(flatten)]
-        policy: PolicyArgs,
-    },
-    /// Auditor: verify a released certificate.
+    /// Verify a certificate offline.
     Verify {
-        #[arg(long)]
         certificate: PathBuf,
-        /// The question you issued; the certificate must answer exactly it.
-        #[arg(long)]
-        question: Option<PathBuf>,
+        #[command(flatten)]
+        policy: PolicyArgs,
         #[arg(long)]
         json: bool,
-        #[command(flatten)]
-        policy: PolicyArgs,
-    },
-    /// Auditor: list every run of your question's text on the enclave (since its boot).
-    Log {
-        #[arg(long)]
-        enclave: String,
-        #[arg(long, conflicts_with = "auditee")]
-        question: Option<PathBuf>,
-        /// Hex public key of an auditee.
-        #[arg(long)]
-        auditee: Option<String>,
-        #[command(flatten)]
-        policy: PolicyArgs,
-    },
-    /// Local web app for auditors and auditees.
-    Ui {
-        /// Where keys, questions, runs and certificates are kept.
-        #[arg(long, default_value = "attest-workspace")]
-        workspace: PathBuf,
-        #[arg(long, default_value_t = 7717)]
-        port: u16,
-        /// Enclave URL to start with (can be changed in the app).
-        #[arg(long)]
-        enclave: Option<String>,
-        /// Open the browser.
-        #[arg(long)]
-        open: bool,
     },
 }
 
-fn warn_all(ws: &[String]) {
-    for w in ws {
-        eprintln!("warning: {w}");
+// ------------------------------------------------------------------ connection
+
+/// Accepts any server certificate but records it: trust comes from the
+/// attestation, which must name this certificate's key.
+#[derive(Debug)]
+struct Capture {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    cert: Mutex<Option<Vec<u8>>>,
+}
+
+impl ServerCertVerifier for Capture {
+    fn verify_server_cert(&self, end: &CertificateDer<'_>, _: &[CertificateDer<'_>], _: &ServerName<'_>, _: &[u8], _: UnixTime) -> Result<ServerCertVerified, rustls::Error> {
+        *self.cert.lock().unwrap() = Some(end.to_vec());
+        Ok(ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(m, c, d, &self.provider.signature_verification_algorithms)
+    }
+    fn verify_tls13_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(m, c, d, &self.provider.signature_verification_algorithms)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
     }
 }
 
-fn main() -> Result<()> {
-    match Cli::parse().cmd {
-        Cmd::Keygen { out } => {
-            let kf = ops::generate_key(&out)?;
-            println!("wrote {} (public key {})", out.display(), kf.public_key);
-        }
+/// One HTTP/1.1 connection, kept open so the attestation check and the
+/// requests that rely on it happen over the same TLS session.
+struct Conn {
+    sender: SendRequest<Full<Bytes>>,
+    host: String,
+    spki_sha256: Option<String>,
+}
 
-        Cmd::Question { key, text, text_file, allow_fine_tuned, max_steps, out } => {
-            let keys = ops::load_key(&key)?;
-            let text = match (text, text_file) {
-                (Some(t), _) => t,
-                (None, Some(f)) => std::fs::read_to_string(f)?,
-                (None, None) => bail!("give --text or --text-file"),
-            };
-            let signed = ops::make_question(&keys, &text, allow_fine_tuned, max_steps)?;
-            let body: QuestionBody = signed.open(DOMAIN_QUESTION)?;
-            write_json(&out, &signed)?;
-            println!("question id {}", signed.id());
-            println!("text sha256 {}", sha256_hex(body.text.as_bytes()));
-            println!("wrote {}; send it to the auditee", out.display());
+impl Conn {
+    async fn open(base: &url::Url) -> Result<Self> {
+        let host = base.host_str().ok_or_else(|| anyhow!("URL has no host"))?.to_string();
+        let https = base.scheme() == "https";
+        let port = base.port_or_known_default().unwrap_or(443);
+        let tcp = tokio::net::TcpStream::connect((host.as_str(), port)).await.with_context(|| format!("connecting to {host}:{port}"))?;
+        let host_header = match base.port() {
+            Some(p) => format!("{host}:{p}"),
+            None => host.clone(),
+        };
+        if !https {
+            let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp)).await?;
+            tokio::spawn(conn);
+            return Ok(Self { sender, host: host_header, spki_sha256: None });
         }
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let capture = Arc::new(Capture { provider: provider.clone(), cert: Mutex::new(None) });
+        let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()?
+            .dangerous()
+            .with_custom_certificate_verifier(capture.clone())
+            .with_no_client_auth();
+        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let name = ServerName::try_from(host.clone())?;
+        let tls = tokio_rustls::TlsConnector::from(Arc::new(cfg)).connect(name, tcp).await.context("TLS handshake")?;
+        let cert = capture.cert.lock().unwrap().clone().ok_or_else(|| anyhow!("server sent no certificate"))?;
+        let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls)).await?;
+        tokio::spawn(conn);
+        Ok(Self { sender, host: host_header, spki_sha256: Some(spki_sha256_of_cert(&cert)?) })
+    }
 
-        Cmd::Info { enclave, policy } => {
-            let v = ops::attest_enclave(&enclave, &policy.policy()?)?;
-            warn_all(&v.warnings);
-            if let Some(d) = &v.doc {
-                println!("verified Nitro enclave, PCR0 {}", d.pcr_hex(0));
+    async fn call(&mut self, method: &str, path: &str, token: Option<&str>, body: Option<(Vec<u8>, &str)>) -> Result<Value> {
+        let mut req = hyper::Request::builder().method(method).uri(path).header("host", &self.host);
+        if let Some(t) = token {
+            req = req.header("authorization", format!("Bearer {t}"));
+        }
+        let body = match body {
+            Some((b, ctype)) => {
+                req = req.header("content-type", ctype);
+                Full::new(Bytes::from(b))
             }
-            println!("{}", serde_json::to_string_pretty(&v.info)?);
+            None => Full::new(Bytes::new()),
+        };
+        let resp = self.sender.send_request(req.body(body)?).await?;
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await?.to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({"error": String::from_utf8_lossy(&bytes)}));
+        if !status.is_success() {
+            bail!("{method} {path}: HTTP {}: {}", status.as_u16(), v["error"].as_str().unwrap_or("error"));
+        }
+        Ok(v)
+    }
+
+    /// Fresh attestation, checked against the policy, and bound to this TLS session.
+    async fn attest(&mut self, policy: &EnclavePolicy) -> Result<VerifiedEnclave> {
+        let nonce: [u8; 32] = rand::random();
+        let v = self.call("GET", &format!("/api/attestation?nonce={}", hex::encode(nonce)), None, None).await?;
+        let a: AttestationResponse = serde_json::from_value(v)?;
+        let ve = verify_enclave(&a.enclave_info_json, a.document_b64.as_deref(), Some(&nonce), policy)?;
+        if ve.info.mode == "nitro" {
+            let want = ve.info.tls_spki_sha256.as_deref().ok_or_else(|| anyhow!("enclave did not commit to a TLS key"))?;
+            let got = self.spki_sha256.as_deref().ok_or_else(|| anyhow!("a Nitro enclave must be reached over https"))?;
+            if want != got {
+                bail!("TLS does not terminate in the attested enclave (server key {got}, attested {want}): something is in between");
+            }
+        }
+        Ok(ve)
+    }
+}
+
+fn print_enclave(v: &VerifiedEnclave) {
+    let i = &v.info;
+    match &v.doc {
+        Some(d) => println!("verified: AWS Nitro enclave, PCR0 {}", d.pcr_hex(0)),
+        None => println!("DEV MODE: nothing is attested"),
+    }
+    println!("source    {} @ {}", i.source_repo, i.source_commit);
+    println!("boot      {} ({} ms since epoch)", i.boot_id, i.booted_at_ms);
+    if let Some(s) = &i.tls_spki_sha256 {
+        println!("TLS key   {s} (this connection terminates inside the enclave)");
+    }
+    println!("harness   {} prompt {}", i.harness.version, i.harness.system_prompt_sha256);
+    for w in &v.warnings {
+        println!("warning   {w}");
+    }
+}
+
+// ------------------------------------------------------------------ commands
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    match Cli::parse().cmd {
+        Cmd::VerifyService { url, policy, json } => {
+            let base = url::Url::parse(&url).context("URL")?;
+            let mut c = Conn::open(&base).await?;
+            let v = c.attest(&policy.policy()?).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&json!({"info": v.info, "pcr0": v.doc.as_ref().map(|d| d.pcr_hex(0)), "warnings": v.warnings}))?);
+            } else {
+                print_enclave(&v);
+            }
         }
 
-        Cmd::Submit {
-            enclave, key, question, dir, org, provider, model, api_key_env, repo_url, git_commit,
-            allow_dirty, zdr, mock_endpoint, yes, wait, out_dir, policy,
-        } => {
-            let policy = policy.policy()?;
-            let keys = ops::load_key(&key)?;
-            let question: Signed = read_json(&question)?;
-            let qbody: QuestionBody = question.open(DOMAIN_QUESTION).context("question signature")?;
-            let api_key = std::env::var(&api_key_env).map_err(|_| anyhow!("set {api_key_env} to your API key"))?;
-
-            let prepared = ops::prepare(&dir)?;
-            if prepared.git.dirty && !allow_dirty {
+        Cmd::Upload { link, dir, org, repo_url, git_commit, allow_dirty, policy } => {
+            let u = url::Url::parse(&link).context("link")?;
+            let token = u.fragment().filter(|t| !t.is_empty()).ok_or_else(|| anyhow!("the link has no token after #"))?.to_string();
+            let sid = u.path().strip_prefix("/s/").ok_or_else(|| anyhow!("not a session link (expected /s/ID#TOKEN)"))?.to_string();
+            let git = bundle::git_info(&dir);
+            if git.dirty && !allow_dirty {
                 bail!("{} has uncommitted changes to tracked files; commit them or pass --allow-dirty", dir.display());
             }
-            let repo_url = repo_url.or(prepared.git.remote.clone());
-            let git_commit = git_commit.or(prepared.git.head.clone());
+            let files = bundle::collect(&dir)?;
+            let (tar, tree) = bundle::tar_and_hash(&files)?;
+            let total: usize = files.iter().map(|(_, b)| b.len()).sum();
 
-            let enclave_v = ops::attest_enclave(&enclave, &policy)?;
-            warn_all(&enclave_v.warnings);
+            let mut c = Conn::open(&u).await?;
+            let v = c.attest(&policy.policy()?).await?;
+            print_enclave(&v);
+            let view = c.call("GET", &format!("/api/sessions/{sid}"), Some(&token), None).await?;
+            if view["role"] != "auditee" {
+                bail!("this is not an auditee link");
+            }
+            eprintln!("uploading {} files, {} bytes, tree {tree}", files.len(), total);
+            let r = c.call("PUT", &format!("/api/sessions/{sid}/code"), Some(&token), Some((tar, "application/x-tar"))).await?;
+            if r["tree_sha256"] != json!(tree) {
+                bail!("the enclave computed tree {} but the local tree is {tree}", r["tree_sha256"]);
+            }
+            println!("uploaded: tree {tree} ({} files)", files.len());
+            match org {
+                Some(org) => {
+                    let body = json!({
+                        "organization": org,
+                        "repo_url": repo_url.or(git.remote),
+                        "git_commit": git_commit.or(git.head),
+                        "tree_sha256": tree,
+                    });
+                    let a = c.call("POST", &format!("/api/sessions/{sid}/affidavit"), Some(&token), Some((serde_json::to_vec(&body)?, "application/json"))).await?;
+                    println!("affidavit confirmed:\n  {}", a["statement"].as_str().unwrap_or(""));
+                }
+                None => println!("next: confirm the affidavit in the web page, or rerun with --org \"Your Org\""),
+            }
+        }
 
-            let statement = ops::affidavit_statement(&org, &prepared.tree, repo_url.as_deref(), git_commit.as_deref());
-            eprintln!("\nQuestion ({}):\n  {}\n", question.id(), qbody.text.replace('\n', "\n  "));
-            eprintln!("Code: {} files, {} bytes, tree {}", prepared.file_count, prepared.total_bytes, prepared.tree);
-            eprintln!("Model: {} {} (the auditor will see this, and the API key's organization)", provider.as_str(), model);
-            eprintln!("Enclave: {} boot {}\n", enclave_v.info.mode, enclave_v.info.boot_id);
-            eprintln!("Affidavit:\n  {statement}\n");
-            if !yes {
-                eprint!("Sign the affidavit and submit? Type 'yes': ");
-                let mut s = String::new();
-                std::io::stdin().read_line(&mut s)?;
-                if s.trim() != "yes" {
-                    bail!("aborted");
+        Cmd::Verify { certificate, policy, json } => {
+            let cert: Certificate = serde_json::from_str(&std::fs::read_to_string(&certificate)?).context("certificate JSON")?;
+            let v = verify_certificate(&cert, &policy.policy()?)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&json!({"body": v.body, "flags": v.warnings, "enclave_warnings": v.enclave.warnings}))?);
+                return Ok(());
+            }
+            print_enclave(&v.enclave);
+            let m = &v.body.manifest;
+            println!();
+            println!("session   {} run {} (#{})", m.session_id, m.run_id, m.run_number);
+            println!("question  v{}: {}", m.question.version, m.question.text);
+            println!("auditee   {} — {} @ {}", m.affidavit.organization, m.affidavit.repo_url.as_deref().unwrap_or("-"), m.affidavit.git_commit.as_deref().unwrap_or("-"));
+            println!("code      {} files, {} bytes, tree {}", m.code.file_count, m.code.total_bytes, m.code.tree_sha256);
+            println!("model     {} via {} (chosen by {:?}; reported {}; key owner {})", m.model.requested_model, m.model.endpoint, m.model.proposed_by,
+                if m.model.response_models.is_empty() { "-".into() } else { m.model.response_models.join(", ") }, m.model.key_owner.as_deref().unwrap_or("not reported"));
+            println!("activity  {} model calls, {} files read, {}+{} tokens", m.activity.llm_calls, m.activity.files_read, m.activity.input_tokens, m.activity.output_tokens);
+            match &v.body.verdict {
+                Some(vd) => {
+                    println!("\nverdict: {:?} (confidence {:.2})\n{}", vd.answer, vd.confidence, vd.summary);
+                    if let Some(c) = &vd.clarification_request {
+                        println!("clarification requested: {c}");
+                    }
+                }
+                None => println!("\nno verdict ({:?})", m.outcome),
+            }
+            if !v.warnings.is_empty() {
+                println!("\nweigh these:");
+                for w in &v.warnings {
+                    println!("  - {w}");
                 }
             }
-            let run_id = ops::submit(ops::SubmitArgs {
-                enclave: &enclave,
-                enclave_v: &enclave_v,
-                keys: &keys,
-                question: &question,
-                prepared,
-                org,
-                provider,
-                model,
-                api_key,
-                repo_url,
-                git_commit,
-                zdr,
-                mock_endpoint,
-            })?;
-            println!("run {run_id}");
-            if wait {
-                fetch(&enclave, &keys, &run_id, &out_dir, &enclave_v, &policy)?;
-            } else {
-                println!("fetch with: attest fetch --enclave {enclave} --key {} --run {run_id}", key.display());
-            }
         }
-
-        Cmd::Fetch { enclave, key, run, out_dir, policy } => {
-            let policy = policy.policy()?;
-            let v = ops::attest_enclave(&enclave, &policy)?;
-            warn_all(&v.warnings);
-            fetch(&enclave, &ops::load_key(&key)?, &run, &out_dir, &v, &policy)?;
-        }
-
-        Cmd::Verify { certificate, question, json, policy } => {
-            let cert: Certificate = read_json(&certificate)?;
-            let q: Option<Signed> = question.as_deref().map(read_json).transpose()?;
-            if q.is_none() {
-                eprintln!("note: no --question given, so this only shows the certificate answers *some* question");
-            }
-            let v = ops::verify(&cert, &policy.policy()?, q.as_ref())?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&v.body)?);
-            } else {
-                report::print(&v);
-            }
-        }
-
-        Cmd::Log { enclave, question, auditee, policy } => {
-            let policy = policy.policy()?;
-            let q: Option<Signed> = question.as_deref().map(read_json).transpose()?;
-            let query = match (&q, &auditee) {
-                (Some(s), _) => ops::LogQuery::Question(s),
-                (None, Some(a)) => ops::LogQuery::Auditee(a),
-                _ => bail!("give --question or --auditee"),
-            };
-            let (v, body) = ops::fetch_log(&enclave, &policy, query)?;
-            warn_all(&v.warnings);
-            report::print_log(&body);
-        }
-
-        Cmd::Ui { workspace, port, enclave, open } => ui::run(workspace, port, enclave, open)?,
     }
-    Ok(())
-}
-
-fn fetch(enclave: &str, keys: &ops::Keys, run: &str, out_dir: &Path, enclave_v: &VerifiedEnclave, policy: &EnclavePolicy) -> Result<()> {
-    let mut last = u32::MAX;
-    let status = loop {
-        let s = ops::poll(enclave, run)?;
-        if s.result_age_b64.is_some() {
-            break s;
-        }
-        if s.status == RunStatus::Failed {
-            bail!("run failed before producing a result");
-        }
-        if s.steps != last {
-            eprintln!("  {:?}: {} model calls", s.status, s.steps);
-            last = s.steps;
-        }
-        std::thread::sleep(Duration::from_secs(3));
-    };
-    let result = ops::open_result(&status, keys, Some(&serde_json::to_string(&enclave_v.info)?))?;
-
-    let dir = out_dir.join(run);
-    std::fs::create_dir_all(&dir)?;
-    write_json(&dir.join("certificate.json"), &result.certificate)?;
-    write_json(&dir.join("trace.json"), &result.trace)?;
-    std::fs::write(dir.join("transcript.md"), report::transcript_markdown(&result.trace))?;
-
-    let v = ops::verify(&result.certificate, policy, None)?;
-    report::print(&v);
-    println!("\nwrote {}/{{certificate.json, trace.json, transcript.md}}", dir.display());
-    println!("Only certificate.json is meant for the auditor. Read transcript.md and the summary above before releasing it.");
     Ok(())
 }

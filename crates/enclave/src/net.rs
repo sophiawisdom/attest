@@ -88,7 +88,29 @@ impl Net {
         Ok(s)
     }
 
-    /// One HTTP/1.1 request on a fresh connection.
+    /// TLS handshake with `host` without trusting its certificate, returning
+    /// the sha256 of its SubjectPublicKeyInfo.
+    pub async fn peer_spki_sha256(&self, host: &str, port: u16) -> Result<String> {
+        let raw = tokio::time::timeout(Duration::from_secs(15), self.tunnel(host, port))
+            .await
+            .map_err(|_| anyhow!("timeout"))??;
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let capture = Arc::new(Capture { provider: provider.clone(), cert: std::sync::Mutex::new(None) });
+        let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()?
+            .dangerous()
+            .with_custom_certificate_verifier(capture.clone())
+            .with_no_client_auth();
+        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let name = rustls::pki_types::ServerName::try_from(host.to_string())?;
+        tokio::time::timeout(Duration::from_secs(15), tokio_rustls::TlsConnector::from(Arc::new(cfg)).connect(name, raw))
+            .await
+            .map_err(|_| anyhow!("TLS timeout"))??;
+        let cert = capture.cert.lock().unwrap().clone().ok_or_else(|| anyhow!("no certificate"))?;
+        attest_core::spki_sha256_of_cert(&cert)
+    }
+
+    /// JSON POST on a fresh connection.
     pub async fn request(
         &self,
         https: bool,
@@ -99,13 +121,33 @@ impl Net {
         body: Vec<u8>,
         timeout: Duration,
     ) -> Result<HttpResponse> {
-        tokio::time::timeout(timeout, self.request_inner(https, host, port, path, headers, body))
+        let mut h: Vec<(&str, &str)> = vec![("content-type", "application/json")];
+        h.extend_from_slice(headers);
+        self.request_full("POST", https, host, port, path, &h, body, timeout).await
+    }
+
+    /// Any HTTP/1.1 request on a fresh connection.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_full(
+        &self,
+        method: &str,
+        https: bool,
+        host: &str,
+        port: u16,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<HttpResponse> {
+        tokio::time::timeout(timeout, self.request_inner(method, https, host, port, path, headers, body))
             .await
             .map_err(|_| anyhow!("request to {host} timed out"))?
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn request_inner(
         &self,
+        method: &str,
         https: bool,
         host: &str,
         port: u16,
@@ -131,7 +173,8 @@ impl Net {
         tokio::spawn(async move {
             let _ = conn.await;
         });
-        let mut req = hyper::Request::post(path).header("host", host).header("content-type", "application/json");
+        let host_header = if (https && port == 443) || (!https && port == 80) { host.to_string() } else { format!("{host}:{port}") };
+        let mut req = hyper::Request::builder().method(method).uri(path).header("host", host_header);
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
@@ -149,5 +192,45 @@ impl Net {
             .to_bytes()
             .to_vec();
         Ok(HttpResponse { status, headers, body })
+    }
+}
+
+/// Accepts any certificate and records it (used only to recognise ourselves).
+#[derive(Debug)]
+struct Capture {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    cert: std::sync::Mutex<Option<Vec<u8>>>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for Capture {
+    fn verify_server_cert(
+        &self,
+        end: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        *self.cert.lock().unwrap() = Some(end.to_vec());
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        m: &[u8],
+        c: &rustls::pki_types::CertificateDer<'_>,
+        d: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(m, c, d, &self.provider.signature_verification_algorithms)
+    }
+    fn verify_tls13_signature(
+        &self,
+        m: &[u8],
+        c: &rustls::pki_types::CertificateDer<'_>,
+        d: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(m, c, d, &self.provider.signature_verification_algorithms)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
     }
 }

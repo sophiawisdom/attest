@@ -1,0 +1,635 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>attest</title>
+<link rel="alternate" type="text/markdown" href="/agents.md" title="Guide for agents">
+<style>
+:root {
+  --bg: #f6f5f1; --panel: #ffffff; --sunken: #efede7; --ink: #1b1a17; --ink-2: #57544c; --ink-3: #8a867c;
+  --line: #e2dfd6; --line-2: #d3cfc3; --accent: #2f4fd8; --accent-ink: #fff; --accent-soft: #e8ecfc;
+  --ok: #1d7a4a; --ok-soft: #e3f3ea; --warn: #9a5b00; --warn-soft: #fbf0dc; --bad: #b3261e; --bad-soft: #fbe6e4;
+  --shadow: 0 1px 2px rgba(27,26,23,.06), 0 4px 16px rgba(27,26,23,.05); --radius: 10px;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", system-ui, sans-serif;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #141412; --panel: #1c1c19; --sunken: #232320; --ink: #ecebe6; --ink-2: #b4b1a7; --ink-3: #85827a;
+    --line: #2e2d29; --line-2: #3b3a35; --accent: #7d96ff; --accent-ink: #0e1330; --accent-soft: #232a48;
+    --ok: #5fc48f; --ok-soft: #17301f; --warn: #e3a547; --warn-soft: #33270f; --bad: #f08a80; --bad-soft: #3a1c19;
+    --shadow: 0 1px 2px rgba(0,0,0,.4); color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 var(--sans); }
+button, input, select, textarea { font: inherit; color: inherit; }
+a { color: var(--accent); }
+code, .mono { font-family: var(--mono); font-size: 12.5px; }
+h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: -0.01em; }
+h1 { font-size: 24px; } h2 { font-size: 16px; }
+h3 { font-size: 11.5px; text-transform: uppercase; letter-spacing: .07em; color: var(--ink-3); }
+p { margin: 0; }
+.top { position: sticky; top: 0; z-index: 10; display: flex; align-items: center; gap: 14px; padding: 10px 20px;
+  background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.brand { font-weight: 700; font-size: 16px; letter-spacing: -0.02em; display: flex; align-items: center; gap: 8px; color: var(--ink); text-decoration: none; }
+.brand .mark { width: 22px; height: 22px; border-radius: 6px; background: var(--ink); color: var(--bg); display: grid; place-items: center; font-size: 13px; }
+.spacer { flex: 1; }
+.chip { display: inline-flex; align-items: center; gap: 7px; border: 1px solid var(--line); background: var(--panel); border-radius: 999px; padding: 4px 12px 4px 10px; font-size: 13px; color: var(--ink-2); cursor: pointer; max-width: 100%; }
+.chip .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3); flex: none; display: inline-block; }
+.dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.bad { background: var(--bad); }
+.dot.run { background: var(--accent); animation: pulse 1.4s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .35; } }
+.wrap { max-width: 1180px; margin: 0 auto; padding: 22px 20px 60px; }
+.grid { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 20px; align-items: start; }
+@media (max-width: 920px) { .grid { grid-template-columns: minmax(0, 1fr); } .wrap { padding: 14px 16px 40px; } }
+.col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); min-width: 0; }
+.pad { padding: 18px 20px; }
+.stack { display: flex; flex-direction: column; gap: 12px; }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.muted { color: var(--ink-2); } .faint { color: var(--ink-3); } .small { font-size: 12.5px; }
+.card-head { display: flex; align-items: center; gap: 10px; padding: 14px 20px; border-bottom: 1px solid var(--line); }
+.card-head .n { width: 24px; height: 24px; border-radius: 50%; background: var(--sunken); border: 1px solid var(--line-2); display: grid; place-items: center; font-weight: 600; font-size: 12px; color: var(--ink-2); flex: none; }
+.card-head .n.done { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+.card-head h2 { flex: 1; }
+.btn { text-decoration: none; color: var(--ink); border: 1px solid var(--line-2); background: var(--panel); border-radius: 8px; padding: 7px 14px; cursor: pointer; font-weight: 500; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.btn:hover { background: var(--sunken); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.btn.primary:hover { filter: brightness(1.07); }
+.btn.danger { color: var(--bad); }
+.btn.ghost { border-color: transparent; background: transparent; color: var(--ink-2); }
+.btn.big { padding: 11px 20px; font-size: 15px; }
+.btn[disabled] { opacity: .5; cursor: not-allowed; filter: none; }
+.spin { width: 13px; height: 13px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin .7s linear infinite; display: inline-block; }
+@keyframes spin { to { transform: rotate(360deg); } }
+label.f { display: flex; flex-direction: column; gap: 6px; font-weight: 500; font-size: 13px; min-width: 0; }
+label.f .hint { font-weight: 400; color: var(--ink-3); font-size: 12.5px; }
+input[type=text], input[type=password], input[type=number], input[type=email], select, textarea {
+  width: 100%; border: 1px solid var(--line-2); background: var(--panel); border-radius: 8px; padding: 8px 10px; outline: none; }
+::placeholder { color: var(--ink-3); opacity: .85; }
+textarea { resize: vertical; min-height: 96px; line-height: 1.5; }
+input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.check { display: flex; gap: 10px; align-items: flex-start; cursor: pointer; font-size: 13.5px; }
+.check input { margin-top: 3px; accent-color: var(--accent); width: 15px; height: 15px; flex: none; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 640px) { .grid2 { grid-template-columns: 1fr; } }
+.seg { display: inline-flex; background: var(--sunken); border: 1px solid var(--line); border-radius: 9px; padding: 2px; flex-wrap: wrap; }
+.seg button { border: 0; background: transparent; padding: 5px 12px; border-radius: 7px; cursor: pointer; color: var(--ink-2); font-weight: 500; }
+.seg button[aria-pressed="true"] { background: var(--panel); color: var(--ink); box-shadow: var(--shadow); }
+.pills { display: flex; flex-wrap: wrap; gap: 6px; }
+.pill { display: inline-flex; gap: 5px; align-items: center; border: 1px solid var(--line); background: var(--sunken); border-radius: 6px; padding: 2px 8px; font-size: 12.5px; color: var(--ink-2); max-width: 100%; overflow-wrap: anywhere; }
+.pill b { color: var(--ink); font-weight: 600; }
+.pill.ok { background: var(--ok-soft); color: var(--ok); border-color: transparent; }
+.pill.warn { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+.pill.bad { background: var(--bad-soft); color: var(--bad); border-color: transparent; }
+.pill.run { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+.callout { border-radius: 9px; padding: 11px 14px; display: flex; gap: 10px; align-items: flex-start; font-size: 13.5px; }
+.callout .ic { flex: none; font-weight: 700; width: 16px; text-align: center; }
+.callout.info { background: var(--accent-soft); }
+.callout.warn { background: var(--warn-soft); color: color-mix(in srgb, var(--warn) 70%, var(--ink)); }
+.callout.bad { background: var(--bad-soft); color: color-mix(in srgb, var(--bad) 75%, var(--ink)); }
+.callout.ok { background: var(--ok-soft); color: color-mix(in srgb, var(--ok) 70%, var(--ink)); }
+.quote { margin: 0; padding: 12px 14px; border-left: 3px solid var(--ink); background: var(--sunken); border-radius: 0 8px 8px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.quote.serif { font-family: Georgia, "Iowan Old Style", serif; font-size: 14.5px; line-height: 1.6; }
+.qtext { font-size: 16.5px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.banner { display: flex; gap: 12px; align-items: center; padding: 14px 18px; }
+.banner .say { font-size: 15px; font-weight: 500; }
+.linkbox { display: flex; gap: 8px; align-items: stretch; }
+.linkbox input { font-family: var(--mono); font-size: 12px; }
+.answer { font-size: 40px; font-weight: 700; letter-spacing: -0.03em; line-height: 1; }
+.answer.small { font-size: 26px; color: var(--ink-2); }
+.meter { height: 6px; background: var(--sunken); border-radius: 999px; overflow: hidden; width: 150px; }
+.meter i { display: block; height: 100%; background: var(--ink); border-radius: 999px; }
+.summary { font-size: 15px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
+.flags { display: flex; flex-direction: column; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.flags li { display: flex; gap: 10px; align-items: flex-start; padding: 8px 12px; background: var(--warn-soft); border-radius: 8px; font-size: 13.5px; overflow-wrap: anywhere; }
+.flags li::before { content: "!"; flex: none; width: 18px; height: 18px; border-radius: 50%; background: var(--warn); color: var(--panel); font-weight: 700; font-size: 12px; display: grid; place-items: center; margin-top: 1px; }
+.run { border-top: 1px solid var(--line); }
+.run:first-child { border-top: 0; }
+.kv { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 12px; font-size: 13px; }
+.kv dt { color: var(--ink-3); } .kv dd { margin: 0; overflow-wrap: anywhere; }
+.hash { font-family: var(--mono); font-size: 12px; cursor: copy; border-bottom: 1px dotted var(--ink-3); }
+.tx { display: flex; flex-direction: column; gap: 8px; max-height: 560px; overflow: auto; padding: 4px 2px; }
+.ev { display: grid; grid-template-columns: 68px minmax(0, 1fr); gap: 10px; }
+.ev .who { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-3); padding-top: 3px; font-weight: 600; }
+.ev .what { min-width: 0; }
+.call { display: inline-flex; gap: 6px; align-items: baseline; background: var(--accent-soft); border-radius: 6px; padding: 2px 8px; font-family: var(--mono); font-size: 12px; margin: 2px 6px 2px 0; max-width: 100%; overflow-wrap: anywhere; }
+.call b { color: var(--accent); }
+pre.out { margin: 6px 0 0; background: var(--sunken); border-radius: 8px; padding: 10px 12px; overflow: auto; max-height: 320px; font-size: 12px; line-height: 1.45; }
+details > summary { cursor: pointer; color: var(--ink-2); }
+.feed { display: flex; flex-direction: column; gap: 10px; max-height: 420px; overflow: auto; }
+.feed .e { font-size: 13px; display: grid; grid-template-columns: 54px 1fr; gap: 8px; }
+.feed .e .t { color: var(--ink-3); font-size: 12px; }
+.drop { border: 1.5px dashed var(--line-2); border-radius: 10px; padding: 16px; text-align: center; color: var(--ink-2); cursor: pointer; }
+.drop:hover { border-color: var(--accent); background: var(--accent-soft); }
+.progress { height: 6px; background: var(--sunken); border-radius: 999px; overflow: hidden; }
+.progress i { display: block; height: 100%; background: var(--accent); width: 0; transition: width .2s; }
+.toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--bg); padding: 9px 16px; border-radius: 9px; z-index: 30; font-size: 13.5px; box-shadow: var(--shadow); max-width: calc(100vw - 32px); }
+.toast.err { background: var(--bad); color: #fff; }
+.hero { max-width: 760px; margin: 30px auto 0; display: flex; flex-direction: column; gap: 22px; }
+.hero h1 { font-size: 34px; letter-spacing: -0.03em; line-height: 1.15; }
+.hero .lead { font-size: 17px; line-height: 1.6; color: var(--ink-2); }
+.steps3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+@media (max-width: 720px) { .steps3 { grid-template-columns: 1fr; } .hero h1 { font-size: 27px; } }
+.steps3 .s { padding: 14px 16px; }
+.steps3 .s b { display: block; margin-bottom: 4px; }
+.foot { color: var(--ink-3); font-size: 12.5px; display: flex; gap: 14px; flex-wrap: wrap; justify-content: center; margin-top: 30px; }
+</style>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="/"><span class="mark">a</span>attest</a>
+  <span id="who"></span>
+  <span class="spacer"></span>
+  <button class="chip" id="encChip" data-act="show-verify"><i class="dot"></i><span class="t">…</span></button>
+</header>
+<main class="wrap" id="app"></main>
+<div id="toastHost"></div>
+<script>
+"use strict";
+// ---------------------------------------------------------------- utilities
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const hash = (h, n = 12) => h ? `<span class="hash" data-copy="${esc(h)}" title="${esc(h)} (click to copy)">${esc(String(h).slice(0, n))}…</span>` : "—";
+const bytes = (n) => { n = Number(n || 0); const u = ["B", "KB", "MB", "GB"]; let i = 0; while (n >= 1024 && i < 3) { n /= 1024; i++; } return (i ? n.toFixed(1) : n) + " " + u[i]; };
+const num = (n) => Number(n || 0).toLocaleString();
+const cap = (s) => s ? s[0].toUpperCase() + s.slice(1) : s;
+function ago(ms) {
+  if (!ms) return ""; const s = Math.round((Date.now() - ms) / 1000);
+  if (s < 45) return "just now"; if (s < 3600) return Math.round(s / 60) + " min ago"; if (s < 86400) return Math.round(s / 3600) + " h ago";
+  return new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+const clock = (ms) => new Date(ms).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+function toast(msg, err = false) {
+  const t = document.createElement("div"); t.className = "toast" + (err ? " err" : ""); t.textContent = msg;
+  $("#toastHost").replaceChildren(t); setTimeout(() => t.remove(), err ? 7000 : 2600);
+}
+async function busy(btn, fn) {
+  if (!btn || btn.disabled) return fn();
+  const html = btn.innerHTML; btn.disabled = true; btn.innerHTML = `<i class="spin"></i>${html}`;
+  try { return await fn(); } catch (e) { toast(e.message, true); } finally { btn.disabled = false; btn.innerHTML = html; }
+}
+const S = { sid: null, token: null, view: null, info: null, traces: {}, last: {}, polling: false };
+async function api(path, { method = "GET", body, raw, timeout } = {}) {
+  const headers = {};
+  const ctl = new AbortController(); const timer = timeout ? setTimeout(() => ctl.abort(), timeout) : null;
+  if (S.token) headers.authorization = "Bearer " + S.token;
+  if (body !== undefined && !raw) headers["content-type"] = "application/json";
+  let r;
+  try { r = await fetch(path, { method, headers, signal: ctl.signal, body: raw ? body : body === undefined ? undefined : JSON.stringify(body) }); }
+  finally { if (timer) clearTimeout(timer); }
+  let j; try { j = await r.json(); } catch { j = { error: r.statusText || "unexpected response" }; }
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+const sapi = (p, opts) => api(`/api/sessions/${S.sid}${p}`, opts);
+document.addEventListener("click", (e) => {
+  const c = e.target.closest("[data-copy]");
+  if (c) { navigator.clipboard?.writeText(c.dataset.copy).then(() => toast("Copied")); }
+});
+/** Replace a container's HTML, keeping elements marked data-keep (live forms). */
+function patch(id, html) {
+  const el = document.getElementById(id); if (!el) return;
+  if (S.last[id] === html) return; S.last[id] = html;
+  const tmp = document.createElement("div"); tmp.innerHTML = html;
+  for (const k of $$("[data-keep]", tmp)) { const old = el.querySelector(`[data-keep="${k.dataset.keep}"]`); if (old) k.replaceWith(old); }
+  el.replaceChildren(...tmp.childNodes);
+}
+
+// ---------------------------------------------------------------- enclave chip / verify
+async function loadInfo() {
+  try { S.info = await api("/api/info"); } catch { S.info = null; }
+  const i = S.info, chip = $("#encChip");
+  if (!i) { chip.innerHTML = `<i class="dot bad"></i><span class="t">Enclave unreachable</span>`; return; }
+  const dev = i.mode === "dev";
+  chip.innerHTML = `<i class="dot ${dev ? "warn" : "ok"}"></i><span class="t">${dev ? "Dev mode · not attested" : `Nitro enclave · ${esc(i.source_commit.slice(0, 7))}`}</span>`;
+}
+function verifyPanel() {
+  const i = S.info; if (!i) return "";
+  const host = location.host;
+  return `<div class="panel pad stack" id="verify">
+    <h3>Verify this service</h3>
+    ${i.mode === "dev" ? `<div class="callout warn"><span class="ic">!</span><span>Dev mode: nothing is attested. For testing only.</span></div>` : ""}
+    <p class="small muted">This page and the API come from inside the enclave. A browser can't check that on its own, so have an agent or the CLI verify it before you upload code or trust a result.</p>
+    <dl class="kv">
+      <dt>source</dt><dd><a href="${esc(i.source_repo)}/tree/${esc(i.source_commit)}" target="_blank" rel="noopener">${esc(i.source_commit.slice(0, 12))}</a></dd>
+      <dt>boot</dt><dd>${hash(i.boot_id, 8)} · ${esc(ago(i.booted_at_ms))}</dd>
+      <dt>TLS key</dt><dd>${i.tls_spki_sha256 ? hash(i.tls_spki_sha256) : "—"}</dd>
+      <dt>harness</dt><dd>${esc(i.harness.version)}</dd>
+    </dl>
+    <div class="small">Agents: <a href="/agents.md">/agents.md</a> explains the protocol and how to check the attestation.</div>
+    <div class="linkbox"><input type="text" readonly value="attest verify-service https://${esc(host)} --pcrs pcrs.json"><button class="btn" data-copy="attest verify-service https://${esc(host)} --pcrs pcrs.json">Copy</button></div>
+  </div>`;
+}
+
+// ---------------------------------------------------------------- landing
+function landing() {
+  $("#who").innerHTML = "";
+  $("#app").innerHTML = `<div class="hero">
+    <h1>Answer questions about your code without showing it.</h1>
+    <p class="lead">An auditor asks a question. A model reads your code inside an attested AWS Nitro enclave and answers. You watch everything it does and decide whether the auditor sees the answer. Neither side sees the other's API key. Apart from you, only the model provider you approve receives the code.</p>
+    <div class="steps3">
+      <div class="panel s"><b>1. Start a session</b><span class="muted small">You get two private links. Send the auditor theirs over a channel you already trust, such as Signal.</span></div>
+      <div class="panel s"><b>2. Agree on the question</b><span class="muted small">The auditor asks; you accept, upload your code, confirm an affidavit, and approve the model.</span></div>
+      <div class="panel s"><b>3. Release or decline</b><span class="muted small">You read the result and the full transcript first. The auditor gets a signed certificate if you release it.</span></div>
+    </div>
+    <div id="created"><div class="row"><button class="btn primary big" data-act="create">Start a session</button><span class="faint small">You'll be the auditee (the party whose code is examined).</span></div></div>
+    <div class="foot"><a href="/agents.md">Guide for agents</a><a href="https://github.com/sophiawisdom/attest" target="_blank" rel="noopener">Source on GitHub</a><a href="#" data-act="show-verify">Verify this service</a></div>
+    <div id="landingVerify"></div>
+  </div>`;
+}
+async function createSession(btn) {
+  await busy(btn, async () => {
+    const r = await api("/api/sessions", { method: "POST", body: {} });
+    $("#created").innerHTML = `<div class="panel pad stack">
+      <h2>Session created</h2>
+      <div class="callout warn"><span class="ic">!</span><span>Save both links now. They can't be shown again, and anyone with a link acts as that party.</span></div>
+      <label class="f">Your link (auditee, keep private)<div class="linkbox"><input type="text" readonly value="${esc(r.auditee_link)}"><button class="btn" data-copy="${esc(r.auditee_link)}">Copy</button></div></label>
+      <label class="f">Auditor's link (send this to them)<div class="linkbox"><input type="text" readonly value="${esc(r.auditor_link)}"><button class="btn" data-copy="${esc(r.auditor_link)}">Copy</button></div></label>
+      <div class="row"><a class="btn primary" href="${esc(r.auditee_link)}">Open my session</a></div>
+    </div>`;
+  });
+}
+
+// ---------------------------------------------------------------- session shell
+function sessionShell() {
+  $("#app").innerHTML = `<div class="grid">
+    <div class="col">
+      <div class="panel" id="banner"></div>
+      <section class="panel" id="cQuestion"></section>
+      <section class="panel" id="cCode"></section>
+      <section class="panel" id="cModel"></section>
+      <section class="panel" id="cRuns"></section>
+    </div>
+    <aside class="col">
+      <div class="panel pad stack" id="cActivity"></div>
+      <div class="panel pad stack" id="cNotify"></div>
+      <div id="cVerify"></div>
+    </aside>
+  </div>`;
+}
+const isAuditee = () => S.view?.role === "auditee";
+function head(n, title, done, extra = "") {
+  return `<div class="card-head"><span class="n ${done ? "done" : ""}">${n}</span><h2>${title}</h2>${extra}</div>`;
+}
+function statusPill(s) {
+  const m = { proposed: ["warn", "waiting for auditee"], accepted: ["ok", "accepted"], rejected: ["bad", "rejected"], superseded: ["", "superseded"],
+    pending: ["warn", "waiting for auditee"], approved: ["ok", "approved"], running: ["run", "running"], awaiting_release: ["warn", "awaiting auditee"],
+    released: ["ok", "released"], declined: ["bad", "declined"] }[s] || ["", s];
+  return `<span class="pill ${m[0]}">${esc(m[1])}</span>`;
+}
+
+function render() {
+  const v = S.view; if (!v) return;
+  $("#who").innerHTML = `<span class="pill"><b>${isAuditee() ? "Auditee" : "Auditor"}</b> · session ${esc(v.session_id.slice(0, 8))}</span>`;
+  const running = v.runs.some(r => r.status === "running");
+  patch("banner", `<div class="banner"><i class="dot ${running ? "run" : v.next_actions.length ? "warn" : "ok"}"></i><div class="say">${esc(v.status)}</div></div>`);
+  renderQuestion(v); renderCode(v); renderModel(v); renderRuns(v); renderActivity(v); renderNotify(v);
+  patch("cVerify", verifyPanel());
+}
+
+// ---------------------------------------------------------------- question
+function renderQuestion(v) {
+  const q = v.questions[v.questions.length - 1];
+  const older = v.questions.slice(0, -1).reverse();
+  let body = "";
+  if (!q) body += `<p class="muted">${isAuditee() ? "Waiting for the auditor to ask a question." : "Ask something the code can answer. Be specific about what counts as yes."}</p>`;
+  else body += `<div class="stack" style="gap:8px"><div class="row">${statusPill(q.status)}<span class="faint small">version ${q.version} · ${esc(ago(q.asked_at_ms))} · step limit ${q.max_steps}${q.allow_fine_tuned ? " · fine-tuned models allowed" : ""}</span></div>
+    <p class="qtext">${esc(q.text)}</p>${q.note ? `<div class="callout ${q.status === "rejected" ? "bad" : "info"}"><span class="ic">“</span><span>${esc(q.note)}</span></div>` : ""}</div>`;
+  if (isAuditee() && q?.status === "proposed") {
+    body += `<div class="stack" data-keep="qdecide-${q.version}"><label class="f">Note to the auditor (optional)<input type="text" id="qNote" placeholder="e.g. please narrow this to the training service"></label>
+      <div class="row"><button class="btn primary" data-act="q-accept" data-v="${q.version}">Accept question</button><button class="btn danger" data-act="q-reject" data-v="${q.version}">Reject</button></div></div>`;
+  }
+  if (!isAuditee()) {
+    const canAsk = !q || q.status !== "proposed";
+    const clar = v.runs.find(r => r.verdict?.answer === "needs_clarification" && r.status === "released");
+    if (canAsk || q?.status === "proposed") {
+      const open = !q || q.status === "rejected" || !!clar;
+      body += `<details data-keep="qform" ${open ? "open" : ""}><summary>${q ? "Revise the question" : "Your question"}</summary>
+        <div class="stack" style="margin-top:10px">
+          ${clar ? `<div class="callout info"><span class="ic">?</span><span>The agent asked for clarification: ${esc(clar.verdict.clarification_request)}</span></div>` : ""}
+          <textarea id="qText" placeholder="Does the training pipeline compute loss on chain-of-thought tokens of model outputs?">${q ? esc(q.text) : ""}</textarea>
+          <div class="grid2"><label class="f">Step limit<input type="number" id="qSteps" min="1" max="400" value="${q?.max_steps || 150}"></label>
+          <div class="f" style="justify-content:flex-end"><label class="check"><input type="checkbox" id="qFt" ${q?.allow_fine_tuned ? "checked" : ""}><span>Allow fine-tuned models<br><span class="faint small">A private fine-tune is the cheapest way to get a model that answers one question wrongly.</span></span></label></div></div>
+          <div class="row"><button class="btn primary" data-act="ask">${q ? "Send revised question" : "Send question"}</button><span class="faint small">The auditee must accept it.</span></div>
+        </div></details>`;
+    }
+  }
+  if (older.length) body += `<details><summary class="small">Earlier versions (${older.length})</summary><div class="stack" style="margin-top:8px">${older.map(o => `<div class="small"><span class="faint">v${o.version}</span> ${statusPill(o.status)} ${esc(o.text)}${o.note ? ` <span class="faint">— ${esc(o.note)}</span>` : ""}</div>`).join("")}</div></details>`;
+  patch("cQuestion", head(1, "Question", q?.status === "accepted") + `<div class="pad stack">${body}</div>`);
+}
+
+// ---------------------------------------------------------------- code & affidavit
+function renderCode(v) {
+  const c = v.code, a = v.affidavit, cur = a?.current;
+  let body = "";
+  if (c) body += `<div class="pills"><span class="pill"><b>${num(c.file_count)}</b> files</span><span class="pill"><b>${bytes(c.total_bytes)}</b></span><span class="pill">tree ${hash(c.tree_sha256)}</span><span class="pill">${esc(ago(c.uploaded_at_ms))}</span></div>`;
+  if (isAuditee()) {
+    const link = `${location.origin}/s/${S.sid}#${S.token}`;
+    const cmd = `attest upload '${link}' ~/path/to/repo`;
+    body += `<details data-keep="upload-${c ? c.tree_sha256 : "none"}" ${c ? "" : "open"}><summary>${c ? "Replace the code" : "Upload your code"}</summary><div class="stack" style="margin-top:10px">
+      <p class="small muted">Recommended: the CLI sends exactly your git-tracked files and checks the enclave's attestation first.</p>
+      <div class="linkbox"><input type="text" readonly value="${esc(cmd)}"><button class="btn" data-copy="${esc(cmd)}">Copy</button></div>
+      <p class="small muted">Or choose a folder here. Everything in it is sent except <code>.git</code>, including untracked files.</p>
+      <label class="drop"><input type="file" id="folder" webkitdirectory multiple hidden><b>Choose a folder</b></label>
+      <div id="upStatus"></div></div></details>`;
+    if (c) {
+      if (cur) body += `<div class="stack" style="gap:6px"><h3>Affidavit (confirmed)</h3><p class="quote serif">${esc(a.record.statement)}</p></div>`;
+      else body += `<div class="stack" data-keep="aff-${c.tree_sha256}"><h3>Affidavit</h3>
+        <div class="grid2"><label class="f">Organization<input type="text" id="aOrg" placeholder="Example Lab"></label><label class="f">Repository URL<input type="text" id="aRepo" placeholder="https://github.com/example/monorepo"></label></div>
+        <label class="f">Commit<input type="text" id="aCommit" placeholder="git rev-parse HEAD"></label>
+        <p class="quote serif" id="aStmt">${esc(statement("", c.tree_sha256, "", ""))}</p>
+        <label class="check"><input type="checkbox" id="aSign"><span>I confirm this statement.</span></label>
+        <div class="row"><button class="btn primary" data-act="affidavit" data-tree="${c.tree_sha256}">Confirm affidavit</button><span class="faint small">The auditor sees it, and it goes in every certificate.</span></div></div>`;
+    }
+  } else {
+    if (!c) body += `<p class="muted">Waiting for the auditee to upload code. You'll see its size and hash, never its contents.</p>`;
+    else if (cur) body += `<div class="stack" style="gap:6px"><h3>Auditee's affidavit</h3><p class="quote serif">${esc(a.record.statement)}</p></div>`;
+    else body += `<p class="muted">Waiting for the auditee to confirm the affidavit.</p>`;
+  }
+  patch("cCode", head(2, "Code and affidavit", !!(c && cur)) + `<div class="pad stack">${body}</div>`);
+}
+function statement(org, tree, repo, commit) {
+  return `On behalf of ${org || "(organization)"}, I affirm that the code uploaded to this session (tree hash ${tree}) is a complete and unmodified copy of ${repo || "(repository not named)"} at commit ${commit || "(commit not named)"}, which is the source currently used in production for the systems the question concerns, and that no content in it was added, modified, or arranged with the intent of influencing the outcome of this or any automated audit.`;
+}
+
+// ---------------------------------------------------------------- model
+const PROVIDERS = [
+  { id: "anthropic", label: "Anthropic", ph: "claude-opus-5-5" },
+  { id: "openai", label: "OpenAI", ph: "gpt-5" },
+  { id: "openrouter", label: "OpenRouter", ph: "anthropic/claude-sonnet-5-5" },
+];
+function renderModel(v) {
+  const approved = [...v.models].reverse().find(m => m.status === "approved");
+  const providers = S.info?.mode === "dev" ? [...PROVIDERS, { id: "mock", label: "Mock (dev)", ph: "gpt-mock" }] : PROVIDERS;
+  let body = "";
+  const rows = [...v.models].reverse().filter(m => m.status !== "superseded");
+  if (rows.length) body += `<div class="stack" style="gap:8px">${rows.map(m => `<div class="row" style="justify-content:space-between">
+      <div class="row" style="gap:8px"><b>${esc(m.provider)} / ${esc(m.model)}</b>${statusPill(m.status)}${m.fine_tuned ? `<span class="pill warn">fine-tune</span>` : ""}<span class="faint small">key from the ${esc(m.proposed_by)}</span></div>
+      ${isAuditee() && m.status === "pending" ? `<div class="row"><button class="btn primary" data-act="m-approve" data-id="${m.id}">Approve</button><button class="btn danger" data-act="m-reject" data-id="${m.id}">Reject</button></div>` : ""}
+    </div>${m.note ? `<div class="small faint">“${esc(m.note)}”</div>` : ""}`).join("")}</div>`;
+  else body += `<p class="muted">${isAuditee() ? "Choose the model and API key the agent will use." : "The auditee usually chooses the model and key. You can offer your own instead; the auditee must approve it."}</p>`;
+  const pendingMine = v.models.some(m => m.status === "pending" && m.proposed_by === v.role);
+  const showForm = !pendingMine;
+  if (showForm) {
+    const open = isAuditee() && !approved && !v.models.some(m => m.status === "pending");
+    body += `<details data-keep="mform" ${open ? "open" : ""}><summary>${isAuditee() ? (approved ? "Use a different model" : "Choose model and key") : "Offer your own model and key"}</summary>
+      <div class="stack" style="margin-top:10px">
+        <div class="seg" id="mProv">${providers.map((p, i) => `<button type="button" data-act="prov" data-p="${p.id}" aria-pressed="${i === 0}">${esc(p.label)}</button>`).join("")}</div>
+        <div class="grid2"><label class="f">Model<input type="text" id="mModel" placeholder="${esc(providers[0].ph)}"></label>
+          <label class="f">API key<input type="password" id="mKey" autocomplete="off" placeholder="sk-…"></label></div>
+        <label class="check" id="mZdrRow" hidden><input type="checkbox" id="mZdr" checked><span>Zero-data-retention endpoints only</span></label>
+        <label class="f" id="mMockRow" hidden>Mock server<input type="text" id="mMock" value="127.0.0.1:19999"></label>
+        <p class="faint small">The key stays inside the enclave and is never shown to anyone. The certificate records the provider, the model the provider reports, and the organization that owns the key. The code is sent to this provider.</p>
+        <div class="row"><button class="btn primary" data-act="propose-model">${isAuditee() ? "Use this model" : "Propose to the auditee"}</button></div>
+      </div></details>`;
+  }
+  patch("cModel", head(3, "Model", !!approved) + `<div class="pad stack">${body}</div>`);
+}
+
+// ---------------------------------------------------------------- runs
+function verdictHtml(r) {
+  const vd = r.verdict;
+  if (!vd) return `<div class="callout bad"><span class="ic">×</span><span>No verdict: ${esc(r.outcome?.message || r.outcome?.kind || "the run ended without one")}</span></div>`;
+  const label = vd.answer === "needs_clarification" ? "Needs clarification" : cap(vd.answer);
+  return `<div class="stack">
+    <div class="row" style="gap:18px"><span class="answer ${vd.answer === "inconclusive" || vd.answer === "needs_clarification" ? "small" : ""}">${esc(label)}</span>
+      <span class="stack" style="gap:4px"><span class="faint small">Agent's confidence ${Math.round(vd.confidence * 100)}%</span><span class="meter"><i style="width:${Math.round(vd.confidence * 100)}%"></i></span></span></div>
+    <p class="summary">${esc(vd.summary)}</p>
+    ${vd.clarification_request ? `<div class="callout info"><span class="ic">?</span><span><b>The agent asks the auditor:</b> ${esc(vd.clarification_request)}</span></div>` : ""}
+  </div>`;
+}
+function facts(m) {
+  if (!m) return "";
+  return `<details><summary class="small">What the certificate records</summary><div class="grid2" style="margin-top:10px">
+    <dl class="kv"><dt>model</dt><dd>${esc(m.model.requested_model)} via <code>${esc(m.model.endpoint)}</code></dd><dt>reported</dt><dd>${esc(m.model.response_models.join(", ") || "—")}</dd><dt>key owner</dt><dd>${esc(m.model.key_owner || "not reported")}</dd><dt>chosen by</dt><dd>${esc(m.model.proposed_by)}</dd></dl>
+    <dl class="kv"><dt>model calls</dt><dd>${num(m.activity.llm_calls)}</dd><dt>files read</dt><dd>${num(m.activity.files_read)}</dd><dt>searches</dt><dd>${num(m.activity.grep_calls + m.activity.find_calls)}</dd><dt>tokens</dt><dd>${num(m.activity.input_tokens)} in · ${num(m.activity.output_tokens)} out</dd></dl>
+  </div></details>`;
+}
+function traceHtml(entries) {
+  const out = [];
+  for (const e of entries) {
+    if (e.type === "system") out.push(`<div class="ev"><div class="who">Harness</div><div class="what"><details><summary class="small">Fixed system prompt</summary><pre class="out">${esc(e.content)}</pre></details></div></div>`);
+    else if (e.type === "user") out.push(`<div class="ev"><div class="who">Task</div><div class="what small muted" style="white-space:pre-wrap">${esc(e.content)}</div></div>`);
+    else if (e.type === "auditor_message") out.push(`<div class="ev"><div class="who">Auditor</div><div class="what">${e.blinded ? `<span class="pill warn">blinded message: hidden from you</span>` : `<p style="white-space:pre-wrap">${esc(e.content)}</p>`}</div></div>`);
+    else if (e.type === "assistant") {
+      const calls = (e.tool_calls || []).map(c => {
+        const a = c.args || {}; const main = c.name === "submit_verdict" ? a.answer : (a.path ?? a.pattern ?? "");
+        return `<span class="call"><b>${esc(c.name)}</b> ${esc(main === "" ? "(root)" : main)}</span>`;
+      }).join("");
+      out.push(`<div class="ev"><div class="who">Agent</div><div class="what">${e.text ? `<p style="white-space:pre-wrap;margin-bottom:4px">${esc(e.text)}</p>` : ""}${calls}</div></div>`);
+    } else if (e.type === "tool_result" && e.name !== "submit_verdict") {
+      const c = String(e.content || ""); const n = c.split("\n").length;
+      out.push(`<div class="ev"><div class="who"></div><div class="what"><details><summary class="small">${esc(e.name)} · ${num(n)} line${n === 1 ? "" : "s"}</summary><pre class="out">${esc(c)}</pre></details></div></div>`);
+    } else if (e.type === "harness") out.push(`<div class="ev"><div class="who">Harness</div><div class="what faint small">${esc(e.content)}</div></div>`);
+    else if (e.type === "error") out.push(`<div class="ev"><div class="who">Error</div><div class="what"><div class="callout bad"><span>${esc(e.content)}</span></div></div></div>`);
+    else if (e.type === "files_read") out.push(`<div class="ev"><div class="who">Read</div><div class="what"><div class="pills">${(e.paths || []).map(p => `<span class="pill mono">${esc(p)}</span>`).join("") || `<span class="faint small">no files</span>`}</div></div></div>`);
+  }
+  return out.join("") || `<span class="faint small">Starting…</span>`;
+}
+function renderRuns(v) {
+  const runs = [...v.runs].reverse();
+  let body;
+  if (!runs.length) body = `<div class="pad"><p class="muted">The agent starts automatically once the question is accepted, the code and affidavit are in, and a model is approved.</p></div>`;
+  else body = runs.map(r => runHtml(v, r)).join("");
+  patch("cRuns", head(4, "Agent runs", runs.some(r => r.status === "released"), `<span class="faint small">${runs.length || ""}</span>`) + body);
+  for (const r of runs) if (isAuditee()) patch("tx-" + r.id, traceHtml(S.traces[r.id]?.entries || []));
+}
+function runHtml(v, r) {
+  const parent = r.parent_run_id ? v.runs.find(x => x.id === r.parent_run_id) : null;
+  const meta = `<div class="row" style="justify-content:space-between"><div class="row" style="gap:8px"><b>Run ${r.number}</b>${statusPill(r.status)}${parent ? `<span class="faint small">follow-up to run ${parent.number}</span>` : `<span class="faint small">question v${r.question_version}</span>`}</div>
+    <span class="faint small">${esc(r.model?.provider)} / ${esc(r.model?.model)} · ${esc(ago(r.started_at_ms))}</span></div>`;
+  const msgs = (r.messages || []).filter((m, i, all) => !parent || i >= (parent.messages || []).length);
+  const msgHtml = msgs.map(m => `<div class="callout info"><span class="ic">✉</span><span>${m.blinded ? "<b>Blinded</b> follow-up" : "Follow-up"} from the auditor${m.text ? `: ${esc(m.text)}` : (isAuditee() ? " (hidden from you)" : "")}</span></div>`).join("");
+  let main = "";
+  if (isAuditee()) {
+    if (r.status === "running") main += `<div class="row"><i class="spin" style="color:var(--accent)"></i><span>The agent is working · ${r.steps} model call${r.steps === 1 ? "" : "s"}</span></div>`;
+    else main += verdictHtml(r) + (r.flags?.length ? `<div class="stack" style="gap:6px"><h3>The auditor will see these flags</h3><ul class="flags">${r.flags.map(f => `<li>${esc(f)}</li>`).join("")}</ul></div>` : "") + facts(r.manifest);
+    if (r.status === "awaiting_release") main += `<div class="stack" data-keep="rel-${r.id}" style="border-top:1px solid var(--line);padding-top:12px">
+      <p class="small muted">Read the answer and the transcript. Releasing sends the verdict, summary and certificate to the auditor. Declining tells them you declined.</p>
+      <label class="f">Note to the auditor (optional)<input type="text" id="note-${r.id}"></label>
+      <div class="row"><button class="btn primary" data-act="release" data-run="${r.id}">Release to auditor</button><button class="btn danger" data-act="decline" data-run="${r.id}">Decline</button></div></div>`;
+    if (r.status === "released" || r.status === "declined") main += `<p class="small faint">You ${r.status} this ${esc(ago(r.decided_at_ms))}${r.decision_note ? `: “${esc(r.decision_note)}”` : ""}.</p>`;
+    main += `<details ${r.status === "running" ? "open" : ""} data-keep="txd-${r.id}"><summary>Transcript (only you can see this)</summary><div class="tx" id="tx-${r.id}"></div></details>`;
+  } else {
+    if (r.status === "running") main += `<div class="row"><i class="spin" style="color:var(--accent)"></i><span class="muted">The agent is working. You can't see its progress; you'll see the result if the auditee releases it.</span></div>`;
+    else if (r.status === "awaiting_release") main += `<p class="muted">The agent finished. Waiting for the auditee to release or decline the result.</p>`;
+    else if (r.status === "declined") main += `<div class="callout bad"><span class="ic">×</span><span>The auditee declined to release this result${r.decision_note ? `: “${esc(r.decision_note)}”` : "."}</span></div>`;
+    else if (r.status === "released") main += verdictHtml(r) + (r.flags?.length ? `<div class="stack" style="gap:6px"><h3>Weigh these</h3><ul class="flags">${r.flags.map(f => `<li>${esc(f)}</li>`).join("")}</ul></div>` : "") + facts(r.manifest)
+      + `${r.decision_note ? `<p class="small faint">Auditee's note: “${esc(r.decision_note)}”</p>` : ""}<div class="row"><a class="btn" href="#" data-act="cert" data-run="${r.id}">Download certificate</a><span class="faint small">Signed by the enclave; check it with <code>attest verify</code>.</span></div>`;
+    const busyNow = v.runs.some(x => x.status === "running");
+    if ((r.status === "released" || r.status === "declined") && !busyNow && r === [...v.runs].reverse().find(x => x.status === "released" || x.status === "declined"))
+      main += `<details data-keep="fu-${r.id}"><summary>Send the agent a follow-up</summary><div class="stack" style="margin-top:10px">
+        <textarea id="fu-${r.id}" placeholder="What did you check to rule out the RL pipeline?"></textarea>
+        <label class="check"><input type="checkbox" id="fub-${r.id}"><span>Blind this message from the auditee<br><span class="faint small">They see that you sent one and everything the agent does in response, but not your text. They still decide on release.</span></span></label>
+        <div class="row"><button class="btn primary" data-act="followup" data-run="${r.id}">Send follow-up</button></div></div></details>`;
+  }
+  return `<div class="run pad stack">${meta}${msgHtml}${main}</div>`;
+}
+
+// ---------------------------------------------------------------- side
+function renderActivity(v) {
+  S.events = (S.events || []).concat(v.events.filter(e => !(S.events || []).some(x => x.seq === e.seq)));
+  const evs = [...S.events].reverse();
+  patch("cActivity", `<h3>Activity</h3><div class="feed">${evs.length ? evs.map(e => `<div class="e"><span class="t">${esc(clock(e.at_ms))}</span><span>${esc(e.text)}</span></div>`).join("") : `<span class="faint small">Nothing yet.</span>`}</div>`);
+}
+function renderNotify(v) {
+  const n = v.notify || {};
+  patch("cNotify", `<h3>Notifications</h3><div class="stack" data-keep="notify">
+    <p class="small muted">Runs can take a while. Get told when it's your turn.</p>
+    ${v.email_available ? `<label class="f">Email<input type="email" id="nEmail" value="${esc(n.email || "")}" placeholder="you@example.com"></label>` : `<p class="small faint">Email isn't configured on this server.</p>`}
+    <label class="f">Webhook (for agents)<input type="text" id="nHook" value="${esc(n.webhook_url || "")}" placeholder="https://…"></label>
+    <div class="row"><button class="btn" data-act="notify">Save</button></div>
+    <p class="small faint">Or poll: <code>GET /api/sessions/${esc(S.sid.slice(0, 6))}…?version=N&amp;wait=25</code> (<a href="/agents.md">guide</a>)</p></div>`);
+}
+
+// ---------------------------------------------------------------- actions
+const val = (id) => document.getElementById(id)?.value ?? "";
+document.addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-act]"); if (!b) return;
+  const act = b.dataset.act;
+  if (act === "create") return createSession(b);
+  if (act === "show-verify") {
+    e.preventDefault();
+    if (!S.sid) { await loadInfo(); $("#landingVerify").innerHTML = verifyPanel(); return; }
+    document.getElementById("verify")?.scrollIntoView({ behavior: "smooth" }); return;
+  }
+  if (act === "prov") {
+    $$("#mProv button").forEach(x => x.setAttribute("aria-pressed", String(x === b)));
+    const p = [...PROVIDERS, { id: "mock", ph: "gpt-mock" }].find(x => x.id === b.dataset.p);
+    $("#mModel").placeholder = p.ph; $("#mZdrRow").hidden = p.id !== "openrouter"; $("#mMockRow").hidden = p.id !== "mock"; return;
+  }
+  if (act === "cert") {
+    e.preventDefault();
+    return busy(b, async () => {
+      const c = await sapi(`/runs/${b.dataset.run}/certificate`);
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([JSON.stringify(c, null, 2)], { type: "application/json" }));
+      a.download = `certificate-${b.dataset.run.slice(0, 8)}.json`; a.click(); URL.revokeObjectURL(a.href);
+    });
+  }
+  const actions = {
+    "ask": () => sapi("/question", { method: "POST", body: { text: val("qText"), max_steps: Number(val("qSteps") || 150), allow_fine_tuned: $("#qFt")?.checked } }),
+    "q-accept": () => sapi("/question/decision", { method: "POST", body: { version: Number(b.dataset.v), accept: true, note: val("qNote") } }),
+    "q-reject": () => sapi("/question/decision", { method: "POST", body: { version: Number(b.dataset.v), accept: false, note: val("qNote") } }),
+    "affidavit": () => {
+      if (!$("#aSign").checked) throw new Error("Tick the box to confirm the statement.");
+      return sapi("/affidavit", { method: "POST", body: { organization: val("aOrg"), repo_url: val("aRepo"), git_commit: val("aCommit"), tree_sha256: b.dataset.tree } });
+    },
+    "propose-model": () => sapi("/models", { method: "POST", body: { provider: $("#mProv [aria-pressed=true]").dataset.p, model: val("mModel"), api_key: val("mKey"), openrouter_zdr: $("#mZdr")?.checked, mock_endpoint: val("mMock") } }),
+    "m-approve": () => sapi(`/models/${b.dataset.id}/decision`, { method: "POST", body: { approve: true } }),
+    "m-reject": () => sapi(`/models/${b.dataset.id}/decision`, { method: "POST", body: { approve: false } }),
+    "release": () => sapi(`/runs/${b.dataset.run}/release`, { method: "POST", body: { release: true, note: val("note-" + b.dataset.run) } }),
+    "decline": () => sapi(`/runs/${b.dataset.run}/release`, { method: "POST", body: { release: false, note: val("note-" + b.dataset.run) } }),
+    "followup": () => sapi(`/runs/${b.dataset.run}/followup`, { method: "POST", body: { text: val("fu-" + b.dataset.run), blinded: $("#fub-" + b.dataset.run)?.checked } }),
+    "notify": () => sapi("/notify", { method: "POST", body: { email: val("nEmail"), webhook_url: val("nHook") } }),
+  };
+  if (!actions[act]) return;
+  await busy(b, async () => {
+    await actions[act]();
+    // A submitted form is done: let it re-render fresh.
+    b.closest("[data-keep]")?.removeAttribute("data-keep");
+    if (act === "propose-model" && $("#mKey")) $("#mKey").value = "";
+    toast("Done"); await refresh();
+  });
+});
+document.addEventListener("input", (e) => {
+  if (["aOrg", "aRepo", "aCommit"].includes(e.target.id)) {
+    const tree = $("[data-act=affidavit]")?.dataset.tree || "";
+    $("#aStmt").textContent = statement(val("aOrg"), tree, val("aRepo"), val("aCommit"));
+  }
+});
+document.addEventListener("change", async (e) => {
+  if (e.target.id !== "folder") return;
+  const files = [...e.target.files].filter(f => !f.webkitRelativePath.split("/").includes(".git"));
+  if (!files.length) return toast("That folder is empty.", true);
+  const total = files.reduce((n, f) => n + f.size, 0);
+  const st = $("#upStatus");
+  st.innerHTML = `<div class="stack"><div class="small">${num(files.length)} files, ${bytes(total)}. Uploading…</div><div class="progress"><i id="upBar"></i></div></div>`;
+  try {
+    const tar = makeTar(files);
+    await new Promise((res, rej) => {
+      const x = new XMLHttpRequest();
+      x.open("PUT", `/api/sessions/${S.sid}/code`); x.setRequestHeader("authorization", "Bearer " + S.token);
+      x.upload.onprogress = (p) => { if (p.lengthComputable) $("#upBar").style.width = (100 * p.loaded / p.total) + "%"; };
+      x.onload = () => { let j = {}; try { j = JSON.parse(x.responseText); } catch {} x.status === 200 ? res(j) : rej(new Error(j.error || x.statusText)); };
+      x.onerror = () => rej(new Error("upload failed"));
+      x.send(tar);
+    });
+    st.closest("[data-keep]")?.removeAttribute("data-keep");
+    toast("Uploaded"); await refresh();
+  } catch (err) { st.innerHTML = `<div class="callout bad"><span class="ic">×</span><span>${esc(err.message)}</span></div>`; }
+});
+
+/** Minimal tar (ustar + PAX for long paths) from browser File objects. */
+function makeTar(files) {
+  const enc = new TextEncoder(), parts = [];
+  const header = (name, size, type = "0") => {
+    const h = new Uint8Array(512);
+    const put = (s, off, len) => h.set(enc.encode(s).slice(0, len), off);
+    const oct = (n, len) => (n.toString(8).padStart(len - 1, "0") + "\0");
+    put(name, 0, 100); put("0000644\0", 100, 8); put(oct(0, 8), 108, 8); put(oct(0, 8), 116, 8);
+    put(oct(size, 12), 124, 12); put(oct(0, 12), 136, 12); put("        ", 148, 8); put(type, 156, 1);
+    put("ustar\0", 257, 6); put("00", 263, 2);
+    let sum = 0; for (const b of h) sum += b; put(sum.toString(8).padStart(6, "0") + "\0 ", 148, 8);
+    return h;
+  };
+  const pad = (n) => n % 512 ? new Uint8Array(512 - n % 512) : null;
+  for (const f of files) {
+    const path = f.webkitRelativePath.split("/").slice(1).join("/") || f.name;
+    if (enc.encode(path).length > 99) {
+      let rec = ` path=${path}\n`, len = enc.encode(rec).length;
+      let full = `${len + String(len).length} ${rec.slice(1)}`;
+      while (enc.encode(full).length !== Number(full.split(" ")[0])) { len = enc.encode(full).length; full = `${len}${rec}`; }
+      const data = enc.encode(full);
+      parts.push(header("PaxHeader", data.length, "x"), data); const p = pad(data.length); if (p) parts.push(p);
+    }
+    parts.push(header(path.slice(0, 99), f.size), f); const p = pad(f.size); if (p) parts.push(p);
+  }
+  parts.push(new Uint8Array(1024));
+  return new Blob(parts);
+}
+
+// ---------------------------------------------------------------- polling
+async function refresh(wait = false) {
+  const q = wait && S.view ? `?version=${S.view.version}&wait=25` : "";
+  const view = await sapi(q, { timeout: 35000 });
+  if (!S.view || view.version >= S.view.version) S.view = view;
+  for (const r of S.view.runs) {
+    if (!isAuditee()) continue;
+    const t = S.traces[r.id] || (S.traces[r.id] = { entries: [], next: 0, done: false });
+    if (t.done) continue;
+    const res = await sapi(`/runs/${r.id}/trace?after=${t.next}`);
+    // Idempotent even if two refreshes overlap: place entries by position.
+    const start = res.next - res.entries.length;
+    t.entries = t.entries.slice(0, start).concat(res.entries); t.next = res.next; t.done = res.status !== "running";
+  }
+  render();
+}
+async function pollLoop() {
+  if (S.polling) return; S.polling = true;
+  for (;;) {
+    try { await refresh(true); } catch (e) { await new Promise(r => setTimeout(r, 5000)); }
+  }
+}
+
+// ---------------------------------------------------------------- boot
+(async function boot() {
+  await loadInfo();
+  const m = location.pathname.match(/^\/s\/([0-9a-f]+)$/);
+  if (!m) return landing();
+  S.sid = m[1]; S.token = location.hash.slice(1);
+  if (!S.token) { $("#app").innerHTML = `<div class="callout bad"><span class="ic">×</span><span>This link is missing its secret part (after the #). Ask for the full link.</span></div>`; return; }
+  sessionShell();
+  try { await refresh(); } catch (e) { $("#app").innerHTML = `<div class="callout bad"><span class="ic">×</span><span>${esc(e.message)}. If the enclave restarted, sessions were lost and you need a new one.</span></div>`; return; }
+  pollLoop();
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh().catch(() => {}); });
+})();
+</script>
+</body>
+</html>

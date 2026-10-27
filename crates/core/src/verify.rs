@@ -1,5 +1,5 @@
-//! Verifier side: check that an enclave (or a certificate it signed) is the
-//! measured build, and turn a certificate into a human-readable report.
+//! Verifier side: check that an enclave (or a certificate it signed) is a
+//! measured build, and list what a certificate's reader should weigh.
 
 use crate::nitro::{self, AttestationDoc, ExpectedPcrs};
 use crate::types::*;
@@ -90,58 +90,51 @@ pub fn verify_enclave(
 pub struct VerifiedCertificate {
     pub enclave: VerifiedEnclave,
     pub body: CertificateBody,
-    pub question: QuestionBody,
-    pub affidavit: AffidavitBody,
     pub warnings: Vec<String>,
 }
 
-/// Verify a certificate end to end. If `expected_question` is given, the
-/// certificate must be for exactly that signed question.
-pub fn verify_certificate(
-    cert: &Certificate,
-    policy: &EnclavePolicy,
-    expected_question: Option<&Signed>,
-) -> Result<VerifiedCertificate> {
+pub fn verify_certificate(cert: &Certificate, policy: &EnclavePolicy) -> Result<VerifiedCertificate> {
     let enclave = verify_enclave(&cert.enclave_info_json, cert.boot_document_b64.as_deref(), None, policy)?;
     let body: CertificateBody = cert.signed.open_by(DOMAIN_CERTIFICATE, &enclave.info.signing_public_key)?;
     let m = &body.manifest;
     if m.boot_id != enclave.info.boot_id {
         bail!("manifest boot id does not match the enclave that signed it");
     }
-    let question: QuestionBody = m.question.open(DOMAIN_QUESTION)?;
-    if m.question.id() != m.question_id {
-        bail!("manifest question id mismatch");
-    }
-    if crate::sha256_hex(question.text.as_bytes()) != m.question_text_sha256 {
+    if crate::sha256_hex(m.question.text.as_bytes()) != m.question.text_sha256 {
         bail!("manifest question text hash mismatch");
     }
-    let affidavit: AffidavitBody = m.affidavit.open(DOMAIN_AFFIDAVIT)?;
-    if m.affidavit.public_key != m.auditee_public_key {
-        bail!("affidavit signer is not the recorded auditee");
-    }
-    if affidavit.code_tree_sha256 != m.code.tree_sha256 || affidavit.question_id != m.question_id {
-        bail!("affidavit does not bind this code and question");
-    }
-    if let Some(q) = expected_question {
-        if q.id() != m.question_id {
-            bail!("certificate answers a different question than the one you issued");
+    for msg in &m.auditor_messages {
+        if let Some(t) = &msg.text {
+            if crate::sha256_hex(t.as_bytes()) != msg.text_sha256 {
+                bail!("manifest auditor message hash mismatch");
+            }
         }
     }
-    let warnings = manifest_warnings(m, &question, &affidavit);
-    Ok(VerifiedCertificate { enclave, body, question, affidavit, warnings })
+    let warnings = manifest_warnings(m);
+    Ok(VerifiedCertificate { enclave, body, warnings })
 }
 
-/// Things in the manifest an auditor should weigh. None of them make the
-/// certificate invalid; they are what the auditee chose.
-pub fn manifest_warnings(m: &Manifest, q: &QuestionBody, a: &AffidavitBody) -> Vec<String> {
+fn categories(c: &ScanCounts) -> String {
+    c.matches_by_category
+        .iter()
+        .map(|(k, n)| format!("{} ×{n}", k.replace('_', " ")))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Things a certificate's reader should weigh. None make it invalid; they
+/// are what the parties chose or what happened.
+pub fn manifest_warnings(m: &Manifest) -> Vec<String> {
     let mut w = Vec::new();
-    if m.outcome != Outcome::Completed {
-        w.push(format!("run did not complete normally: {:?}", m.outcome));
+    match &m.outcome {
+        Outcome::Completed => {}
+        Outcome::StepLimit => w.push("the agent hit its step limit before answering".into()),
+        Outcome::Error { message } => w.push(format!("the run failed: {message}")),
     }
     if m.model.fine_tuned {
-        w.push(format!("model {} is a fine-tune (policy allowed it)", m.model.requested_model));
+        w.push(format!("model {} is a fine-tune (the question allowed it)", m.model.requested_model));
     }
-    let org = a.organization.to_ascii_lowercase();
+    let org = m.affidavit.organization.to_ascii_lowercase();
     let provider_org = match m.model.provider {
         Provider::Openai => Some("openai"),
         Provider::Anthropic => Some("anthropic"),
@@ -150,53 +143,56 @@ pub fn manifest_warnings(m: &Manifest, q: &QuestionBody, a: &AffidavitBody) -> V
     if let Some(p) = provider_org {
         if org.contains(p) {
             w.push(format!(
-                "self-hosted inference: the auditee ({}) operates the model endpoint ({}), so it controls what model actually answered",
-                a.organization, m.model.endpoint
+                "self-hosted inference: the auditee ({}) operates the model endpoint ({}), so it controls which model actually answered",
+                m.affidavit.organization, m.model.endpoint
             ));
         }
     }
     if m.model.provider == Provider::Openrouter {
         w.push(format!(
-            "routed through OpenRouter (zdr={:?}); upstream providers: {}",
-            m.model.openrouter_zdr,
+            "routed through OpenRouter (zero data retention {}); upstream providers: {}",
+            if m.model.openrouter_zdr == Some(true) { "requested" } else { "not requested" },
             if m.model.upstream_providers.is_empty() { "unreported".into() } else { m.model.upstream_providers.join(", ") }
         ));
     }
     if m.model.response_models.iter().any(|r| !r.starts_with(&m.model.requested_model) && !m.model.requested_model.starts_with(r.as_str())) {
         w.push(format!(
-            "provider reported model(s) {:?} for requested {}",
-            m.model.response_models, m.model.requested_model
+            "provider reported model(s) {} for requested {}",
+            m.model.response_models.join(", "),
+            m.model.requested_model
         ));
     }
     let h = &m.history;
-    if h.prior_runs_same_question_text > 0 {
-        w.push(format!(
-            "{} earlier run(s) of this question text on this enclave boot; ask the auditee for those certificates",
-            h.prior_runs_same_question_text
-        ));
+    if h.prior_runs_in_session > 0 {
+        w.push(format!("{} earlier run(s) in this session", h.prior_runs_in_session));
     }
-    if h.prior_code_hashes_same_question_text.iter().any(|c| c != &m.code.tree_sha256) {
+    let other_trees = h.prior_code_trees_in_session.iter().filter(|c| *c != &m.code.tree_sha256).count();
+    if other_trees > 0 {
+        w.push(format!("the code changed between runs: {other_trees} other version(s) were used earlier in this session"));
+    }
+    if h.same_question_text_other_sessions > 0 {
         w.push(format!(
-            "the code changed between attempts: {} distinct earlier tree hash(es)",
-            h.prior_code_hashes_same_question_text.iter().filter(|c| *c != &m.code.tree_sha256).count()
+            "the same question text was run in {} other session(s) on this enclave",
+            h.same_question_text_other_sessions
         ));
     }
     let s = &m.instruction_scan.files_read;
     if s.files_with_matches > 0 {
         w.push(format!(
-            "{} file(s) the model read contain instruction-like text ({})",
+            "{} file(s) the agent read contain instruction-like text ({})",
             s.files_with_matches,
-            s.matches_by_category.iter().map(|(k, n)| format!("{} ×{n}", k.replace('_', " "))).collect::<Vec<_>>().join(", ")
+            categories(s)
         ));
     }
     if m.activity.files_read == 0 {
-        w.push("the model read no files".into());
+        w.push("the agent read no files".into());
     }
-    if a.git_commit.is_none() {
-        w.push("affidavit names no git commit".into());
+    if m.affidavit.git_commit.is_none() {
+        w.push("the affidavit names no git commit".into());
     }
-    if q.policy.allow_fine_tuned {
-        w.push("your question allowed fine-tuned models".into());
+    let blinded = m.auditor_messages.iter().filter(|x| x.blinded).count();
+    if blinded > 0 {
+        w.push(format!("{blinded} blinded auditor message(s) the auditee could not read"));
     }
     w
 }
