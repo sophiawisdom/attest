@@ -1,0 +1,822 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>attest</title>
+<style>
+:root {
+  --bg: #f6f5f1;
+  --panel: #ffffff;
+  --sunken: #efede7;
+  --ink: #1b1a17;
+  --ink-2: #57544c;
+  --ink-3: #8a867c;
+  --line: #e2dfd6;
+  --line-2: #d3cfc3;
+  --accent: #2f4fd8;
+  --accent-ink: #ffffff;
+  --accent-soft: #e8ecfc;
+  --ok: #1d7a4a;
+  --ok-soft: #e3f3ea;
+  --warn: #9a5b00;
+  --warn-soft: #fbf0dc;
+  --bad: #b3261e;
+  --bad-soft: #fbe6e4;
+  --run: #2f4fd8;
+  --shadow: 0 1px 2px rgba(27,26,23,.06), 0 4px 16px rgba(27,26,23,.05);
+  --radius: 10px;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", system-ui, sans-serif;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #141412; --panel: #1c1c19; --sunken: #232320; --ink: #ecebe6; --ink-2: #b4b1a7; --ink-3: #85827a;
+    --line: #2e2d29; --line-2: #3b3a35; --accent: #7d96ff; --accent-ink: #0e1330; --accent-soft: #232a48;
+    --ok: #5fc48f; --ok-soft: #17301f; --warn: #e3a547; --warn-soft: #33270f; --bad: #f08a80; --bad-soft: #3a1c19;
+    --run: #7d96ff; --shadow: 0 1px 2px rgba(0,0,0,.4); color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 var(--sans); }
+button, input, select, textarea { font: inherit; color: inherit; }
+a { color: var(--accent); }
+code, .mono { font-family: var(--mono); font-size: 12.5px; }
+h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: -0.01em; }
+h1 { font-size: 22px; } h2 { font-size: 16px; } h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-3); font-weight: 600; }
+p { margin: 0; }
+
+/* top bar */
+.top { position: sticky; top: 0; z-index: 10; display: flex; align-items: center; gap: 16px; padding: 10px 20px;
+  background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); }
+.brand { font-weight: 700; font-size: 16px; letter-spacing: -0.02em; display: flex; align-items: center; gap: 8px; }
+.brand .mark { width: 22px; height: 22px; border-radius: 6px; background: var(--ink); color: var(--bg); display: grid; place-items: center; font-size: 13px; }
+.seg { display: inline-flex; background: var(--sunken); border: 1px solid var(--line); border-radius: 9px; padding: 2px; }
+.seg button { border: 0; background: transparent; padding: 5px 14px; border-radius: 7px; cursor: pointer; color: var(--ink-2); font-weight: 500; }
+.seg button[aria-selected="true"] { background: var(--panel); color: var(--ink); box-shadow: var(--shadow); }
+.spacer { flex: 1; }
+.chip { display: inline-flex; align-items: center; gap: 7px; border: 1px solid var(--line); background: var(--panel); border-radius: 999px;
+  padding: 4px 12px 4px 10px; cursor: pointer; font-size: 13px; color: var(--ink-2); max-width: 46vw; }
+.chip span.t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3); flex: none; }
+.dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.bad { background: var(--bad); }
+.dot.run { background: var(--run); animation: pulse 1.4s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .35; } }
+
+/* shell */
+.shell { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 20px; max-width: 1240px; margin: 0 auto; padding: 20px; }
+@media (max-width: 860px) { .shell { grid-template-columns: minmax(0, 1fr); padding: 12px 16px; } .top { padding: 10px 16px; gap: 10px; flex-wrap: wrap; } .chip { max-width: 100%; } }
+.side { display: flex; flex-direction: column; gap: 16px; align-self: start; position: sticky; top: 70px; min-width: 0; }
+@media (max-width: 860px) { .side { position: static; } }
+.side .group { display: flex; flex-direction: column; gap: 4px; }
+.side h3 { padding: 0 10px 4px; }
+.item { display: block; width: 100%; text-align: left; border: 1px solid transparent; background: transparent; border-radius: 8px; padding: 8px 10px; cursor: pointer; color: var(--ink); }
+.item:hover { background: var(--sunken); }
+.item[aria-current="true"] { background: var(--panel); border-color: var(--line); box-shadow: var(--shadow); }
+.item .l1 { display: flex; align-items: center; gap: 8px; }
+.item .l1 .txt { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.item .l2 { font-size: 12px; color: var(--ink-3); margin-top: 2px; display: flex; gap: 6px; flex-wrap: wrap; }
+.empty { color: var(--ink-3); font-size: 13px; padding: 4px 10px; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* panels */
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
+.pad { padding: 20px 22px; }
+.stack { display: flex; flex-direction: column; gap: 16px; }
+.row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.muted { color: var(--ink-2); } .faint { color: var(--ink-3); } .small { font-size: 12.5px; }
+.hr { height: 1px; background: var(--line); margin: 4px 0; }
+
+/* buttons */
+.btn { text-decoration: none; color: var(--ink); border: 1px solid var(--line-2); background: var(--panel); border-radius: 8px; padding: 7px 14px; cursor: pointer; font-weight: 500; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.btn:hover { background: var(--sunken); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.btn.primary:hover { filter: brightness(1.07); }
+.btn.ghost { border-color: transparent; background: transparent; color: var(--ink-2); }
+.btn.ghost:hover { background: var(--sunken); color: var(--ink); }
+.btn.wide { width: 100%; justify-content: center; }
+.btn[disabled] { opacity: .5; cursor: not-allowed; filter: none; }
+.btn .spin { width: 13px; height: 13px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin .7s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* forms */
+label.f { display: flex; flex-direction: column; gap: 6px; font-weight: 500; font-size: 13px; }
+label.f .hint { font-weight: 400; color: var(--ink-3); font-size: 12.5px; }
+input[type=text], input[type=password], input[type=number], select, textarea {
+  width: 100%; border: 1px solid var(--line-2); background: var(--panel); border-radius: 8px; padding: 8px 10px; outline: none; }
+::placeholder { color: var(--ink-3); opacity: .8; }
+textarea { resize: vertical; min-height: 110px; line-height: 1.5; }
+input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.check { display: flex; gap: 10px; align-items: flex-start; cursor: pointer; }
+.check input { margin-top: 3px; accent-color: var(--accent); width: 15px; height: 15px; flex: none; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+@media (max-width: 640px) { .grid2 { grid-template-columns: 1fr; } }
+
+/* steps in the audit form */
+.step { display: grid; grid-template-columns: 28px 1fr; gap: 14px; padding: 18px 22px; border-top: 1px solid var(--line); }
+.step:first-of-type { border-top: 0; }
+.step .n { width: 26px; height: 26px; border-radius: 50%; background: var(--sunken); border: 1px solid var(--line-2); display: grid; place-items: center; font-weight: 600; font-size: 12.5px; color: var(--ink-2); }
+.step.done .n { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+.step .body { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+
+/* option cards */
+.opts { display: flex; flex-direction: column; gap: 8px; }
+.opt { display: flex; gap: 10px; align-items: flex-start; border: 1px solid var(--line-2); border-radius: 9px; padding: 10px 12px; cursor: pointer; background: var(--panel); }
+.opt:hover { border-color: var(--ink-3); }
+.opt.sel { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.opt input { accent-color: var(--accent); margin-top: 3px; }
+.pills { display: flex; flex-wrap: wrap; gap: 6px; }
+.pill { display: inline-flex; gap: 5px; align-items: center; border: 1px solid var(--line); background: var(--sunken); border-radius: 6px; padding: 2px 8px; font-size: 12.5px; color: var(--ink-2); max-width: 100%; }
+.pill b { color: var(--ink); font-weight: 600; }
+.pill.warn { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+.pill.ok { background: var(--ok-soft); color: var(--ok); border-color: transparent; }
+.pill.bad { background: var(--bad-soft); color: var(--bad); border-color: transparent; }
+
+/* callouts */
+.callout { border-radius: 9px; padding: 11px 14px; display: flex; gap: 10px; align-items: flex-start; font-size: 13.5px; }
+.callout.info { background: var(--accent-soft); }
+.callout.warn { background: var(--warn-soft); color: color-mix(in srgb, var(--warn) 70%, var(--ink)); }
+.callout.bad { background: var(--bad-soft); color: color-mix(in srgb, var(--bad) 75%, var(--ink)); }
+.callout.ok { background: var(--ok-soft); color: color-mix(in srgb, var(--ok) 70%, var(--ink)); }
+.callout .ic { flex: none; font-weight: 700; width: 16px; text-align: center; }
+blockquote.affidavit { margin: 0; padding: 14px 16px; border-left: 3px solid var(--ink); background: var(--sunken); border-radius: 0 8px 8px 0; font-family: Georgia, "Iowan Old Style", serif; font-size: 14.5px; line-height: 1.6; overflow-wrap: anywhere; }
+
+/* drop zone */
+.drop { border: 1.5px dashed var(--line-2); border-radius: 10px; padding: 22px; text-align: center; color: var(--ink-2); cursor: pointer; transition: background .15s, border-color .15s; }
+.drop:hover, .drop.over { border-color: var(--accent); background: var(--accent-soft); }
+.drop input { display: none; }
+
+/* report */
+.verdict { display: grid; grid-template-columns: auto 1fr; gap: 6px 22px; align-items: center; }
+.answer { font-size: 44px; font-weight: 700; letter-spacing: -0.03em; line-height: 1; }
+.answer.inconclusive { color: var(--ink-2); font-size: 34px; }
+.meter { height: 6px; background: var(--sunken); border-radius: 999px; overflow: hidden; width: 160px; }
+.meter i { display: block; height: 100%; background: var(--ink); border-radius: 999px; }
+.summary { font-size: 15px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
+.weigh { display: flex; flex-direction: column; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.weigh li { display: flex; gap: 10px; align-items: flex-start; padding: 9px 12px; background: var(--warn-soft); border-radius: 8px; font-size: 13.5px; }
+.weigh li::before { content: "!"; flex: none; width: 18px; height: 18px; border-radius: 50%; background: var(--warn); color: var(--panel); font-weight: 700; font-size: 12px; display: grid; place-items: center; margin-top: 1px; }
+.facts { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }
+.fact { border: 1px solid var(--line); border-radius: 9px; padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.fact h3 { font-size: 11.5px; }
+.kv { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 12px; font-size: 13px; }
+.kv dt { color: var(--ink-3); } .kv dd { margin: 0; overflow-wrap: anywhere; }
+.hash { font-family: var(--mono); font-size: 12px; cursor: copy; border-bottom: 1px dotted var(--ink-3); }
+pre.raw { background: var(--sunken); border-radius: 8px; padding: 12px; overflow: auto; max-height: 420px; font-size: 12px; margin: 8px 0 0; }
+details > summary { cursor: pointer; color: var(--ink-2); }
+
+/* transcript */
+.tx { display: flex; flex-direction: column; gap: 10px; }
+.ev { display: grid; grid-template-columns: 74px minmax(0, 1fr); gap: 12px; }
+.ev .who { font-size: 11.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-3); padding-top: 3px; font-weight: 600; }
+.ev .what { min-width: 0; }
+.call { display: inline-flex; gap: 6px; align-items: baseline; background: var(--accent-soft); border-radius: 6px; padding: 3px 9px; font-family: var(--mono); font-size: 12.5px; margin: 2px 6px 2px 0; max-width: 100%; overflow-wrap: anywhere; }
+.call b { font-weight: 600; color: var(--accent); }
+.ev pre { margin: 6px 0 0; background: var(--sunken); border-radius: 8px; padding: 10px 12px; overflow: auto; max-height: 360px; font-size: 12px; line-height: 1.45; }
+.tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--line); padding: 0 22px; }
+.tabs button { border: 0; background: transparent; padding: 11px 12px; cursor: pointer; color: var(--ink-2); border-bottom: 2px solid transparent; margin-bottom: -1px; font-weight: 500; }
+.tabs button[aria-selected="true"] { color: var(--ink); border-color: var(--ink); }
+
+/* progress */
+.progress { display: flex; align-items: center; gap: 14px; }
+.bigspin { width: 34px; height: 34px; border: 3px solid var(--accent-soft); border-top-color: var(--accent); border-radius: 50%; animation: spin 1s linear infinite; flex: none; }
+
+/* settings sheet */
+.scrim { position: fixed; inset: 0; background: rgba(0,0,0,.25); z-index: 20; }
+.sheet { position: fixed; top: 0; right: 0; bottom: 0; width: min(460px, 100vw); background: var(--panel); z-index: 21; border-left: 1px solid var(--line); box-shadow: -8px 0 30px rgba(0,0,0,.12); overflow: auto; }
+.toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--bg); padding: 9px 16px; border-radius: 9px; z-index: 30; font-size: 13.5px; box-shadow: var(--shadow); max-width: calc(100vw - 32px); }
+.toast.err { background: var(--bad); color: #fff; }
+table.log { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.log th { text-align: left; font-weight: 600; color: var(--ink-3); font-size: 11.5px; text-transform: uppercase; letter-spacing: .05em; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+table.log td { padding: 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.scroll-x { overflow-x: auto; }
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand"><div class="mark">a</div>attest</div>
+  <div class="seg" role="tablist" id="roles">
+    <button role="tab" data-role="auditor">Auditor</button>
+    <button role="tab" data-role="auditee">Auditee</button>
+  </div>
+  <div class="spacer"></div>
+  <button class="chip" id="enclaveChip" title="Enclave settings"><i class="dot"></i><span class="t">No enclave set</span></button>
+</header>
+<div class="shell">
+  <nav class="side" id="side"></nav>
+  <main id="detail"></main>
+</div>
+<div id="overlay"></div>
+<div id="toastHost"></div>
+
+<script>
+"use strict";
+// ---------------------------------------------------------------- utilities
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const short = (h, n = 10) => h ? String(h).slice(0, n) + "…" : "—";
+const hash = (h, n = 12) => h ? `<span class="hash" data-copy="${esc(h)}" title="${esc(h)} (click to copy)">${esc(String(h).slice(0, n))}…</span>` : "—";
+const bytes = (n) => { n = Number(n || 0); const u = ["B", "KB", "MB", "GB"]; let i = 0; while (n >= 1024 && i < 3) { n /= 1024; i++; } return (i ? n.toFixed(1) : n) + " " + u[i]; };
+const num = (n) => Number(n || 0).toLocaleString();
+function ago(ms) {
+  if (!ms) return "";
+  const s = Math.round((Date.now() - ms) / 1000);
+  if (s < 45) return "just now"; if (s < 3600) return Math.round(s / 60) + " min ago";
+  if (s < 86400) return Math.round(s / 3600) + " h ago";
+  return new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+const when = (ms) => ms ? new Date(ms).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) : "—";
+const store = { get(k, d) { try { return localStorage.getItem(k) ?? d; } catch { return d; } }, set(k, v) { try { localStorage.setItem(k, v); } catch {} } };
+
+async function api(path, body) {
+  const opts = body === undefined ? {} : { method: "POST", headers: { "content-type": "application/json", "x-attest": "1" }, body: JSON.stringify(body) };
+  const r = await fetch("/api/" + path, opts);
+  let j; try { j = await r.json(); } catch { j = { error: r.statusText || "unexpected response" }; }
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+function toast(msg, err = false) {
+  const t = document.createElement("div");
+  t.className = "toast" + (err ? " err" : ""); t.textContent = msg;
+  $("#toastHost").replaceChildren(t);
+  setTimeout(() => t.remove(), err ? 6000 : 2600);
+}
+async function busy(btn, fn) {
+  if (btn.disabled) return;
+  const html = btn.innerHTML; btn.disabled = true; btn.innerHTML = `<i class="spin"></i>${html}`;
+  try { return await fn(); } catch (e) { toast(e.message, true); throw e; } finally { btn.disabled = false; btn.innerHTML = html; }
+}
+document.addEventListener("click", (e) => {
+  const c = e.target.closest("[data-copy]");
+  if (c) { navigator.clipboard?.writeText(c.dataset.copy).then(() => toast("Copied")); }
+});
+function readJsonFile(file) {
+  return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => { try { res(JSON.parse(r.result)); } catch { rej(new Error(file.name + " is not JSON")); } }; r.onerror = () => rej(r.error); r.readAsText(file); });
+}
+function dropZone(el, onFile) {
+  const input = $("input", el);
+  el.addEventListener("click", () => input.click());
+  input.addEventListener("change", () => input.files[0] && onFile(input.files[0]));
+  el.addEventListener("dragover", (e) => { e.preventDefault(); el.classList.add("over"); });
+  el.addEventListener("dragleave", () => el.classList.remove("over"));
+  el.addEventListener("drop", (e) => { e.preventDefault(); el.classList.remove("over"); e.dataTransfer.files[0] && onFile(e.dataTransfer.files[0]); });
+}
+
+// ---------------------------------------------------------------- state & routing
+const S = { state: null, enclave: { status: "unknown" }, runView: null };
+const role = () => (location.hash.split("/")[1] === "auditor" ? "auditor" : location.hash.split("/")[1] === "auditee" ? "auditee" : store.get("role", "auditee"));
+const route = () => location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
+const go = (h) => { if (location.hash !== h) location.hash = h; else renderDetail(); };
+
+async function refresh() {
+  S.state = await api("state");
+  renderSide();
+  return S.state;
+}
+window.addEventListener("hashchange", () => { store.set("role", role()); renderTop(); renderSide(); renderDetail(); });
+
+// ---------------------------------------------------------------- top bar
+function renderTop() {
+  $$("#roles button").forEach(b => b.setAttribute("aria-selected", String(b.dataset.role === role())));
+  const chip = $("#enclaveChip"), e = S.enclave, url = S.state?.settings?.enclave;
+  let dot = "", text = "No enclave set";
+  if (url) {
+    const host = url.replace(/^https?:\/\//, "");
+    if (e.status === "checking") { dot = "run"; text = "Checking " + host; }
+    else if (e.status === "ok" && e.info.mode === "nitro") { dot = e.info.warnings.length ? "warn" : "ok"; text = `Nitro · PCR0 ${short(e.info.pcr0, 8)} · ${host}`; }
+    else if (e.status === "ok") { dot = "warn"; text = "Dev enclave (not attested) · " + host; }
+    else if (e.status === "error") { dot = "bad"; text = "Enclave not verified · " + host; }
+    else text = host;
+  }
+  chip.innerHTML = `<i class="dot ${dot}"></i><span class="t">${esc(text)}</span>`;
+  chip.title = e.status === "error" ? e.error : "Enclave settings";
+}
+$$("#roles button").forEach(b => b.addEventListener("click", () => go("#/" + b.dataset.role)));
+$("#enclaveChip").addEventListener("click", openSettings);
+
+async function checkEnclave(quiet = true) {
+  if (!S.state?.settings?.enclave) { S.enclave = { status: "unknown" }; renderTop(); return; }
+  S.enclave = { status: "checking" }; renderTop();
+  try { S.enclave = { status: "ok", info: await api("enclave", {}) }; }
+  catch (e) { S.enclave = { status: "error", error: e.message }; if (!quiet) toast(e.message, true); }
+  renderTop();
+  return S.enclave;
+}
+
+// ---------------------------------------------------------------- settings sheet
+function openSettings() {
+  const st = S.state.settings;
+  $("#overlay").innerHTML = `
+    <div class="scrim" data-close></div>
+    <aside class="sheet" role="dialog" aria-label="Enclave settings">
+      <div class="pad stack">
+        <div class="row"><h2>Enclave</h2><div class="spacer"></div><button class="btn ghost" data-close>Close</button></div>
+        <p class="muted">Every action checks a fresh attestation from the enclave first. Certificates are checked against the measurements below.</p>
+        <label class="f">Enclave URL<input type="text" id="sEnclave" placeholder="http://54.202.167.71:8080" value="${esc(st.enclave)}"></label>
+        <label class="f">Expected measurements
+          <span class="hint">Path to <code>pcrs.json</code> from a reproducible build (<code>build/build-eif.sh</code>). Without it, any genuine Nitro enclave would pass.</span>
+          <input type="text" id="sPcrs" placeholder="~/attest/build/out/pcrs.json" value="${esc(st.pcrs_path || "")}"></label>
+        <label class="check"><input type="checkbox" id="sSkip" ${st.skip_measurement ? "checked" : ""}><span>Accept any genuine Nitro enclave without measurements<br><span class="faint small">Proves hardware, not which code runs. For trying things out.</span></span></label>
+        <label class="check"><input type="checkbox" id="sDev" ${st.allow_dev ? "checked" : ""}><span>Accept dev-mode enclaves<br><span class="faint small">Local testing only: nothing is attested.</span></span></label>
+        <div class="row"><button class="btn primary" id="sSave">Save and check</button></div>
+        <div id="sResult"></div>
+        <div class="hr"></div>
+        <p class="faint small">Workspace <code>${esc(S.state.workspace)}</code></p>
+      </div>
+    </aside>`;
+  $$("[data-close]").forEach(el => el.addEventListener("click", closeSettings));
+  const show = () => {
+    const e = S.enclave, box = $("#sResult");
+    if (!box) return;
+    if (e.status === "ok") {
+      const i = e.info;
+      box.innerHTML = `<div class="stack">
+        <div class="callout ${i.mode === "nitro" ? "ok" : "warn"}"><span class="ic">${i.mode === "nitro" ? "✓" : "!"}</span><span>${i.mode === "nitro" ? "Verified AWS Nitro enclave." : "Dev-mode enclave: nothing is attested."}</span></div>
+        ${i.warnings.filter(w => !/^DEV MODE/.test(w)).map(w => `<div class="callout warn"><span class="ic">!</span><span>${esc(w)}</span></div>`).join("")}
+        <dl class="kv">
+          <dt>PCR0</dt><dd>${i.pcr0 ? hash(i.pcr0, 24) : "—"}</dd>
+          <dt>Boot</dt><dd>${hash(i.boot_id)} · ${esc(ago(i.booted_at_ms))}</dd>
+          <dt>Harness</dt><dd>${esc(i.harness.version)} · ${esc(i.harness.tools.join(", "))}</dd>
+          <dt>Prompt</dt><dd>${hash(i.harness.system_prompt_sha256)}</dd>
+          <dt>Endpoints</dt><dd>${Object.entries(i.harness.endpoints).map(([k, v]) => `${esc(k)}: <code>${esc(v)}</code>`).join("<br>")}</dd>
+        </dl></div>`;
+    } else if (e.status === "error") box.innerHTML = `<div class="callout bad"><span class="ic">×</span><span>${esc(e.error)}</span></div>`;
+    else box.innerHTML = "";
+  };
+  show();
+  $("#sSave").addEventListener("click", (ev) => busy(ev.currentTarget, async () => {
+    await api("settings", { enclave: $("#sEnclave").value, pcrs_path: $("#sPcrs").value, allow_dev: $("#sDev").checked, skip_measurement: $("#sSkip").checked });
+    await refresh(); await checkEnclave(); show();
+  }));
+}
+function closeSettings() { $("#overlay").innerHTML = ""; }
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeSettings(); });
+
+// ---------------------------------------------------------------- sidebar
+function keyCallout(r) {
+  return `<div class="panel pad stack">
+    <h2>Create your ${r} key</h2>
+    <p class="muted small">${r === "auditor" ? "Signs the questions you send. Auditees and certificates name it." : "Signs your affidavits and receives the encrypted results."} Stored in this workspace only.</p>
+    <button class="btn primary" data-keygen="${r}">Create key</button></div>`;
+}
+function renderSide() {
+  const st = S.state; if (!st) return;
+  const r = role(), cur = route();
+  const sel = (h) => location.hash === h ? `aria-current="true"` : "";
+  let html = "";
+  if (!st.keys[r]) html += keyCallout(r);
+  if (r === "auditor") {
+    const mine = st.questions.filter(q => q.mine);
+    html += `<div class="actions"><button class="btn primary" data-go="#/auditor/new">New question</button><button class="btn" data-go="#/auditor/verify">Verify certificate</button></div>
+    <div class="group"><h3>Your questions</h3>
+      ${mine.length ? mine.map(q => `<button class="item" data-go="#/auditor/q/${q.id}" ${sel("#/auditor/q/" + q.id)}>
+        <div class="l1"><span class="txt">${esc(q.text)}</span></div>
+        <div class="l2"><span>${esc(ago(q.created_at_ms))}</span><span>·</span><span>${received(q.id).length} certificate${received(q.id).length === 1 ? "" : "s"}</span></div></button>`).join("")
+        : `<div class="empty">None yet.</div>`}
+    </div>
+    <div class="group"><h3>Verified certificates</h3>
+      ${st.received.length ? st.received.map(c => `<button class="item" data-go="#/auditor/c/${c.run_id}" ${sel("#/auditor/c/" + c.run_id)}>
+        <div class="l1">${answerPill(c.answer)}<span class="txt">${esc(c.org)}</span></div>
+        <div class="l2"><span class="txt">${esc(c.question_text.slice(0, 60))}</span></div></button>`).join("")
+        : `<div class="empty">Certificates you verify appear here.</div>`}
+    </div>`;
+  } else {
+    const qs = st.questions;
+    html += `<div class="actions"><button class="btn primary" data-go="#/auditee/new">New audit</button><button class="btn" data-go="#/auditee/import">Import question</button></div>
+    <div class="group"><h3>Runs</h3>
+      ${st.runs.length ? st.runs.map(run => `<button class="item" data-go="#/auditee/run/${run.run_id}" ${sel("#/auditee/run/" + run.run_id)}>
+        <div class="l1">${runDot(run)}<span class="txt">${esc(run.question_text)}</span>${run.verdict ? answerPill(run.verdict.answer) : ""}</div>
+        <div class="l2"><span>${esc(run.model)}</span><span>·</span><span>${run.status === "running" ? `${run.steps} model calls` : esc(ago(run.submitted_at_ms))}</span></div></button>`).join("")
+        : `<div class="empty">No runs yet.</div>`}
+    </div>
+    <div class="group"><h3>Questions received</h3>
+      ${qs.length ? qs.map(q => `<button class="item" data-go="#/auditee/new/${q.id}">
+        <div class="l1"><span class="txt">${esc(q.text)}</span></div>
+        <div class="l2"><span>from ${short(q.auditor_key, 8)}</span><span>·</span><span>${esc(ago(q.created_at_ms))}</span></div></button>`).join("")
+        : `<div class="empty">Import the question file the auditor sent you.</div>`}
+    </div>`;
+  }
+  $("#side").innerHTML = html;
+}
+const received = (qid) => (S.state?.received || []).filter(c => c.question_id === qid);
+function runDot(run) {
+  const cls = { running: "run", done: "ok", failed: "bad", lost: "bad" }[run.status] || "";
+  return `<i class="dot ${cls}" title="${esc(run.status)}"></i>`;
+}
+function answerPill(a) {
+  if (!a) return `<span class="pill">no verdict</span>`;
+  return `<span class="pill"><b>${esc(a[0].toUpperCase() + a.slice(1))}</b></span>`;
+}
+document.addEventListener("click", async (e) => {
+  const g = e.target.closest("[data-go]"); if (g) { go(g.dataset.go); return; }
+  const k = e.target.closest("[data-keygen]");
+  if (k) await busy(k, async () => { await api("keys", { role: k.dataset.keygen }); await refresh(); renderDetail(); toast("Key created"); });
+});
+
+// ---------------------------------------------------------------- detail router
+function renderDetail() {
+  const [r, view, id] = route();
+  S.runView = null;
+  const d = $("#detail");
+  if ((r || role()) === "auditor") {
+    if (view === "new") return viewNewQuestion(d);
+    if (view === "q" && id) return viewQuestion(d, id);
+    if (view === "verify") return viewVerify(d);
+    if (view === "c" && id) return viewReceived(d, id);
+    return viewAuditorHome(d);
+  }
+  if (view === "import") return viewImport(d);
+  if (view === "new") return viewNewAudit(d, id);
+  if (view === "run" && id) return viewRun(d, id);
+  return viewAuditeeHome(d);
+}
+
+function intro(title, body, actions = "") {
+  return `<div class="panel pad stack"><h1>${title}</h1><p class="muted">${body}</p>${actions ? `<div class="actions">${actions}</div>` : ""}</div>`;
+}
+
+// ---------------------------------------------------------------- auditor views
+function viewAuditorHome(d) {
+  d.innerHTML = `<div class="stack">${intro("Ask about code you can't see",
+    "Write a question about the auditee's code. They run it through an attested enclave that reads their repository with a model they choose, and you get back a signed verdict plus a record of everything they chose. They see the full transcript and decide whether to release it; you can still see that a run happened.",
+    `<button class="btn primary" data-go="#/auditor/new">New question</button><button class="btn" data-go="#/auditor/verify">Verify a certificate</button>`)}
+    <div class="panel pad stack"><h2>How it works</h2>
+      <ol class="muted" style="margin:0;padding-left:20px;display:flex;flex-direction:column;gap:6px">
+        <li>Sign a question here and send the <code>question.json</code> file to the auditee.</li>
+        <li>The auditee uploads their code, encrypted to the enclave, with a signed affidavit that it is their production code.</li>
+        <li>A model with read-only tools (list, find, read, grep) investigates inside the enclave.</li>
+        <li>The auditee reviews the result and may send you <code>certificate.json</code>. Verify it here.</li>
+        <li>Check the question's run log: every run of your question is listed, released or not.</li>
+      </ol></div></div>`;
+}
+
+function viewNewQuestion(d) {
+  if (!S.state.keys.auditor) { d.innerHTML = keyCallout("auditor"); return; }
+  d.innerHTML = `<div class="panel pad stack">
+    <h1>New question</h1>
+    <label class="f">Question
+      <span class="hint">Ask something the code can answer. Be specific about what would count as yes.</span>
+      <textarea id="qText" placeholder="Does the training pipeline compute loss on chain-of-thought tokens of model outputs?"></textarea></label>
+    <div class="grid2">
+      <label class="f">Step limit<span class="hint">Model calls the auditee's run may use (max 400).</span><input type="number" id="qSteps" min="1" max="400" value="150"></label>
+      <div class="f" style="justify-content:flex-end"><label class="check"><input type="checkbox" id="qFt"><span>Allow fine-tuned models<br><span class="faint small">Off by default: a private fine-tune is the cheapest way to get a model that answers one question wrongly.</span></span></label></div>
+    </div>
+    <div class="row"><button class="btn primary" id="qSign">Sign question</button><span class="faint small">Signed with ${hash(S.state.keys.auditor)}</span></div>
+  </div>`;
+  $("#qSign").addEventListener("click", (e) => busy(e.currentTarget, async () => {
+    const r = await api("questions", { text: $("#qText").value, max_steps: Number($("#qSteps").value), allow_fine_tuned: $("#qFt").checked });
+    await refresh(); go("#/auditor/q/" + r.id); toast("Question signed");
+  }));
+}
+
+function viewQuestion(d, id) {
+  const q = S.state.questions.find(x => x.id === id);
+  if (!q) { d.innerHTML = intro("Question not found", "It may have been removed from the workspace."); return; }
+  const certs = received(id);
+  d.innerHTML = `<div class="stack">
+    <div class="panel pad stack">
+      <h3>Question</h3>
+      <p style="font-size:17px;line-height:1.55;white-space:pre-wrap">${esc(q.text)}</p>
+      <div class="pills"><span class="pill">id ${hash(q.id)}</span><span class="pill">step limit <b>${q.policy.max_steps}</b></span>
+        <span class="pill">${q.policy.allow_fine_tuned ? "fine-tunes allowed" : "no fine-tunes"}</span><span class="pill">${esc(when(q.created_at_ms))}</span></div>
+      <div class="actions"><a class="btn primary" href="/api/questions/${id}/download" download>Download question.json</a>
+        <span class="faint small" style="align-self:center">Send this file to the auditee.</span></div>
+    </div>
+    <div class="panel pad stack">
+      <div class="row"><h2>Runs on the enclave</h2><div class="spacer"></div><button class="btn" id="logBtn">Check run log</button></div>
+      <p class="muted small">Every run of this question's text, by anyone, since the enclave last restarted. A finished run you have no certificate for was withheld.</p>
+      <div id="logOut"></div>
+    </div>
+    <div class="panel pad stack"><h2>Certificates received</h2>
+      ${certs.length ? certs.map(c => `<button class="item" data-go="#/auditor/c/${c.run_id}"><div class="l1">${answerPill(c.answer)}<span class="txt">${esc(c.org)} · run ${short(c.run_id, 8)}</span><span class="faint small">${esc(ago(c.verified_at_ms))}</span></div></button>`).join("")
+        : `<div class="empty" style="padding:0">None yet. <a href="#/auditor/verify">Verify one</a> when it arrives.</div>`}
+    </div></div>`;
+  $("#logBtn").addEventListener("click", (e) => busy(e.currentTarget, async () => {
+    const r = await api(`questions/${id}/log`, {});
+    const have = new Set(certs.map(c => c.run_id));
+    const rows = r.log.entries;
+    $("#logOut").innerHTML = `<div class="stack">
+      <p class="small faint">Signed by enclave boot ${hash(r.log.boot_id)} (started ${esc(when(r.log.booted_at_ms))})${r.enclave.mode === "dev" ? " · dev mode, not attested" : ""}.</p>
+      ${rows.length ? `<div class="scroll-x"><table class="log"><thead><tr><th>Run</th><th>Status</th><th>Submitted</th><th>Model</th><th>Code</th><th>Certificate</th></tr></thead><tbody>
+        ${rows.map(x => `<tr><td>${hash(x.run_id, 8)}</td><td>${esc(x.status)}</td><td>${esc(when(x.submitted_at_ms))}</td><td>${esc(x.provider)} / ${esc(x.model)}</td><td>${hash(x.code_tree_sha256, 8)}</td>
+          <td>${have.has(x.run_id) ? `<span class="pill ok">received</span>` : x.status === "done" ? `<span class="pill warn">not released</span>` : `<span class="pill">—</span>`}</td></tr>`).join("")}
+      </tbody></table></div>` : `<div class="empty" style="padding:0">No runs of this question yet.</div>`}
+      ${new Set(rows.map(x => x.code_tree_sha256)).size > 1 ? `<div class="callout warn"><span class="ic">!</span><span>Runs used ${new Set(rows.map(x => x.code_tree_sha256)).size} different versions of the code.</span></div>` : ""}
+    </div>`;
+  }));
+}
+
+function viewVerify(d) {
+  const mine = S.state.questions.filter(q => q.mine);
+  d.innerHTML = `<div class="stack"><div class="panel pad stack">
+    <h1>Verify a certificate</h1>
+    <p class="muted">Checks the enclave's hardware attestation and measurements, the enclave's signature, the auditee's affidavit, and that it answers your question.</p>
+    <label class="f">Your question<select id="vq"><option value="">Match automatically</option>${mine.map(q => `<option value="${q.id}">${esc(q.text.slice(0, 90))}</option>`).join("")}</select></label>
+    <div class="drop" id="vDrop"><input type="file" accept=".json,application/json"><b>Drop certificate.json</b><br><span class="small">or click to choose</span></div>
+  </div><div id="vOut"></div></div>`;
+  dropZone($("#vDrop"), async (file) => {
+    try {
+      const cert = await readJsonFile(file);
+      let qid = $("#vq").value;
+      if (!qid) {
+        try { const body = JSON.parse(cert.signed.body); if (mine.some(q => q.id === body.manifest.question_id)) qid = body.manifest.question_id; } catch {}
+      }
+      $("#vOut").innerHTML = `<div class="panel pad"><div class="progress"><div class="bigspin"></div><span>Verifying…</span></div></div>`;
+      const r = await api("verify", { certificate: cert, question_id: qid || undefined });
+      await refresh();
+      go("#/auditor/c/" + r.summary.run_id);
+      if (!qid) toast("Verified, but it answers a question that isn't in your workspace", true);
+    } catch (e) {
+      $("#vOut").innerHTML = `<div class="callout bad"><span class="ic">×</span><span><b>Not verified.</b> ${esc(e.message)}</span></div>`;
+    }
+  });
+}
+
+async function viewReceived(d, id) {
+  d.innerHTML = `<div class="panel pad"><div class="progress"><div class="bigspin"></div><span>Re-checking certificate…</span></div></div>`;
+  try {
+    const r = await api("received/" + id);
+    d.innerHTML = `<div class="panel">${reportHtml(r.report, { audience: "auditor", matched: r.summary.matched_question })}</div>`;
+  } catch (e) {
+    d.innerHTML = `<div class="callout bad"><span class="ic">×</span><span><b>This certificate no longer verifies with your current settings.</b> ${esc(e.message)}</span></div>`;
+  }
+}
+
+// ---------------------------------------------------------------- auditee views
+function viewAuditeeHome(d) {
+  d.innerHTML = `<div class="stack">${intro("Answer an auditor without showing your code",
+    "Your code is encrypted to an attested enclave and read by a model you choose, with your own API key. You see the full transcript. The auditor only gets the signed verdict and a record of your choices, and only if you send it.",
+    `<button class="btn primary" data-go="#/auditee/new">New audit</button><button class="btn" data-go="#/auditee/import">Import question</button>`)}
+    <div class="panel pad stack"><h2>What the auditor will be able to see</h2>
+      <div class="grid2 small">
+        <div class="stack" style="gap:6px"><b>In the certificate (if you release it)</b><span class="muted">The verdict and summary; your affidavit; the code's tree hash, file count and size; provider, model and your API key's organization; how many files and tokens were used; counts of instruction-like text in the code; earlier runs of the same question.</span></div>
+        <div class="stack" style="gap:6px"><b>Never</b><span class="muted">Your code, the files read, the transcript, or your API key. Note that the inference provider you choose does receive the code under your agreement with them.</span></div>
+      </div>
+      <div class="callout warn"><span class="ic">!</span><span>The auditor can list every run of their question even if you release nothing, and later certificates say if the code changed between attempts.</span></div>
+    </div></div>`;
+}
+
+function viewImport(d) {
+  d.innerHTML = `<div class="panel pad stack"><h1>Import a question</h1>
+    <p class="muted">Open the <code>question.json</code> file the auditor sent you. Its signature is checked on import.</p>
+    <div class="drop" id="iDrop"><input type="file" accept=".json,application/json"><b>Drop question.json</b><br><span class="small">or click to choose</span></div></div>`;
+  dropZone($("#iDrop"), async (file) => {
+    try { const r = await api("questions/import", { question: await readJsonFile(file) }); await refresh(); go("#/auditee/new/" + r.id); toast("Question imported"); }
+    catch (e) { toast(e.message, true); }
+  });
+}
+
+const PROVIDERS = [
+  { id: "openai", label: "OpenAI", host: "api.openai.com", ph: "gpt-5" },
+  { id: "anthropic", label: "Anthropic", host: "api.anthropic.com", ph: "claude-opus-5-5", models: ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"] },
+  { id: "openrouter", label: "OpenRouter", host: "openrouter.ai", ph: "anthropic/claude-sonnet-5-5" },
+];
+
+function viewNewAudit(d, preselect) {
+  const st = S.state;
+  if (!st.keys.auditee) { d.innerHTML = keyCallout("auditee"); return; }
+  if (!st.questions.length) { viewImport(d); return; }
+  const last = st.settings.last || {};
+  const devOk = S.enclave.status === "ok" && S.enclave.info.mode === "dev";
+  const providers = devOk ? [...PROVIDERS, { id: "mock", label: "Mock (dev)", host: "local", ph: "gpt-mock" }] : PROVIDERS;
+  const f = { qid: preselect || (st.questions.find(q => q.id === last.question_id) ? last.question_id : st.questions[0].id),
+    provider: providers.some(p => p.id === last.provider) ? last.provider : "anthropic", inspected: null };
+  d.innerHTML = `<div class="panel">
+    <div class="pad" style="padding-bottom:6px"><h1>New audit</h1></div>
+    <section class="step" id="st1"><div class="n">1</div><div class="body"><h2>Question</h2>
+      <div class="opts">${st.questions.map(q => `<label class="opt ${q.id === f.qid ? "sel" : ""}"><input type="radio" name="q" value="${q.id}" ${q.id === f.qid ? "checked" : ""}>
+        <span><span style="white-space:pre-wrap">${esc(q.text)}</span><br><span class="faint small">from auditor ${short(q.auditor_key, 10)} · step limit ${q.policy.max_steps}${q.policy.allow_fine_tuned ? " · fine-tunes allowed" : ""}</span></span></label>`).join("")}</div>
+    </div></section>
+    <section class="step" id="st2"><div class="n">2</div><div class="body"><h2>Code</h2>
+      <label class="f">Repository directory<span class="hint">In a git checkout only tracked files are sent, exactly as they are on disk.</span>
+        <div class="row" style="flex-wrap:nowrap"><input type="text" id="aDir" placeholder="~/code/monorepo" value="${esc(last.dir || "")}"><button class="btn" id="aInspect">Inspect</button></div></label>
+      <div id="aCode"></div>
+    </div></section>
+    <section class="step" id="st3"><div class="n">3</div><div class="body"><h2>Model</h2>
+      <div class="seg" id="aProv">${providers.map(p => `<button data-p="${p.id}" aria-selected="${p.id === f.provider}">${esc(p.label)}</button>`).join("")}</div>
+      <div class="grid2">
+        <label class="f">Model<input type="text" id="aModel" list="aModels" value="${esc(last.provider === f.provider ? last.model || "" : "")}"><datalist id="aModels"></datalist></label>
+        <label class="f">API key<span class="hint" style="margin-top:-4px">Used inside the enclave only. Never saved.</span><input type="password" id="aKey" autocomplete="off" placeholder="sk-…"></label>
+      </div>
+      <div id="aProvExtra"></div>
+      <p class="faint small">The auditor will see the provider, the model the provider reported, and the organization that owns this key.</p>
+    </div></section>
+    <section class="step" id="st4"><div class="n">4</div><div class="body"><h2>Affidavit</h2>
+      <div class="grid2">
+        <label class="f">Organization<input type="text" id="aOrg" value="${esc(last.org || "")}" placeholder="Example Lab"></label>
+        <label class="f">Repository URL<input type="text" id="aRepo" placeholder="filled in by Inspect"></label>
+      </div>
+      <label class="f">Commit<input type="text" id="aCommit" placeholder="filled in by Inspect"></label>
+      <blockquote class="affidavit" id="aStatement"><span class="faint">Inspect the repository to see the affidavit.</span></blockquote>
+      <label class="check"><input type="checkbox" id="aSign"><span id="aSignLabel">I sign this affidavit.</span></label>
+      <div class="row"><button class="btn primary" id="aSubmit" disabled>Sign and start audit</button><span class="faint small" id="aWhy">Inspect the repository first.</span></div>
+    </div></section></div>`;
+
+  $$('input[name="q"]').forEach(r => r.addEventListener("change", () => { f.qid = r.value; $$(".opt").forEach(o => o.classList.toggle("sel", $("input", o).checked)); }));
+  const setProvider = (p) => {
+    f.provider = p;
+    $$("#aProv button").forEach(b => b.setAttribute("aria-selected", String(b.dataset.p === p)));
+    const meta = providers.find(x => x.id === p);
+    $("#aModel").placeholder = meta.ph;
+    $("#aModels").innerHTML = (meta.models || []).map(m => `<option value="${m}">`).join("");
+    $("#aProvExtra").innerHTML =
+      p === "openrouter" ? `<label class="check"><input type="checkbox" id="aZdr" checked><span>Route only to zero-data-retention endpoints<br><span class="faint small">Some models have no ZDR endpoint and will fail.</span></span></label>`
+      : p === "mock" ? `<label class="f">Mock server<input type="text" id="aMock" value="127.0.0.1:19999"></label>`
+      : `<p class="faint small">Requests go to <code>${esc(meta.host)}</code>.</p>`;
+    validate();
+  };
+  $$("#aProv button").forEach(b => b.addEventListener("click", () => setProvider(b.dataset.p)));
+
+  let stTimer;
+  const updateStatement = () => {
+    $("#aSignLabel").textContent = `I sign this affidavit on behalf of ${$("#aOrg").value.trim() || "my organization"}.`;
+    if (!f.inspected) return;
+    clearTimeout(stTimer);
+    stTimer = setTimeout(async () => {
+      const r = await api("statement", { org: $("#aOrg").value, tree: f.inspected.tree, repo_url: $("#aRepo").value, git_commit: $("#aCommit").value });
+      $("#aStatement").textContent = r.statement;
+    }, 150);
+  };
+  const validate = () => {
+    const missing = !f.inspected ? "Inspect the repository first."
+      : (f.inspected.git.dirty && !$("#aDirty")?.checked) ? "The repository has uncommitted changes."
+      : !$("#aModel").value.trim() ? "Enter a model." : !$("#aKey").value.trim() ? "Enter the API key."
+      : !$("#aOrg").value.trim() ? "Enter your organization." : !$("#aSign").checked ? "Confirm the affidavit." : "";
+    $("#aSubmit").disabled = !!missing; $("#aWhy").textContent = missing;
+    $("#st2").classList.toggle("done", !!f.inspected);
+    $("#st3").classList.toggle("done", !!($("#aModel").value.trim() && $("#aKey").value.trim()));
+    $("#st4").classList.toggle("done", $("#aSign").checked);
+  };
+  ["aModel", "aKey", "aOrg", "aRepo", "aCommit"].forEach(id => $("#" + id).addEventListener("input", () => { if (["aOrg", "aRepo", "aCommit"].includes(id)) { $("#aSign").checked = false; updateStatement(); } validate(); }));
+  $("#aSign").addEventListener("change", validate);
+  $("#st1").classList.add("done");
+
+  const inspect = (btn) => busy(btn, async () => {
+    f.inspected = null; $("#aSign").checked = false; validate();
+    const r = await api("inspect", { dir: $("#aDir").value });
+    f.inspected = r;
+    $("#aRepo").value = r.git.remote || ""; $("#aCommit").value = r.git.head || "";
+    $("#aCode").innerHTML = `<div class="stack" style="gap:10px">
+      <div class="pills"><span class="pill"><b>${num(r.file_count)}</b> files</span><span class="pill"><b>${bytes(r.total_bytes)}</b></span><span class="pill">tree ${hash(r.tree)}</span>
+        ${r.git.is_repo ? `<span class="pill">commit <b>${short(r.git.head, 10)}</b></span>` : `<span class="pill warn">not a git repository</span>`}</div>
+      ${r.git.dirty ? `<div class="callout warn"><span class="ic">!</span><span>Tracked files have uncommitted changes, so the commit named in the affidavit would not match the code sent. Commit first, or
+        <label class="check" style="display:inline-flex;margin-top:6px"><input type="checkbox" id="aDirty"><span>send anyway</span></label></span></div>` : ""}
+    </div>`;
+    $("#aDirty")?.addEventListener("change", validate);
+    updateStatement(); validate();
+  });
+  $("#aInspect").addEventListener("click", (e) => inspect(e.currentTarget));
+  $("#aDir").addEventListener("keydown", (e) => { if (e.key === "Enter") inspect($("#aInspect")); });
+  $("#aDir").addEventListener("input", () => { f.inspected = null; $("#aCode").innerHTML = ""; $("#aStatement").innerHTML = `<span class="faint">Inspect the repository to see the affidavit.</span>`; validate(); });
+
+  $("#aSubmit").addEventListener("click", (e) => busy(e.currentTarget, async () => {
+    const body = { question_id: f.qid, dir: $("#aDir").value, expected_tree: f.inspected.tree, provider: f.provider, model: $("#aModel").value,
+      api_key: $("#aKey").value, org: $("#aOrg").value, repo_url: $("#aRepo").value, git_commit: $("#aCommit").value,
+      zdr: $("#aZdr")?.checked || false, mock_endpoint: $("#aMock")?.value, allow_dirty: $("#aDirty")?.checked || false, sign: $("#aSign").checked };
+    const r = await api("submit", body);
+    api("settings", { last: { question_id: f.qid, dir: body.dir, provider: body.provider, model: body.model, org: body.org } }).catch(() => {});
+    await refresh(); go("#/auditee/run/" + r.run_id); toast("Submitted");
+  }));
+  setProvider(f.provider);
+  if (last.dir) inspect($("#aInspect")).catch(() => {});
+}
+
+async function viewRun(d, id, tab) {
+  S.runView = { id, tab: tab || S.runView?.tab || "result", sig: "" };
+  const load = async () => {
+    if (S.runView?.id !== id) return;
+    const r = await api("runs/" + id);
+    const sig = JSON.stringify([r.meta.status, r.meta.steps, r.meta.error, !!r.report]);
+    if (sig === S.runView.sig) return;
+    S.runView.sig = sig;
+    renderRun(d, r);
+  };
+  d.innerHTML = `<div class="panel pad"><div class="progress"><div class="bigspin"></div></div></div>`;
+  await load().catch(e => d.innerHTML = `<div class="callout bad"><span class="ic">×</span><span>${esc(e.message)}</span></div>`);
+  S.runView.load = load;
+}
+
+function renderRun(d, r) {
+  const m = r.meta;
+  const head = `<div class="pad stack" style="gap:10px">
+    <div class="row"><span class="pill">${runDot(m)} ${esc(m.status)}</span><span class="faint small">${esc(when(m.submitted_at_ms))} · ${esc(m.provider)} / ${esc(m.model)} · ${num(m.file_count)} files</span></div>
+    <h2 style="font-size:18px;line-height:1.45;white-space:pre-wrap">${esc(m.question_text)}</h2></div>`;
+  if (m.status === "running") {
+    d.innerHTML = `<div class="panel">${head}<div class="pad" style="border-top:1px solid var(--line)">
+      <div class="progress"><div class="bigspin"></div><div><b>The model is reading your code</b><br><span class="muted">${m.steps} model call${m.steps === 1 ? "" : "s"} so far. You can leave this page; the run continues in the enclave.</span></div></div>
+      ${m.error ? `<div class="callout warn" style="margin-top:14px"><span class="ic">!</span><span>${esc(m.error)}</span></div>` : ""}
+    </div></div>`;
+    return;
+  }
+  if (!r.report) {
+    d.innerHTML = `<div class="panel">${head}<div class="pad"><div class="callout bad"><span class="ic">×</span><span>${esc(m.error || r.report_error || "No result.")}</span></div></div></div>`;
+    return;
+  }
+  const tab = S.runView.tab;
+  d.innerHTML = `<div class="stack">
+    <div class="panel">${head}
+      <div class="tabs" role="tablist"><button data-tab="result" aria-selected="${tab === "result"}">Result</button><button data-tab="transcript" aria-selected="${tab === "transcript"}">Transcript</button></div>
+      <div id="runBody"></div></div>
+    <div class="panel pad stack">
+      <h2>Release to the auditor</h2>
+      <p class="muted">The certificate contains the verdict and summary above and the record under "Details". It does not contain your code, the transcript, or your API key. Read both tabs before sending it.</p>
+      ${m.error ? `<div class="callout warn"><span class="ic">!</span><span>${esc(m.error)}</span></div>` : ""}
+      <div class="actions"><a class="btn primary" href="/api/runs/${m.run_id}/certificate" download>Download certificate.json</a></div>
+    </div></div>`;
+  const body = $("#runBody");
+  const show = (t) => {
+    S.runView.tab = t;
+    $$(".tabs button", d).forEach(b => b.setAttribute("aria-selected", String(b.dataset.tab === t)));
+    body.innerHTML = t === "result" ? reportHtml(r.report, { audience: "auditee" }) : `<div class="pad">${transcriptHtml(r.trace)}</div>`;
+  };
+  $$(".tabs button", d).forEach(b => b.addEventListener("click", () => show(b.dataset.tab)));
+  show(tab);
+}
+
+// ---------------------------------------------------------------- report
+const CATEGORY = {
+  addressed_to_auditor_or_ai: "addressed to an auditor or AI",
+  instruction_override: "\"ignore previous instructions\"",
+  self_assessment_claim: "claims about what the code does not do",
+  verdict_steering: "steering a verdict",
+  chat_markup: "chat or role markup",
+};
+function scanPills(c) {
+  const e = Object.entries(c.matches_by_category || {});
+  if (!e.length) return `<span class="faint">none</span>`;
+  return `<div class="pills">${e.map(([k, n]) => `<span class="pill">${esc(CATEGORY[k] || k)} <b>${n}</b></span>`).join("")}</div>`;
+}
+function reportHtml(rep, { audience, matched }) {
+  const m = rep.manifest, v = rep.verdict, en = rep.enclave, a = rep.affidavit, q = rep.question;
+  const verified = en.mode === "nitro"
+    ? `<div class="callout ok"><span class="ic">✓</span><span>Signed by an attested AWS Nitro enclave · PCR0 ${hash(en.pcr0, 16)}${audience === "auditor" && matched === false ? " · <b>not matched to one of your questions</b>" : ""}</span></div>`
+    : `<div class="callout warn"><span class="ic">!</span><span>Signed by a <b>dev-mode</b> enclave. Nothing about how this was produced is attested.</span></div>`;
+  const ans = v ? v.answer : null;
+  const verdict = v ? `<div class="verdict">
+      <div class="answer ${ans}">${esc(ans[0].toUpperCase() + ans.slice(1))}</div>
+      <div class="stack" style="gap:4px"><span class="faint small">Model's confidence ${Math.round(v.confidence * 100)}%</span><div class="meter"><i style="width:${Math.round(v.confidence * 100)}%"></i></div></div>
+    </div><p class="summary">${esc(v.summary)}</p>`
+    : `<div class="callout bad"><span class="ic">×</span><span>No verdict: ${esc(m.outcome.message || m.outcome.kind)}</span></div>`;
+  const warn = rep.warnings.filter(w => !/^DEV MODE/.test(w));
+  return `<div class="pad stack">
+    ${verified}
+    <div class="stack" style="gap:12px">${verdict}</div>
+    ${warn.length ? `<div class="stack" style="gap:8px"><h3>${audience === "auditor" ? "Weigh these" : "The auditor will see these flags"}</h3><ul class="weigh">${warn.map(w => `<li>${esc(w)}</li>`).join("")}</ul></div>` : ""}
+    <div class="stack" style="gap:8px"><h3>Details</h3>
+    <div class="facts">
+      <div class="fact"><h3>Question</h3><p style="white-space:pre-wrap">${esc(q.text)}</p><dl class="kv"><dt>id</dt><dd>${hash(m.question_id)}</dd><dt>auditor</dt><dd>${hash(m.question.public_key)}</dd></dl></div>
+      <div class="fact"><h3>Auditee's affidavit</h3><dl class="kv"><dt>org</dt><dd>${esc(a.organization)}</dd><dt>repo</dt><dd>${esc(a.repo_url || "not named")}</dd><dt>commit</dt><dd>${a.git_commit ? hash(a.git_commit, 12) : "not named"}</dd><dt>key</dt><dd>${hash(m.auditee_public_key)}</dd></dl>
+        <details><summary class="small">Statement</summary><p class="small" style="margin-top:6px">${esc(a.statement)}</p></details></div>
+      <div class="fact"><h3>Code</h3><dl class="kv"><dt>files</dt><dd>${num(m.code.file_count)} (${num(m.code.text_file_count)} text)</dd><dt>size</dt><dd>${bytes(m.code.total_bytes)}</dd><dt>tree</dt><dd>${hash(m.code.tree_sha256)}</dd></dl></div>
+      <div class="fact"><h3>Model</h3><dl class="kv"><dt>requested</dt><dd>${esc(m.model.requested_model)}</dd><dt>reported</dt><dd>${esc(m.model.response_models.join(", ") || "—")}</dd><dt>endpoint</dt><dd><code>${esc(m.model.endpoint)}</code></dd><dt>key owner</dt><dd>${esc(m.model.key_owner || "not reported")}</dd>
+        ${m.model.upstream_providers.length ? `<dt>upstream</dt><dd>${esc(m.model.upstream_providers.join(", "))}</dd>` : ""}${m.model.openrouter_zdr !== null ? `<dt>ZDR</dt><dd>${m.model.openrouter_zdr ? "requested" : "off"}</dd>` : ""}</dl></div>
+      <div class="fact"><h3>What the model did</h3><dl class="kv"><dt>model calls</dt><dd>${num(m.activity.llm_calls)}</dd><dt>files read</dt><dd>${num(m.activity.files_read)}</dd><dt>searches</dt><dd>${num(m.activity.grep_calls)} grep · ${num(m.activity.find_calls)} find · ${num(m.activity.list_calls)} list</dd><dt>tokens</dt><dd>${num(m.activity.input_tokens)} in · ${num(m.activity.output_tokens)} out</dd><dt>duration</dt><dd>${Math.max(1, Math.round((m.finished_at_ms - m.started_at_ms) / 1000))} s</dd></dl></div>
+      <div class="fact"><h3>Earlier attempts</h3><dl class="kv"><dt>same question</dt><dd>${num(m.history.prior_runs_same_question_text)}</dd><dt>by this auditee</dt><dd>${num(m.history.prior_runs_same_auditee)}</dd><dt>other code versions</dt><dd>${num(m.history.prior_code_hashes_same_question_text.filter(h => h !== m.code.tree_sha256).length)}</dd></dl><p class="faint small">Since enclave boot ${short(m.boot_id, 8)}.</p></div>
+      <div class="fact" style="grid-column:1/-1"><h3>Instruction-like text in the code</h3><p class="faint small">Text that could steer a model. Common and usually harmless in AI code; worth comparing with the verdict.</p>
+        <dl class="kv"><dt>files read</dt><dd>${m.instruction_scan.files_read.files_with_matches} file(s) ${scanPills(m.instruction_scan.files_read)}</dd><dt>whole repo</dt><dd>${m.instruction_scan.whole_bundle.files_with_matches} file(s) ${scanPills(m.instruction_scan.whole_bundle)}</dd></dl></div>
+    </div></div>
+    <details><summary class="small">Raw manifest</summary><pre class="raw">${esc(JSON.stringify(m, null, 2))}</pre></details>
+  </div>`;
+}
+
+function transcriptHtml(trace) {
+  if (!trace) return `<div class="empty">No transcript.</div>`;
+  const out = [];
+  for (const e of trace) {
+    if (e.type === "system") out.push(`<div class="ev"><div class="who">Harness</div><div class="what"><details><summary class="small">Fixed system prompt (same for every run)</summary><pre>${esc(e.content)}</pre></details></div></div>`);
+    else if (e.type === "user") out.push(`<div class="ev"><div class="who">Task</div><div class="what"><pre style="margin:0">${esc(e.content)}</pre></div></div>`);
+    else if (e.type === "assistant") {
+      const calls = (e.tool_calls || []).filter(c => c.name !== "submit_verdict").map(c => {
+        const a = c.args || {}; const main = a.path ?? a.pattern ?? "";
+        const extra = Object.entries(a).filter(([k]) => !["path", "pattern"].includes(k)).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(" ");
+        return `<span class="call"><b>${esc(c.name)}</b> ${esc(main === "" ? "(root)" : main)}${extra ? ` <span class="faint">${esc(extra)}</span>` : ""}</span>`;
+      }).join("");
+      const verdict = (e.tool_calls || []).find(c => c.name === "submit_verdict");
+      out.push(`<div class="ev"><div class="who">Model</div><div class="what">${e.text ? `<p style="white-space:pre-wrap;margin-bottom:4px">${esc(e.text)}</p>` : ""}${calls}${verdict ? `<span class="call"><b>submit_verdict</b> ${esc(verdict.args?.answer)}</span>` : ""}</div></div>`);
+    } else if (e.type === "tool_result" && e.name !== "submit_verdict") {
+      const c = String(e.content || ""); const lines = c.split("\n").length;
+      out.push(`<div class="ev"><div class="who"></div><div class="what"><details><summary class="small">${esc(e.name)} result · ${num(lines)} line${lines === 1 ? "" : "s"}</summary><pre>${esc(c)}</pre></details></div></div>`);
+    } else if (e.type === "harness") out.push(`<div class="ev"><div class="who">Harness</div><div class="what faint">${esc(e.content)}</div></div>`);
+    else if (e.type === "error") out.push(`<div class="ev"><div class="who">Error</div><div class="what"><div class="callout bad"><span>${esc(e.content)}</span></div></div></div>`);
+    else if (e.type === "files_read") out.push(`<div class="ev"><div class="who">Files read</div><div class="what"><div class="pills">${(e.paths || []).map(p => `<span class="pill mono">${esc(p)}</span>`).join("") || `<span class="faint">none</span>`}</div></div></div>`);
+  }
+  return `<div class="tx">${out.join("")}</div>`;
+}
+
+// ---------------------------------------------------------------- boot
+(async function boot() {
+  if (!location.hash) history.replaceState(null, "", "#/" + store.get("role", "auditee"));
+  try { await refresh(); } catch (e) { $("#detail").innerHTML = `<div class="callout bad"><span class="ic">×</span><span>Cannot reach the attest app: ${esc(e.message)}</span></div>`; return; }
+  renderTop(); renderDetail();
+  checkEnclave();
+  setInterval(async () => {
+    const running = S.state?.runs?.some(r => r.status === "running");
+    if (!running && !S.runView) return;
+    try { await refresh(); if (S.runView?.load) await S.runView.load(); } catch {}
+  }, 2000);
+})();
+</script>
+</body>
+</html>

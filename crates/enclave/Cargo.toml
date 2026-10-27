@@ -1,0 +1,33 @@
+[package]
+name = "attest-enclave"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+attest-core = { path = "../core" }
+anyhow.workspace = true
+base64.workspace = true
+bytes.workspace = true
+clap.workspace = true
+hex.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+rand.workspace = true
+regex.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tar.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+age.workspace = true
+webpki-roots = "1"
+ed25519-dalek = "2"
+url = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-vsock.workspace = true
+aws-nitro-enclaves-nsm-api = "0.5"
+serde_bytes = "0.11"

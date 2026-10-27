@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/enclave", "crates/host", "crates/cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+base64 = "0.22"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+hex = "0.4"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+rand = "0.8"
+regex = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tar = { version = "0.4", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-vsock = "0.7"
+age = "0.11"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+# i18n-embed-fl 0.9.x (pulled in by age 0.11) emits code in HashMap order,
+# which is randomly seeded per rustc process, so enclave builds would not be
+# reproducible. Patched copy from timelock-proxy; see vendor/i18n-embed-fl/PATCHED.md.
+[patch.crates-io]
+i18n-embed-fl = { path = "vendor/i18n-embed-fl" }
