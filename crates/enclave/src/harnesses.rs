@@ -285,7 +285,8 @@ async fn run_jailed(
                 continue;
             }
             let l: String = l.chars().take(4000).collect();
-            budget = budget.saturating_sub(l.len());
+            // Charge per line too, so empty lines can't make unbounded updates.
+            budget = budget.saturating_sub(l.len() + 200);
             batch.push(l);
             if batch.len() >= 20 {
                 p2(vec![

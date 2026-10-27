@@ -528,9 +528,9 @@ function renderDisclosures(v) {
     body += `<p class="muted">Nothing disclosed. The auditee can choose to show you files, or the output of scripts run over the code, each signed by the enclave.</p>`;
   }
   body += ds.slice().reverse().map(d => `<div class="stack" style="gap:6px;border-top:1px solid var(--line);padding-top:10px">
-    <div class="row"><b>#${d.number}</b> ${statusPill(d.status)}<span class="faint small">${esc(ago(d.body.published_at_ms || d.body.created_at_ms))}</span></div>
+    <div class="row"><b>${d.status === "published" ? "#" + d.number : "draft " + d.draft}</b> ${statusPill(d.status)}<span class="faint small">${esc(ago(d.body.published_at_ms || d.body.created_at_ms))}</span></div>
     ${d.body.note ? `<p class="small">${esc(d.body.note)}</p>` : ""}${disclosureContent(d.body.content)}
-    ${d.status === "draft" ? `<div class="row"><button class="btn primary" data-act="disc-publish" data-n="${d.number}">Publish to auditor</button><button class="btn danger" data-act="disc-discard" data-n="${d.number}">Discard</button></div>`
+    ${d.status === "draft" ? `<div class="row"><button class="btn primary" data-act="disc-publish" data-n="${d.draft}">Publish to auditor</button><button class="btn danger" data-act="disc-discard" data-n="${d.draft}">Discard</button></div>`
       : `<div class="row"><a class="btn" href="#" data-act="disc-get" data-n="${d.number}">Download signed disclosure</a><span class="faint small">Check it with <code>attest verify</code>.</span></div>`}</div>`).join("");
   patch("cDisclose", `<div class="card-head"><h2>Disclosures</h2></div><div class="pad stack">${body}</div>`);
 }

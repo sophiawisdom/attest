@@ -49,6 +49,8 @@ pub struct Ctx {
     pub public_name: Option<String>,
     pub max_code_bytes: usize,
     pub slots: tokio::sync::Semaphore,
+    /// Python disclosures get their own slot, apart from runs.
+    pub disclosure_slots: tokio::sync::Semaphore,
     pub store: Store,
 }
 
@@ -89,6 +91,9 @@ struct State {
 /// A disclosure starts as a draft only the auditee sees; publishing signs
 /// it and shows it to the auditor.
 struct DisclosureState {
+    /// The auditee's handle for it. `body.number` is assigned only when it
+    /// is published, so the auditor's numbering says nothing about drafts.
+    draft: u32,
     body: DisclosureBody,
     /// draft | published | discarded
     status: &'static str,
@@ -292,6 +297,27 @@ impl Session {
         let i = ri(role);
         st.versions[i] += 1;
         let _ = self.tx[i].send(st.versions[i]);
+    }
+
+    /// Email `role` now, if they asked for email.
+    fn email(&self, ctx: &Arc<Ctx>, role: Role, text: String) {
+        let prefs = self.st.lock().unwrap().notify.get(&role).cloned();
+        if let Some(NotifyPrefs {
+            email: Some(email),
+            email_status,
+            ..
+        }) = prefs
+        {
+            let verified = email_status == "verified";
+            tokio::spawn(crate::notify::deliver(
+                ctx.clone(),
+                self.id.clone(),
+                role,
+                email,
+                verified,
+                text,
+            ));
+        }
     }
 
     /// Record an event, wake long-polls, and notify the parties it concerns
@@ -1114,7 +1140,13 @@ impl Session {
             }),
             "models": st.models.iter().map(|m| m.public()).collect::<Vec<_>>(),
             "runs": runs,
-            "disclosures": st.disclosures.iter().filter(|d| role == Role::Auditee || d.status == "published").map(disclosure_view).collect::<Vec<_>>(),
+            "disclosures": st.disclosures.iter().filter(|d| role == Role::Auditee || d.status == "published").map(|d| {
+                let mut v = disclosure_view(d);
+                if role == Role::Auditor {
+                    v.as_object_mut().unwrap().remove("draft");
+                }
+                v
+            }).collect::<Vec<_>>(),
             "events": events,
             "last_event_seq": st.event_counts[ri(role)],
             "notify": st.notify.get(&role).cloned().unwrap_or_default(),
@@ -1207,7 +1239,7 @@ impl Session {
                     anyhow!("the python sandbox is still starting up; try again in a minute")
                 })?;
                 let _slot = ctx
-                    .slots
+                    .disclosure_slots
                     .acquire()
                     .await
                     .map_err(|_| anyhow!("shutting down"))?;
@@ -1244,19 +1276,22 @@ impl Session {
             schema: "attest/disclosure-body/v1".into(),
             session_id: self.id.clone(),
             boot_id: ctx.info.boot_id.clone(),
-            number: st.disclosures.len() as u32 + 1,
+            number: 0,
             code_commitment_sha256: bundle.info.commitment_sha256.clone(),
             note,
             created_at_ms: now_ms(),
             published_at_ms: 0,
             content,
         };
+        let draft = st.disclosures.len() as u32 + 1;
         let out = disclosure_view(&DisclosureState {
+            draft,
             body: body.clone(),
             status: "draft",
             signed: None,
         });
         st.disclosures.push(DisclosureState {
+            draft,
             body,
             status: "draft",
             signed: None,
@@ -1282,7 +1317,7 @@ impl Session {
         let d = st
             .disclosures
             .iter_mut()
-            .find(|d| d.body.number == number)
+            .find(|d| d.draft == number)
             .ok_or_else(|| anyhow!("no such disclosure"))?;
         ensure!(
             d.status == "draft",
@@ -1298,6 +1333,19 @@ impl Session {
             current.as_deref() == Some(d.body.code_commitment_sha256.as_str()),
             "the code changed since this draft was made; draft it again"
         );
+        let _ = d;
+        let published = st
+            .disclosures
+            .iter()
+            .filter(|d| d.status == "published")
+            .count() as u32;
+        let d = st
+            .disclosures
+            .iter_mut()
+            .find(|d| d.draft == number)
+            .unwrap();
+        d.body.number = published + 1;
+        let number = d.body.number;
         d.body.published_at_ms = now_ms();
         let signed = sign::sign(&ctx.signing, DOMAIN_DISCLOSURE, &d.body)?;
         d.signed = Some(Disclosure {
@@ -1306,9 +1354,10 @@ impl Session {
             signed,
         });
         d.status = "published";
+        // No path or content in the text: it can go out by email.
         let what = match &d.body.content {
-            DisclosureContent::File { path, .. } => format!("the file {path}"),
-            DisclosureContent::Python { .. } => "the output of a script run over the code".into(),
+            DisclosureContent::File { .. } => "a file",
+            DisclosureContent::Python { .. } => "a script's output",
         };
         let out = disclosure_view(d);
         self.event(
@@ -1399,8 +1448,38 @@ impl RunJob {
                         .count() as u32;
                     r.trace.extend(entries);
                 }
-                session.changed_for(&mut st, Role::Auditee);
+                // No wake-up here: the ticker below wakes the auditee on a
+                // fixed schedule, so the timing of their trace fetches (which
+                // the parent sees) doesn't follow what the agent does.
             });
+        let ticker = {
+            let session = self.session.clone();
+            tokio::spawn(async move {
+                let mut t = tokio::time::interval(Duration::from_secs(5));
+                loop {
+                    t.tick().await;
+                    let mut st = session.st.lock().unwrap();
+                    session.changed_for(&mut st, Role::Auditee);
+                }
+            })
+        };
+        // Email the auditee at the run's time limit, whether or not it has
+        // finished: a completion-triggered email would carry its timing.
+        {
+            let (session, ctx, n) = (self.session.clone(), self.ctx.clone(), self.number);
+            let limit = run_time_limit(self.question.max_steps);
+            tokio::spawn(async move {
+                tokio::time::sleep(limit).await;
+                let decided =
+                    session.st.lock().unwrap().runs.iter().any(|r| {
+                        r.number == n && (r.status == "released" || r.status == "declined")
+                    });
+                if decided {
+                    return;
+                }
+                session.email(&ctx, Role::Auditee, format!("Run {n} has had its full time ({} min). Once it has finished, review it and decide whether to release it.", limit.as_secs() / 60));
+            });
+        }
         // Load all the code into enclave memory first; from here on the
         // host sees no reads that depend on what the agent does.
         let pin = self.bundle.pin().await;
@@ -1418,8 +1497,7 @@ impl RunJob {
                 key_owner: None,
             },
             (Ok(_), Some((provider, model, key, zdr))) => {
-                let timeout =
-                    Duration::from_secs((self.question.max_steps as u64 * 20).clamp(300, 1800));
+                let timeout = run_time_limit(self.question.max_steps);
                 crate::harnesses::run_codex(
                     self.ctx.net.clone(),
                     &self.run_id,
@@ -1516,14 +1594,20 @@ impl RunJob {
             format!("Run {n} finished. Review it and decide whether to release it."),
             Some(Role::Auditee),
             None,
-            true,
+            false,
         );
+        ticker.abort();
 
         let s = self.session.clone();
         drop(st);
         let mut st = s.st.lock().unwrap();
         s.maybe_start(&self.ctx, &mut st);
     }
+}
+
+/// How long a run may take; also when the auditee is emailed about it.
+fn run_time_limit(max_steps: u32) -> Duration {
+    Duration::from_secs((max_steps as u64 * 20).clamp(300, 1800))
 }
 
 /// With a strict answer format, the result should carry little beyond the
@@ -1567,7 +1651,7 @@ fn auditor_sees_finish(_st: &State, _r: &RunState) -> bool {
 }
 
 fn disclosure_view(d: &DisclosureState) -> Value {
-    json!({"number": d.body.number, "status": d.status, "body": d.body})
+    json!({"draft": d.draft, "number": d.body.number, "status": d.status, "body": d.body})
 }
 
 fn run_view(r: &RunState, role: Role, st: &State) -> Value {

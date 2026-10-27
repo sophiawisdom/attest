@@ -91,3 +91,9 @@ sandbox mode, so only confirmed addresses get mail. Agents poll instead. See
   (`deploy/self-host.sh`): then the parent is theirs.
 - Before release the auditor sees only a salted commitment to the code, not
   its tree hash, size or file count; each released certificate opens it.
+- Sessions on one server share its CPUs and run slots. Someone running other
+  sessions on the same server can notice when a run frees its slot, which
+  says roughly when it finished (the auditor's own view never does). The
+  auditee's live trace refreshes on a fixed 5-second tick and run emails go
+  out at the run's time limit, not when it ends. For the strict setting,
+  self-host so no one else shares the server.

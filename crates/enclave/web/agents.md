@@ -91,8 +91,8 @@ is written for an agent to follow, and takes one script.
     `POST /api/sessions/ID/disclosures` with
     `{"kind": "file", "path": "...", "note": "..."}` or
     `{"kind": "python", "code": "...", "note": "..."}`. This makes a draft only
-    the auditee sees. `POST /api/sessions/ID/disclosures/N/decision`
-    `{"publish": true}` signs it, binds it to the code commitment, and shows it
+    the auditee sees. `POST /api/sessions/ID/disclosures/DRAFT/decision` (the `draft` id from
+    the response) `{"publish": true}` numbers and signs it, binds it to the code commitment, and shows it
     to the auditor (`false` discards it). Either party can fetch a published
     one with `GET /api/sessions/ID/disclosures/N` and check it with
     `attest verify FILE`. Disclosures are the auditee's choice: nothing about

@@ -299,6 +299,7 @@ async fn main() -> Result<()> {
         upload_slots: tokio::sync::Semaphore::new(2),
         sandbox: Arc::new(std::sync::OnceLock::new()),
         slots: tokio::sync::Semaphore::new(args.concurrency),
+        disclosure_slots: tokio::sync::Semaphore::new(1),
         store: sessions::Store::default(),
     });
     let app = Arc::new(App {
