@@ -201,6 +201,13 @@ fn public(ip: IpAddr) -> bool {
     }
 }
 
+/// The `peer` in the config file, if any.
+fn configured_peer(args: &Args) -> Option<String> {
+    let body = std::fs::read(args.config.as_ref()?).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
+    v["peer"].as_str().map(str::to_string)
+}
+
 async fn handle_tunnel<S: Io>(args: Args, s: S) -> Result<()> {
     let mut r = BufReader::new(s);
     let mut line = String::new();
@@ -225,9 +232,12 @@ async fn handle_tunnel<S: Io>(args: Args, s: S) -> Result<()> {
             .and_then(|r| r.ok())
             .map(|a| a.collect())
             .unwrap_or_default();
-    let ok_addr = addrs
-        .into_iter()
-        .find(|a| (port == 443 && public(a.ip())) || (args.dev && a.ip().is_loopback()));
+    // Besides public HTTPS: the peer enclave this machine's config names
+    // (a failover pair talks over the private network; deploy/pair.sh).
+    let peer = configured_peer(&args).filter(|p| *p == target);
+    let ok_addr = addrs.into_iter().find(|a| {
+        (port == 443 && (public(a.ip()) || peer.is_some())) || (args.dev && a.ip().is_loopback())
+    });
     let Some(addr) = ok_addr else {
         r.get_mut()
             .write_all(b"ERR destination not allowed\n")
