@@ -60,7 +60,10 @@ mkdir -p "$STATE_DIR"
 # shellcheck disable=SC1090
 [ -f "$STATE" ] && source "$STATE"
 BUCKET=${BUCKET_ARG:-${BUCKET:-}}
-save() { printf 'REGION=%q\nINSTANCE=%q\nSG=%q\nALLOC=%q\nIP=%q\nBUCKET=%q\n' "$REGION" "${INSTANCE:-}" "${SG:-}" "${ALLOC:-}" "${IP:-}" "${BUCKET:-}" > "$STATE"; }
+# The handoff token gates moving sessions between enclaves of this
+# deployment (see crates/enclave/src/handoff.rs). Made once, kept here.
+HANDOFF_TOKEN=${HANDOFF_TOKEN:-$(openssl rand -hex 24)}
+save() { printf 'REGION=%q\nINSTANCE=%q\nSG=%q\nALLOC=%q\nIP=%q\nBUCKET=%q\nHANDOFF_TOKEN=%q\n' "$REGION" "${INSTANCE:-}" "${SG:-}" "${ALLOC:-}" "${IP:-}" "${BUCKET:-}" "$HANDOFF_TOKEN" > "$STATE"; chmod 600 "$STATE"; }
 
 # Enclave size per instance type: the parent keeps the rest.
 case "$TYPE" in
@@ -240,10 +243,10 @@ done
 "${SSH[@]}" 'test -f /var/lib/attest-bootstrapped' || { echo "instance setup did not finish; check /var/log/cloud-init-output.log on it" >&2; exit 1; }
 
 say "building the enclave image on the instance (about 10 minutes)"
-CONFIG=$(ACME_DIR="${ACME_DIR:-}" DOMAIN="$DOMAIN" OPERATOR="$OPERATOR" IP="$IP" EMAIL_FROM="$EMAIL_FROM" REGION="$REGION" python3 -c '
+CONFIG=$(ACME_DIR="${ACME_DIR:-}" DOMAIN="$DOMAIN" OPERATOR="$OPERATOR" IP="$IP" EMAIL_FROM="$EMAIL_FROM" REGION="$REGION" HANDOFF_TOKEN="$HANDOFF_TOKEN" python3 -c '
 import json, os
 e = lambda k: os.environ[k] or None
-print(json.dumps({"domain": e("DOMAIN"), "operator": e("OPERATOR"), "public_ip": e("IP"), "email_from": e("EMAIL_FROM"), "ses_region": e("REGION"), "acme_directory": e("ACME_DIR")}))')
+print(json.dumps({"domain": e("DOMAIN"), "operator": e("OPERATOR"), "public_ip": e("IP"), "email_from": e("EMAIL_FROM"), "ses_region": e("REGION"), "acme_directory": e("ACME_DIR"), "handoff_token": e("HANDOFF_TOKEN")}))')
 "${SSH[@]}" "set -euo pipefail
   if [ \"\$(cat attest-src/build/out/built-commit 2>/dev/null)\" = '$COMMIT' ]; then
     echo 'enclave image for $COMMIT already built; reusing it'; cd attest-src
