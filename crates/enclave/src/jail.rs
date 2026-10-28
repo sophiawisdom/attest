@@ -239,7 +239,22 @@ pub struct Spec {
     /// loopback port inside the jail's own network namespace bridged to it.
     pub proxy_socket: String,
     pub proxy_port: u16,
+    /// User and group the agent runs as: different for every concurrent
+    /// run, so process limits and /proc visibility aren't shared.
+    #[serde(default = "nobody")]
+    pub uid: u32,
+    /// cgroup.procs files of the run's cgroup (memory, pids, cpu limits),
+    /// joined before anything else happens in the jail.
+    #[serde(default)]
+    pub cgroup_procs: Vec<String>,
 }
+
+fn nobody() -> u32 {
+    65534
+}
+
+/// At most this many simultaneous connections from the jail to the proxy.
+const MAX_BRIDGE_CONNECTIONS: usize = 8;
 
 pub const RESULT_MARKER: &str = "ATTEST-JAIL-RESULT ";
 
@@ -399,9 +414,9 @@ fn exec_inner(spec_json: &str) -> anyhow::Result<i32> {
         }
         std::fs::write(
             format!("{root}/etc/passwd"),
-            "root:x:0:0::/:/bin/sh\nnobody:x:65534:65534::/work:/bin/sh\n",
+            format!("root:x:0:0::/:/bin/sh\nagent:x:{0}:{0}::/work:/bin/sh\n", spec.uid),
         )?;
-        std::fs::write(format!("{root}/etc/group"), "root:x:0:\nnogroup:x:65534:\n")?;
+        std::fs::write(format!("{root}/etc/group"), format!("root:x:0:\nagent:x:{}:\n", spec.uid))?;
         std::fs::write(format!("{root}/etc/hosts"), "127.0.0.1 localhost\n")?;
         let host = cstr("attest-jail");
         libc::sethostname(host.as_ptr(), 11);
@@ -430,10 +445,24 @@ fn exec_inner(spec_json: &str) -> anyhow::Result<i32> {
         }
         // Bridge loopback connections from the jail to the model proxy.
         let sock = spec.proxy_socket.clone();
+        let open = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         std::thread::spawn(move || {
             for conn in bridge.incoming().flatten() {
-                let sock = sock.clone();
+                use std::sync::atomic::Ordering::SeqCst;
+                if open.fetch_add(1, SeqCst) >= MAX_BRIDGE_CONNECTIONS {
+                    open.fetch_sub(1, SeqCst);
+                    drop(conn);
+                    continue;
+                }
+                let (sock, open) = (sock.clone(), open.clone());
                 std::thread::spawn(move || {
+                    struct Done(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+                    impl Drop for Done {
+                        fn drop(&mut self) {
+                            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                    let _done = Done(open);
                     let Ok(up) = std::os::unix::net::UnixStream::connect(&sock) else {
                         return;
                     };
@@ -460,7 +489,7 @@ fn exec_inner(spec_json: &str) -> anyhow::Result<i32> {
         // namespace). The agent controls /work, so: no root, no symlinks, no
         // FIFOs or devices, bounded size.
         libc::setgroups(0, std::ptr::null());
-        if libc::setgid(65534) != 0 || libc::setuid(65534) != 0 {
+        if libc::setgid(spec.uid) != 0 || libc::setuid(spec.uid) != 0 {
             anyhow::bail!("dropping privileges before collecting results");
         }
         let mut files = serde_json::Map::new();
@@ -510,7 +539,11 @@ fn read_regular_nofollow(path: &str, max: usize) -> Option<Vec<u8>> {
 
 #[cfg(target_os = "linux")]
 unsafe fn child(spec: &Spec, root: &str) -> anyhow::Result<std::convert::Infallible> {
-    let parent = libc::getppid();
+    // Join the run's cgroup before anything else, so every process the
+    // agent starts is limited and can be killed by the service.
+    for f in &spec.cgroup_procs {
+        std::fs::write(f, "0").map_err(|e| anyhow::anyhow!("joining cgroup {f}: {e}"))?;
+    }
     mount(
         "proc",
         &format!("{root}/proc"),
@@ -556,14 +589,18 @@ unsafe fn child(spec: &Spec, root: &str) -> anyhow::Result<std::convert::Infalli
     )?;
     install_seccomp()?;
     check(libc::setgroups(0, std::ptr::null()), "setgroups")?;
-    check(libc::setgid(65534), "setgid")?;
-    check(libc::setuid(65534), "setuid")?;
-    // Die with our parent: if the server kills it, the whole namespace goes.
-    // (Set after the uid change, which clears it.)
-    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-    if libc::getppid() != parent {
-        libc::_exit(137);
-    }
+    check(libc::setgid(spec.uid), "setgid")?;
+    check(libc::setuid(spec.uid), "setuid")?;
+    // Die with our parent. (Set after the uid change, which clears it.) The
+    // agent can clear this, so it's a convenience: the service ends a run
+    // by killing everything in its cgroup.
+    check(libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL), "parent-death signal")?;
+    // The agent's stdout goes to stderr: stdout carries the executor's own
+    // result line, which the agent must not be able to forge.
+    check(
+        if libc::dup2(2, 1) < 0 { -1 } else { 0 },
+        "redirecting stdout",
+    )?;
     let argv: Vec<std::ffi::CString> = spec.argv.iter().map(|a| cstr(a)).collect();
     let env: Vec<std::ffi::CString> = spec
         .env
@@ -652,13 +689,71 @@ fn install_seccomp() -> anyhow::Result<()> {
         libc::SYS_userfaultfd,
         libc::SYS_open_by_handle_at,
         libc::SYS_name_to_handle_at,
+        // io_uring can do socket and file operations the rules above don't see.
+        libc::SYS_io_uring_setup,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
+        // The newer mount API.
+        libc::SYS_open_tree,
+        libc::SYS_move_mount,
+        libc::SYS_fsopen,
+        libc::SYS_fsconfig,
+        libc::SYS_fsmount,
+        libc::SYS_fspick,
+        libc::SYS_mount_setattr,
     ] {
         rules.insert(sys, vec![]);
     }
+    // No new namespaces through clone either (unshare and setns are denied
+    // above): refuse clone when any namespace flag is set.
+    let flag = |f: i32| {
+        SeccompRule::new(vec![SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Qword,
+            SeccompCmpOp::MaskedEq(f as u64),
+            f as u64,
+        )
+        .unwrap()])
+        .unwrap()
+    };
+    rules.insert(
+        libc::SYS_clone,
+        [
+            libc::CLONE_NEWNS,
+            libc::CLONE_NEWUTS,
+            libc::CLONE_NEWIPC,
+            libc::CLONE_NEWUSER,
+            libc::CLONE_NEWPID,
+            libc::CLONE_NEWNET,
+            libc::CLONE_NEWCGROUP,
+        ]
+        .into_iter()
+        .map(flag)
+        .collect(),
+    );
     let f = SeccompFilter::new(
         rules,
         SeccompAction::Allow,
         SeccompAction::Errno(libc::EPERM as u32),
+        if cfg!(target_arch = "x86_64") {
+            seccompiler::TargetArch::x86_64
+        } else {
+            seccompiler::TargetArch::aarch64
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("seccomp: {e}"))?;
+    let prog: seccompiler::BpfProgram = f
+        .try_into()
+        .map_err(|e: seccompiler::BackendError| anyhow::anyhow!("seccomp: {e}"))?;
+    seccompiler::apply_filter(&prog).map_err(|e| anyhow::anyhow!("seccomp: {e}"))?;
+    // clone3 passes its flags in memory, where a filter can't check them.
+    // "Not implemented" makes the C library fall back to clone, checked above.
+    let mut c3 = std::collections::BTreeMap::new();
+    c3.insert(libc::SYS_clone3, vec![]);
+    let f = SeccompFilter::new(
+        c3,
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::ENOSYS as u32),
         if cfg!(target_arch = "x86_64") {
             seccompiler::TargetArch::x86_64
         } else {

@@ -378,7 +378,31 @@ const PROVIDERS = [
   { id: "anthropic", label: "Anthropic", ph: "claude-opus-5-5" },
   { id: "openai", label: "OpenAI", ph: "gpt-5" },
   { id: "openrouter", label: "OpenRouter", ph: "anthropic/claude-sonnet-5-5" },
+  { id: "bedrock", label: "Bedrock", ph: "global.anthropic.claude-opus-5-5 or us.openai.gpt-6-sol" },
+  { id: "vertex", label: "Vertex", ph: "claude-opus-5-5" },
+  { id: "azure", label: "Azure", ph: "your deployment name" },
 ];
+// Region, project or resource for the cloud providers. `pre` prefixes the ids.
+function cloudFields(pre, only, p = {}) {
+  const show = id => only ? (only === id ? "" : "hidden") : "hidden";
+  return `<div class="grid2" id="${pre}-bedrock" ${show("bedrock")}><label class="f">AWS region<input id="${pre}-region" placeholder="us-east-1" value="${esc(p.region || "")}"></label></div>
+    <div class="grid2" id="${pre}-vertex" ${show("vertex")}><label class="f">Google Cloud project<input id="${pre}-project" placeholder="my-project" value="${esc(p.project || "")}"></label>
+      <label class="f">Location<select id="${pre}-location">${["global", "us", "eu"].map(l => `<option ${p.location === l ? "selected" : ""}>${l}</option>`).join("")}</select></label></div>
+    <div class="grid2" id="${pre}-azure" ${show("azure")}><label class="f">Azure resource name<input id="${pre}-resource" placeholder="NAME in NAME.openai.azure.com" value="${esc(p.resource || "")}"></label>
+      <label class="f">API<select id="${pre}-api">${["openai", "anthropic"].map(a => `<option ${p.api === a ? "selected" : ""}>${a}</option>`).join("")}</select></label></div>`;
+}
+function showCloud(pre, id) {
+  for (const c of ["bedrock", "vertex", "azure"]) { const e = $(`#${pre}-${c}`); if (e) e.hidden = c !== id; }
+  const k = $(`#${pre}Key`); if (k) k.placeholder = id === "vertex" ? "paste the service-account key file (JSON)" : id === "bedrock" ? "Bedrock API key" : k.placeholder;
+}
+function cloudValues(pre) {
+  const out = {};
+  for (const f of ["region", "project", "location", "resource", "api"]) {
+    const e = $(`#${pre}-${f}`);
+    if (e && !e.closest("[hidden]") && e.value.trim()) out[f] = e.value.trim();
+  }
+  return out;
+}
 function renderModel(v) {
   const approved = [...v.models].reverse().find(m => m.status === "approved");
   const providers = S.info?.mode === "dev" ? [...PROVIDERS, { id: "mock", label: "Mock (dev)", ph: "gpt-mock" }] : PROVIDERS;
@@ -390,7 +414,8 @@ function renderModel(v) {
     </div>${m.note ? `<div class="small faint">“${esc(m.note)}”</div>` : ""}
     ${isAuditee() && m.status === "pending" ? `<div class="stack" data-keep="approve-${m.id}" style="gap:8px;padding:10px 12px;background:var(--sunken);border-radius:8px">
       ${m.has_key ? `<div class="callout warn small"><span class="ic">!</span><span>This uses <b>the auditor's own provider account</b>. Their account can log everything the model sees, including your code. Safer: use your own key.</span></div>` : `<p class="small muted">The auditor proposed this model without a key. Approve it with your own API key.</p>`}
-      <label class="f">Your API key${m.has_key ? " (optional, replaces theirs)" : ""}<input type="password" id="ak-${m.id}" autocomplete="off" placeholder="sk-…"></label>
+      <label class="f">Your API key${m.has_key ? " (optional, replaces theirs)" : ""}${m.provider === "vertex" ? " (service-account key file, JSON)" : ""}<input type="password" id="ak-${m.id}" autocomplete="off" placeholder="sk-…"></label>
+      ${["bedrock", "vertex", "azure"].includes(m.provider) ? `<p class="faint small">With your own key, also give your own ${m.provider === "bedrock" ? "region" : m.provider === "vertex" ? "project and location" : "resource"}: on a cloud it decides whose account the requests reach. Proposed: ${esc(m.endpoint || "")}</p>${cloudFields("a" + m.id, m.provider, m.params)}` : ""}
       ${m.has_key ? `<label class="check"><input type="checkbox" id="acc-${m.id}"><span>Use the auditor's key anyway; I accept their account may see my code</span></label>` : ""}
       <div class="row"><button class="btn primary" data-act="m-approve" data-id="${m.id}">Approve</button></div></div>` : ""}`).join("")}</div>`;
   else body += `<p class="muted">${isAuditee() ? "Choose the model and API key the agent will use." : "The auditee usually chooses the model and key. You can offer your own instead; the auditee must approve it."}</p>`;
@@ -401,12 +426,13 @@ function renderModel(v) {
     body += `<details data-keep="mform" ${open ? "open" : ""}><summary>${isAuditee() ? (approved ? "Use a different model" : "Choose model and key") : "Offer your own model and key"}</summary>
       <div class="stack" style="margin-top:10px">
         <div class="seg" id="mProv">${providers.map((p, i) => `<button type="button" data-act="prov" data-p="${p.id}" aria-pressed="${i === 0}">${esc(p.label)}</button>`).join("")}</div>
-        ${(S.info?.harness?.agents || []).length > 1 ? `<label class="f">Agent<select id="mAgent">${S.info.harness.agents.map(a => `<option value="${esc(a.split(" ")[0])}">${a === "builtin" ? "Built-in tools (read, grep, python sandbox)" : esc(a) + " (full shell in a jail; " + ({codex: "OpenAI or OpenRouter", "claude-code": "Anthropic or OpenRouter", pi: "any provider"}[a.split(" ")[0]] || "") + ")"}</option>`).join("")}</select></label>` : ""}
+        ${(S.info?.harness?.agents || []).length > 1 ? `<label class="f">Agent<select id="mAgent">${S.info.harness.agents.map(a => `<option value="${esc(a.split(" ")[0])}">${a === "builtin" ? "Built-in tools (read, grep, python sandbox)" : esc(a) + " (full shell in a jail; " + ({codex: "OpenAI-API models", "claude-code": "Anthropic-API models", pi: "any provider"}[a.split(" ")[0]] || "") + ")"}</option>`).join("")}</select></label>` : ""}
         <div class="grid2"><label class="f">Model<input type="text" id="mModel" placeholder="${esc(providers[0].ph)}"></label>
           <label class="f">API key${isAuditee() ? "" : " (optional)"}<input type="password" id="mKey" autocomplete="off" placeholder="${isAuditee() ? "sk-…" : "leave empty: the auditee supplies theirs"}"></label></div>
         <label class="check" id="mZdrRow" hidden><input type="checkbox" id="mZdr" checked><span>Zero-data-retention endpoints only</span></label>
         <label class="f" id="mOnlyRow" hidden>Upstream hosts (optional; OpenRouter slugs, comma-separated, e.g. google-vertex, amazon-bedrock, azure). Every request is pinned to these, with no fallback.<input id="mOnly" placeholder="any host" autocomplete="off"></label>
         <label class="f" id="mMockRow" hidden>Mock server<input type="text" id="mMock" value="127.0.0.1:19999"></label>
+        ${cloudFields("m")}
         <p class="faint small">The key stays inside the enclave and is never shown to anyone. The certificate records the provider, the model the provider reports, and the organization that owns the key. The code is sent to this provider.</p>
         <div class="row"><button class="btn primary" data-act="propose-model">${isAuditee() ? "Use this model" : "Propose to the auditee"}</button></div>
       </div></details>`;
@@ -575,7 +601,7 @@ document.addEventListener("click", async (e) => {
   if (act === "prov") {
     $$("#mProv button").forEach(x => x.setAttribute("aria-pressed", String(x === b)));
     const p = [...PROVIDERS, { id: "mock", ph: "gpt-mock" }].find(x => x.id === b.dataset.p);
-    $("#mModel").placeholder = p.ph; $("#mZdrRow").hidden = p.id !== "openrouter"; $("#mOnlyRow").hidden = p.id !== "openrouter"; $("#mMockRow").hidden = p.id !== "mock"; return;
+    $("#mModel").placeholder = p.ph; $("#mZdrRow").hidden = p.id !== "openrouter"; $("#mOnlyRow").hidden = p.id !== "openrouter"; $("#mMockRow").hidden = p.id !== "mock"; showCloud("m", p.id); return;
   }
   if (act === "cert") {
     e.preventDefault();
@@ -612,8 +638,8 @@ document.addEventListener("click", async (e) => {
       if (!$("#aSign").checked) throw new Error("Tick the box to confirm the statement.");
       return sapi("/affidavit", { method: "POST", body: { organization: val("aOrg"), repo_url: val("aRepo"), git_commit: val("aCommit"), tree_sha256: b.dataset.tree } });
     },
-    "propose-model": () => sapi("/models", { method: "POST", body: { provider: $("#mProv [aria-pressed=true]").dataset.p, model: val("mModel"), api_key: val("mKey"), openrouter_zdr: $("#mZdr")?.checked, openrouter_only: (val("mOnly") || "").split(",").map(s => s.trim()).filter(Boolean), mock_endpoint: val("mMock"), agent: val("mAgent") || "builtin" } }),
-    "m-approve": () => sapi(`/models/${b.dataset.id}/decision`, { method: "POST", body: { approve: true, api_key: val("ak-" + b.dataset.id) || undefined, accept_auditor_account: $("#acc-" + b.dataset.id)?.checked || false } }),
+    "propose-model": () => sapi("/models", { method: "POST", body: { provider: $("#mProv [aria-pressed=true]").dataset.p, model: val("mModel"), api_key: val("mKey"), openrouter_zdr: $("#mZdr")?.checked, openrouter_only: (val("mOnly") || "").split(",").map(s => s.trim()).filter(Boolean), mock_endpoint: val("mMock"), agent: val("mAgent") || "builtin", ...cloudValues("m") } }),
+    "m-approve": () => sapi(`/models/${b.dataset.id}/decision`, { method: "POST", body: { approve: true, api_key: val("ak-" + b.dataset.id) || undefined, accept_auditor_account: $("#acc-" + b.dataset.id)?.checked || false, ...cloudValues("a" + b.dataset.id) } }),
     "m-reject": () => sapi(`/models/${b.dataset.id}/decision`, { method: "POST", body: { approve: false } }),
     "release": () => sapi(`/runs/${b.dataset.run}/release`, { method: "POST", body: { release: true, details: !!$("#det-" + b.dataset.run)?.checked, note: val("note-" + b.dataset.run) } }),
     "decline": () => sapi(`/runs/${b.dataset.run}/release`, { method: "POST", body: { release: false, note: val("note-" + b.dataset.run) } }),

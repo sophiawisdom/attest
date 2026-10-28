@@ -94,11 +94,12 @@ impl Net {
     async fn tunnel(&self, host: &str, port: u16) -> Result<Stream> {
         if !self.dev
             && (port != 443
-                || !self
+                || !(self
                     .allowed
                     .read()
                     .unwrap()
-                    .contains(&host.to_ascii_lowercase()))
+                    .contains(&host.to_ascii_lowercase())
+                    || crate::targets::egress_allows(host)))
         {
             bail!("connection to {host}:{port} refused: not on this enclave's egress allowlist");
         }

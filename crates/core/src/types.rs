@@ -52,6 +52,12 @@ pub enum Provider {
     Openai,
     Anthropic,
     Openrouter,
+    /// Amazon Bedrock: Claude (Anthropic Messages) and GPT (OpenAI API).
+    Bedrock,
+    /// Google Vertex AI: Claude.
+    Vertex,
+    /// Azure OpenAI / Foundry: GPT (OpenAI API) and Claude (Anthropic Messages).
+    Azure,
     /// Local OpenAI-compatible server. Only accepted by dev-mode enclaves.
     Mock,
 }
@@ -62,6 +68,9 @@ impl Provider {
             Provider::Openai => "openai",
             Provider::Anthropic => "anthropic",
             Provider::Openrouter => "openrouter",
+            Provider::Bedrock => "bedrock",
+            Provider::Vertex => "vertex",
+            Provider::Azure => "azure",
             Provider::Mock => "mock",
         }
     }
@@ -74,8 +83,11 @@ impl std::str::FromStr for Provider {
             "openai" => Provider::Openai,
             "anthropic" => Provider::Anthropic,
             "openrouter" => Provider::Openrouter,
+            "bedrock" => Provider::Bedrock,
+            "vertex" => Provider::Vertex,
+            "azure" => Provider::Azure,
             "mock" => Provider::Mock,
-            _ => anyhow::bail!("unknown provider {s:?} (openai, anthropic, openrouter)"),
+            _ => anyhow::bail!("unknown provider {s:?} (openai, anthropic, openrouter, bedrock, vertex, azure)"),
         })
     }
 }

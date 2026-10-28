@@ -55,7 +55,26 @@ is written for an agent to follow, and takes one script.
    The statement says the upload is the production code at that commit, and
    that nothing in it was arranged to influence the audit.
 5. Either party proposes a model: `POST /api/sessions/ID/models`
-   `{"provider": "anthropic"|"openai"|"openrouter", "model": "...", "api_key": "...", "openrouter_zdr": true}`.
+   `{"provider": "anthropic"|"openai"|"openrouter"|"bedrock"|"vertex"|"azure", "model": "...", "api_key": "...", "openrouter_zdr": true}`.
+   The clouds that serve Anthropic's and OpenAI's models work directly too,
+   so the model's maker needn't run the servers:
+   - `"provider": "bedrock"`, `"region": "us-east-1"`, a Bedrock API key, and a
+     model id such as `global.anthropic.claude-opus-5-5` (Claude, Anthropic API)
+     or `us.openai.gpt-6-sol` (GPT, OpenAI API).
+   - `"provider": "vertex"`, `"project": "my-project"`, `"location"`:
+     `global`, `us` or `eu`, a model such as `claude-opus-5-5`, and as
+     `api_key` the service-account key file (JSON). The enclave exchanges it
+     for an access token at oauth2.googleapis.com.
+   - `"provider": "azure"`, `"resource": "NAME"` (from NAME.openai.azure.com),
+     `"api": "openai"` or `"anthropic"`, the resource's key, and your
+     deployment name as `model`. The certificate records the model Azure
+     reports.
+   The region, project or resource decides whose account the requests reach,
+   so whoever supplies the key supplies it too: when the auditee approves an
+   auditor's cloud proposal with their own key, they give their own region,
+   project or resource with it. Check the host's retention settings: Bedrock
+   has a per-region data retention mode, and Fable 5.1 is retained for 30 days
+   on every host.
    With OpenRouter, add `"openrouter_only": ["google-vertex"]` to pin which
    upstream host may serve the model (OpenRouter slugs: `google-vertex`,
    `amazon-bedrock`, `azure`, `anthropic`, `openai`, or a region such as
@@ -67,9 +86,10 @@ is written for an agent to follow, and takes one script.
    that isn't the model's maker serving it (Claude on Vertex or Bedrock,
    GPT on Azure) can't steer its answers.
    To use a real coding agent instead of the built-in tools, add `"agent"`:
-   `"codex"` (OpenAI's Codex CLI; provider openai or openrouter),
-   `"claude-code"` (Claude Code; anthropic or openrouter) or `"pi"` (any
-   provider). Each runs with a full shell in a jail: repository read-only at
+   `"codex"` (OpenAI's Codex CLI; any OpenAI-API model: openai, openrouter,
+   GPT on bedrock or azure), `"claude-code"` (Claude Code; any Anthropic-API
+   model: anthropic, openrouter, Claude on bedrock, vertex or azure) or
+   `"pi"` (any). Each runs with a full shell in a jail: repository read-only at
    /repo, 20 MB scratch, no network except the approved model, reached
    through a proxy in the enclave that refuses provider-side tools (web
    search, URL fetches, MCP connectors). The agents don't load instructions,

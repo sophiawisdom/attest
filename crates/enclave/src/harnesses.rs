@@ -64,13 +64,16 @@ impl Agent {
         cfg!(target_os = "linux")
             && std::path::Path::new(&format!("{IMAGE_ROOT}{}", self.binary())).exists()
     }
-    /// Which providers' wire formats the harness speaks.
-    fn providers(self) -> &'static [Provider] {
-        match self {
-            Agent::Codex => &[Provider::Openai, Provider::Openrouter],
-            Agent::ClaudeCode => &[Provider::Anthropic, Provider::Openrouter],
-            Agent::Pi => &[Provider::Openai, Provider::Anthropic, Provider::Openrouter],
-        }
+    /// The model API this harness uses with `target`, if it can use any.
+    fn api_for(self, target: &crate::llm::Target) -> Option<crate::llm::Api> {
+        use crate::llm::{Api, Wire};
+        let want = match (self, target.wire) {
+            (Agent::Codex, _) => Api::Responses,
+            (Agent::ClaudeCode, _) => Api::Messages,
+            (Agent::Pi, Wire::Anthropic) => Api::Messages,
+            (Agent::Pi, Wire::Openai) => Api::Responses,
+        };
+        target.apis().contains(&want).then_some(want)
     }
 }
 
@@ -85,7 +88,7 @@ pub fn available() -> Vec<String> {
     v
 }
 
-pub fn supports(agent: &str, provider: Provider) -> anyhow::Result<()> {
+pub fn supports(agent: &str, target: &crate::llm::Target) -> anyhow::Result<()> {
     if agent == "builtin" {
         return Ok(());
     }
@@ -97,13 +100,15 @@ pub fn supports(agent: &str, provider: Provider) -> anyhow::Result<()> {
         "this server does not have the {agent} harness"
     );
     anyhow::ensure!(
-        a.providers().contains(&provider),
-        "{agent} works with {}",
-        a.providers()
-            .iter()
-            .map(|p| p.as_str())
-            .collect::<Vec<_>>()
-            .join(" or ")
+        a.api_for(target).is_some(),
+        "{agent} needs {} models, and {} serves {} here",
+        match a {
+            Agent::Codex => "OpenAI-API (Responses)",
+            Agent::ClaudeCode => "Anthropic-API (Messages)",
+            Agent::Pi => "OpenAI- or Anthropic-API",
+        },
+        target.provider.as_str(),
+        if target.wire == crate::llm::Wire::Anthropic { "Anthropic's API" } else { "the OpenAI API" },
     );
     Ok(())
 }
@@ -148,7 +153,7 @@ pub async fn run_agent(
     net: crate::net::Net,
     run_id: &str,
     bundle: &Arc<Bundle>,
-    provider: Provider,
+    target: crate::llm::Target,
     model: &str,
     api_key: &str,
     routing: crate::llm::Routing,
@@ -170,7 +175,7 @@ pub async fn run_agent(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (
-            agent, net, run_id, bundle, provider, model, api_key, routing, prompt, format, timeout,
+            agent, net, run_id, bundle, target, model, api_key, routing, prompt, format, timeout,
             progress,
         );
         return fail("agent harnesses need a Linux enclave".into());
@@ -183,7 +188,7 @@ pub async fn run_agent(
         let socket = format!("{scratch}/proxy.sock");
         let proxy = match ModelProxy::start(
             net,
-            provider,
+            target.clone(),
             model.to_string(),
             api_key.to_string(),
             routing,
@@ -203,8 +208,21 @@ pub async fn run_agent(
             crate::jail::unmount(&repo);
             return fail(format!("preparing the repository: {e:#}"));
         }
-        let (argv, env) = command(agent, provider, model, &proxy.token, prompt);
+        let (argv, env) = command(agent, &target, model, &proxy.token, prompt);
+        // Each run gets its own cgroup (memory, process and CPU caps) and
+        // user id. Without the cgroup there's no dependable way to end the
+        // run, so no cgroup, no run.
+        let cgroup = match crate::cgroups::RunCgroup::create(run_id, &run_limits()) {
+            Ok(c) => c,
+            Err(e) => {
+                crate::jail::unmount(&repo);
+                let _ = std::fs::remove_dir_all(&scratch);
+                return fail(format!("setting up the run's resource limits: {e:#}"));
+            }
+        };
         let spec = crate::jail::Spec {
+            uid: next_uid(),
+            cgroup_procs: cgroup.procs_files(),
             repo: repo.clone(),
             image_root: IMAGE_ROOT.into(),
             scratch: scratch.clone(),
@@ -218,6 +236,9 @@ pub async fn run_agent(
         };
         let started = std::time::SystemTime::now() - Duration::from_secs(1);
         let out = run_jailed(&spec, timeout, progress.clone()).await;
+        // Whatever the agent left running (it may have detached from the
+        // executor) dies here, before the repository is unmounted.
+        tokio::task::spawn_blocking(move || drop(cgroup)).await.ok();
         let read = crate::jail::accessed_since(&repo, started);
         crate::jail::unmount(&repo);
         let _ = std::fs::remove_dir_all(&scratch);
@@ -296,7 +317,7 @@ pub async fn run_agent(
 #[cfg(target_os = "linux")]
 fn command(
     agent: Agent,
-    provider: Provider,
+    target: &crate::llm::Target,
     model: &str,
     token: &str,
     prompt: String,
@@ -366,8 +387,8 @@ fn command(
             ]
         }
         Agent::Pi => {
-            let (api, url) = match provider {
-                Provider::Anthropic => ("anthropic-messages", base.clone()),
+            let (api, url) = match agent.api_for(target) {
+                Some(crate::llm::Api::Messages) => ("anthropic-messages", base.clone()),
                 _ => ("openai-responses", format!("{base}/v1")),
             };
             let models = json!({"providers": {"attest": {
@@ -408,7 +429,7 @@ async fn run_jailed(
     timeout: Duration,
     progress: Arc<dyn Fn(Vec<Value>) + Send + Sync>,
 ) -> Result<(i32, BTreeMap<String, String>), String> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
+
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut child = tokio::process::Command::new(exe)
         .arg("--jail-exec")
@@ -422,10 +443,10 @@ async fn run_jailed(
     let stderr = child.stderr.take().unwrap();
     let p2 = progress.clone();
     let log_task = tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
+        let mut lines = BoundedLines::new(stderr, 4000);
         let mut budget = 400_000usize;
         let mut batch = Vec::new();
-        while let Ok(Some(l)) = lines.next_line().await {
+        while let Some(l) = lines.next_line().await {
             if budget == 0 {
                 continue;
             }
@@ -446,10 +467,12 @@ async fn run_jailed(
             ]);
         }
     });
-    let mut stdout = BufReader::new(child.stdout.take().unwrap()).lines();
+    // Only the executor writes stdout (the agent's goes to stderr); the
+    // result line holds at most a few collected files.
+    let mut stdout = BoundedLines::new(child.stdout.take().unwrap(), 4 << 20);
     let read_out = async {
         let mut result = None;
-        while let Ok(Some(l)) = stdout.next_line().await {
+        while let Some(l) = stdout.next_line().await {
             if let Some(r) = l.strip_prefix(crate::jail::RESULT_MARKER) {
                 result = serde_json::from_str::<Value>(r).ok();
             }
@@ -463,7 +486,7 @@ async fn run_jailed(
     })
     .await;
     if r.is_err() {
-        // Kill first; the jail's processes die with it (parent-death signal).
+        // The caller then kills everything in the run's cgroup.
         let _ = child.kill().await;
     }
     let _ = tokio::time::timeout(Duration::from_secs(10), log_task).await;
@@ -483,6 +506,86 @@ async fn run_jailed(
                 })
                 .unwrap_or_default();
             Ok((v["exit"].as_i64().unwrap_or(-1) as i32, files))
+        }
+    }
+}
+
+/// Memory, process and CPU caps for one jailed run: a share of the
+/// enclave's memory that leaves room for the service and other runs.
+#[cfg(target_os = "linux")]
+fn run_limits() -> crate::cgroups::Limits {
+    let total = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|m| {
+            m.lines()
+                .find(|l| l.starts_with("MemTotal:"))
+                .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
+        })
+        .map(|kib| kib * 1024)
+        .unwrap_or(8 << 30);
+    crate::cgroups::Limits {
+        memory_bytes: (total / 5).clamp(1 << 30, 4 << 30),
+        pids: 512,
+        cpus: 1.0,
+    }
+}
+
+/// A user id for the next jailed run, distinct from any other run that
+/// could be going at the same time.
+#[cfg(target_os = "linux")]
+fn next_uid() -> u32 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    200_000 + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 50_000
+}
+
+/// Lines from a pipe, each cut to `max` bytes; the rest of an overlong line
+/// is skipped without being buffered.
+#[cfg(target_os = "linux")]
+struct BoundedLines<R> {
+    r: R,
+    buf: Vec<u8>,
+    pending: std::collections::VecDeque<String>,
+    max: usize,
+    skipping: bool,
+    eof: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl<R: tokio::io::AsyncRead + Unpin> BoundedLines<R> {
+    fn new(r: R, max: usize) -> Self {
+        Self { r, buf: Vec::new(), pending: Default::default(), max, skipping: false, eof: false }
+    }
+
+    async fn next_line(&mut self) -> Option<String> {
+        use tokio::io::AsyncReadExt;
+        loop {
+            if let Some(l) = self.pending.pop_front() {
+                return Some(l);
+            }
+            if self.eof {
+                if self.buf.is_empty() {
+                    return None;
+                }
+                return Some(String::from_utf8_lossy(&std::mem::take(&mut self.buf)).into_owned());
+            }
+            let mut chunk = [0u8; 16384];
+            let n = self.r.read(&mut chunk).await.unwrap_or(0);
+            if n == 0 {
+                self.eof = true;
+                continue;
+            }
+            for &b in &chunk[..n] {
+                if b == b'\n' {
+                    if !self.skipping || !self.buf.is_empty() {
+                        self.pending.push_back(String::from_utf8_lossy(&std::mem::take(&mut self.buf)).into_owned());
+                    }
+                    self.skipping = false;
+                } else if self.buf.len() < self.max {
+                    self.buf.push(b);
+                } else {
+                    self.skipping = true;
+                }
+            }
         }
     }
 }

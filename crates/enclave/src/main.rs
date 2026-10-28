@@ -11,6 +11,7 @@ mod acme;
 mod aws;
 mod blobs;
 mod bundle;
+mod cgroups;
 mod harnesses;
 mod jail;
 mod llm;
@@ -21,6 +22,7 @@ mod nsm;
 mod run;
 mod sandbox;
 mod sessions;
+mod targets;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod tls;
 
@@ -176,8 +178,9 @@ async fn read_host_config(args: &Args) -> Result<HostConfig> {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // The jail executor runs before any async runtime exists, so it starts
+    // as a plain single-threaded process.
     if std::env::args().nth(1).as_deref() == Some("--jail-exec") {
         jail::exec_main(&std::env::args().nth(2).unwrap_or_default());
     }
@@ -185,7 +188,18 @@ async fn main() -> Result<()> {
         println!("{}", jail::probe());
         return Ok(());
     }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(service())
+}
+
+async fn service() -> Result<()> {
     let args = Args::parse();
+    match cgroups::init() {
+        Ok(()) => log("cgroups ready for jailed runs"),
+        Err(e) => log(&format!("cgroups unavailable, so jailed agents can't run: {e:#}")),
+    }
     start_log_forwarding(args.dev);
     let attester = nsm::Attester::new(args.dev)?;
     let cfg = read_host_config(&args).await?;
@@ -215,9 +229,15 @@ async fn main() -> Result<()> {
     // Inside Nitro the kernel RNG is fed by the NSM hardware RNG.
     let signing = SigningKey::generate(&mut rand::rngs::OsRng);
     let mut endpoints = BTreeMap::new();
-    for p in [Provider::Openai, Provider::Anthropic, Provider::Openrouter] {
-        let (h, path) = llm::endpoint(p);
-        endpoints.insert(p.as_str().to_string(), format!("https://{h}{path}"));
+    for (p, url) in [
+        (Provider::Openai, "https://api.openai.com/v1/"),
+        (Provider::Anthropic, "https://api.anthropic.com/v1/messages"),
+        (Provider::Openrouter, "https://openrouter.ai/api/v1/"),
+        (Provider::Bedrock, "https://bedrock-runtime.REGION.amazonaws.com/{anthropic,openai}/v1/"),
+        (Provider::Vertex, "https://aiplatform[.us|.eu.rep].googleapis.com/v1/projects/PROJECT/locations/LOCATION/publishers/anthropic/"),
+        (Provider::Azure, "https://RESOURCE.openai.azure.com/openai/v1/ or https://RESOURCE.services.ai.azure.com/anthropic/v1/"),
+    ] {
+        endpoints.insert(p.as_str().to_string(), url.to_string());
     }
     let mut boot = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut boot);
@@ -249,10 +269,8 @@ async fn main() -> Result<()> {
         None,
     )?;
     let net = net::Net::new(args.dev, args.dev_tunnel.clone())?;
-    // Egress allowlist: everything this enclave may ever connect to.
-    for p in [Provider::Openai, Provider::Anthropic, Provider::Openrouter] {
-        net.allow(llm::endpoint(p).0);
-    }
+    // Egress allowlist: model hosts are fixed patterns (targets::EGRESS);
+    // ACME, SES and the DNS self-check are added below.
     let acme_dir = cfg
         .acme_directory
         .clone()

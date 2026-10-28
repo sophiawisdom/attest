@@ -8,6 +8,7 @@ license.workspace = true
 attest-core = { path = "../core" }
 anyhow.workspace = true
 base64.workspace = true
+ring = "0.17"
 bytes.workspace = true
 clap.workspace = true
 hex.workspace = true

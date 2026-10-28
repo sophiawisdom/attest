@@ -163,6 +163,15 @@ def run(work):
     check(call("POST", f"/api/sessions/{s['session_id']}/models/{m['id']}/decision", auditee.token, {"approve": True})[0] == 400, "approving the auditor's own key needs explicit acceptance")
     auditee.post(f"/models/{m['id']}/decision", {"approve": True, "accept_auditor_account": True})
     check(call("POST", f"/api/sessions/{s['session_id']}/models", auditor.token, {"provider": "openrouter", "model": "anthropic/claude-haiku-5.5:online"})[0] == 400, "web-search model variants are refused")
+    sc = ok("POST", "/api/sessions", body={})
+    ca, co = Party(sc["session_id"], sc["auditee_token"]), Party(sc["session_id"], sc["auditor_token"])
+    check(call("POST", f"/api/sessions/{sc['session_id']}/models", co.token, {"provider": "azure", "model": "dep"})[0] == 400, "azure needs a resource")
+    check(call("POST", f"/api/sessions/{sc['session_id']}/models", co.token, {"provider": "vertex", "model": "claude-opus-5-5", "project": "p-1", "api_key": "not a key file"})[0] == 400, "vertex needs a service-account key file")
+    cm = co.post("/models", {"provider": "bedrock", "model": "global.anthropic.claude-opus-5-5", "region": "us-east-1"})
+    check(call("POST", f"/api/sessions/{sc['session_id']}/models/{cm['id']}/decision", ca.token, {"approve": True, "api_key": "auditee-key"})[0] == 400, "own key on an auditor's cloud proposal needs the auditee's own region")
+    ca.post(f"/models/{cm['id']}/decision", {"approve": True, "api_key": "auditee-key", "region": "eu-west-2"})
+    mv = [m for m in ca.view()["models"] if m["id"] == cm["id"]][0]
+    check(mv["status"] == "approved" and mv["endpoint"] == "bedrock-runtime.eu-west-2.amazonaws.com" and mv["key_from"] == "auditee", "the auditee's region replaces the auditor's")
 
     v = auditee.wait_until(lambda v: v["runs"] and v["runs"][-1]["status"] == "awaiting_release", "run 1")
     r1 = v["runs"][-1]

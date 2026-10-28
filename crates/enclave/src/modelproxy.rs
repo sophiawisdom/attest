@@ -7,7 +7,7 @@
 //! endpoints, over the enclave's own TLS, to the fixed provider host. Every
 //! exchange is recorded for the auditee's transcript.
 
-use crate::llm::Routing;
+use crate::llm::{Api, Routing, Target};
 use crate::net::Net;
 use anyhow::Result;
 use attest_core::Provider;
@@ -49,9 +49,9 @@ impl Drop for ModelProxy {
 
 struct Upstream {
     net: Net,
-    provider: Provider,
+    target: Target,
     model: String,
-    api_key: String,
+    creds: crate::targets::Creds,
     routing: Routing,
     token: String,
     usage: Arc<Mutex<Usage>>,
@@ -73,18 +73,20 @@ pub fn vet_request(
     approved_model: &str,
     body: &[u8],
 ) -> Result<Vec<u8>, String> {
-    vet_request_routed(provider, path, approved_model, body, &Routing::default())
+    let t = Target::resolve(provider, approved_model, &json!({}), Some("localhost:1")).unwrap();
+    vet_request_routed(&t, path, approved_model, body, &Routing::default())
 }
 
 /// `vet_request`, plus on OpenRouter the agreed routing and plugin
 /// switch-offs, as the built-in harness sends them.
 pub fn vet_request_routed(
-    provider: Provider,
+    target: &Target,
     path: &str,
     approved_model: &str,
     body: &[u8],
     routing: &Routing,
 ) -> Result<Vec<u8>, String> {
+    let provider = target.provider;
     let mut v: Value =
         serde_json::from_slice(body).map_err(|_| "request body is not JSON".to_string())?;
     let obj = v
@@ -211,6 +213,7 @@ pub fn vet_request_routed(
     if provider == Provider::Openrouter {
         crate::llm::apply_openrouter(obj, routing);
     }
+    target.adapt_body(obj);
     let out = serde_json::to_vec(&v).map_err(|e| e.to_string())?;
     Ok(crate::llm::pad_json(out))
 }
@@ -372,7 +375,7 @@ const HEADER_BYTES: usize = 1024;
 /// The headers sent upstream. None are copied from the harness: they are
 /// derived from the vetted request (endpoint, stream flag) and the known
 /// beta flags it asked for, then padded to a fixed total size.
-fn upstream_headers(messages_api: bool, stream: bool, betas: &str) -> Vec<(String, String)> {
+fn upstream_headers(messages_api: bool, version: bool, stream: bool, betas: &str) -> Vec<(String, String)> {
     let mut h = vec![
         ("content-type".to_string(), "application/json".to_string()),
         (
@@ -380,8 +383,10 @@ fn upstream_headers(messages_api: bool, stream: bool, betas: &str) -> Vec<(Strin
             if stream { "text/event-stream" } else { "application/json" }.to_string(),
         ),
     ];
-    if messages_api {
+    if version {
         h.push(("anthropic-version".into(), "2023-06-01".into()));
+    }
+    if messages_api {
         if !betas.is_empty() {
             h.push(("anthropic-beta".into(), betas.to_string()));
         }
@@ -393,29 +398,12 @@ fn upstream_headers(messages_api: bool, stream: bool, betas: &str) -> Vec<(Strin
     h
 }
 
-/// Map a harness request path to the provider path, or refuse it.
-fn upstream_path(provider: Provider, path: &str) -> Option<String> {
-    let p = path.trim_start_matches("/v1");
-    let allowed = match provider {
-        Provider::Anthropic => p == "/messages",
-        Provider::Openrouter => p == "/messages" || p == "/responses" || p == "/chat/completions",
-        _ => p == "/responses" || p == "/chat/completions",
-    };
-    if !allowed {
-        return None;
-    }
-    Some(match provider {
-        Provider::Openrouter => format!("/api/v1{p}"),
-        _ => format!("/v1{p}"),
-    })
-}
-
 impl ModelProxy {
     /// Listen on a Unix socket at `socket_path`; the jail bridges one
     /// loopback port in its own empty network namespace to it.
     pub async fn start(
         net: Net,
-        provider: Provider,
+        target: Target,
         model: String,
         api_key: String,
         routing: Routing,
@@ -430,10 +418,10 @@ impl ModelProxy {
         let token = hex::encode(t);
         let usage = Arc::new(Mutex::new(Usage::default()));
         let up = Arc::new(Upstream {
+            creds: crate::targets::Creds::new(&target, &api_key)?,
             net,
-            provider,
+            target,
             model,
-            api_key,
             routing,
             token: token.clone(),
             usage: usage.clone(),
@@ -511,7 +499,8 @@ async fn handle(up: Arc<Upstream>, req: Request<hyper::body::Incoming>) -> Respo
             "only POST to the model endpoint is forwarded",
         );
     }
-    let Some(path) = upstream_path(up.provider, req.uri().path()) else {
+    let harness_path = req.uri().path().to_string();
+    let Some(api) = Api::from_path(&harness_path).filter(|a| up.target.apis().contains(a)) else {
         return reply(
             StatusCode::NOT_FOUND,
             "only the model endpoint is forwarded",
@@ -532,7 +521,7 @@ async fn handle(up: Arc<Upstream>, req: Request<hyper::body::Incoming>) -> Respo
         Ok(b) => b.to_bytes().to_vec(),
         Err(_) => return reply(StatusCode::PAYLOAD_TOO_LARGE, "request too large"),
     };
-    let body = match vet_request_routed(up.provider, &path, &up.model, &raw, &up.routing) {
+    let body = match vet_request_routed(&up.target, &harness_path, &up.model, &raw, &up.routing) {
         Ok(b) => b,
         Err(why) => {
             // Field names in `why` are request-chosen; keep the trace entry short.
@@ -547,26 +536,36 @@ async fn handle(up: Arc<Upstream>, req: Request<hyper::body::Incoming>) -> Respo
         .ok()
         .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
         .unwrap_or(false);
-    let headers = upstream_headers(path.ends_with("/messages"), stream, &betas);
-    let mut h: Vec<(&str, &str)> = headers
+    let Some(path) = up.target.path(api, &up.model, stream) else {
+        return reply(StatusCode::NOT_FOUND, "only the model endpoint is forwarded");
+    };
+    let mut headers = upstream_headers(
+        api == Api::Messages,
+        api == Api::Messages && up.target.wants_version_header(),
+        stream,
+        &betas,
+    );
+    match up.creds.headers(&up.net, api).await {
+        Ok(a) => headers.extend(a),
+        Err(e) => {
+            (up.record)(json!({"type": "error", "content": format!("model credentials: {e:#}")}));
+            return reply(StatusCode::BAD_GATEWAY, "upstream credentials failed");
+        }
+    }
+    let h: Vec<(&str, &str)> = headers
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
-    let auth = format!("Bearer {}", up.api_key);
-    match up.provider {
-        Provider::Anthropic => h.push(("x-api-key", &up.api_key)),
-        _ => h.push(("authorization", &auth)),
-    }
-    let host = crate::llm::endpoint(up.provider).0;
+    let host = up.target.host.clone();
     let req_summary = summarize_request(&raw);
     let _one_at_a_time = up.inflight.acquire().await;
     let resp = match up
         .net
         .request_full(
             "POST",
-            true,
-            host,
-            443,
+            up.target.mock_port.is_none(),
+            &host,
+            up.target.mock_port.unwrap_or(443),
             &path,
             &h,
             body,
@@ -583,7 +582,7 @@ async fn handle(up: Arc<Upstream>, req: Request<hyper::body::Incoming>) -> Respo
         }
     };
     let text = String::from_utf8_lossy(&resp.body).into_owned();
-    if up.provider == Provider::Openrouter {
+    if up.target.provider == Provider::Openrouter {
         if let Err(why) = crate::llm::check_reported_model(&up.model, usage_of(&text).2.as_deref())
         {
             (up.record)(json!({"type": "error", "content": why}));
@@ -692,6 +691,15 @@ fn usage_of(text: &str) -> (u64, u64, Option<String>, Option<String>) {
 mod tests {
     use super::*;
 
+    fn or_target() -> Target {
+        Target::resolve(Provider::Openrouter, "m", &json!({}), None).unwrap()
+    }
+
+    fn upstream_path(p: Provider, path: &str) -> Option<String> {
+        let t = Target::resolve(p, "m", &json!({}), Some("localhost:1")).ok()?;
+        t.path(Api::from_path(path)?, "m", false)
+    }
+
     #[test]
     fn paths() {
         assert_eq!(
@@ -731,7 +739,7 @@ mod tests {
             ),
         ] {
             let out = vet_request_routed(
-                Provider::Openrouter,
+                &or_target(),
                 path,
                 "anthropic/claude-opus-5.5",
                 body,
@@ -776,7 +784,7 @@ mod tests {
         assert!(v.get("plugins").is_none() && v.get("provider").is_none());
         // The harness can't set its own routing.
         assert!(vet_request_routed(
-            Provider::Openrouter,
+            &or_target(),
             "/api/v1/chat/completions",
             "m",
             br#"{"model":"m","messages":[],"provider":{"only":["x"]}}"#,
@@ -878,11 +886,11 @@ mod tests {
         let size = |h: Vec<(String, String)>| h.iter().map(|(k, v)| k.len() + v.len() + 4).sum::<usize>();
         let all = KNOWN_BETAS.join(",");
         let sizes = [
-            size(upstream_headers(false, false, "")),
-            size(upstream_headers(false, true, "")),
-            size(upstream_headers(true, true, "")),
-            size(upstream_headers(true, false, &all)),
-            size(upstream_headers(true, true, "effort-2025-11-24")),
+            size(upstream_headers(false, false, false, "")),
+            size(upstream_headers(false, false, true, "")),
+            size(upstream_headers(true, true, true, "")),
+            size(upstream_headers(true, true, false, &all)),
+            size(upstream_headers(true, false, true, "effort-2025-11-24")),
         ];
         assert!(sizes.iter().all(|s| *s == HEADER_BYTES), "{sizes:?}");
         // Codex 0.164 sends tools as an input item, grouped in namespaces.

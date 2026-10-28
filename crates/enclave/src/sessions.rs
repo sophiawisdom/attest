@@ -126,7 +126,8 @@ struct ModelProposal {
     api_key: String,
     /// OpenRouter only: required zero data retention and allowed upstream hosts.
     routing: llm::Routing,
-    mock_endpoint: Option<String>,
+    /// Host, API shape, and for the clouds the region, project or resource.
+    target: llm::Target,
     /// "builtin", or a jailed harness: "codex", "claude-code", "pi".
     agent: String,
     /// Whose provider account the key belongs to.
@@ -144,6 +145,7 @@ impl ModelProposal {
             "id": self.id, "proposed_by": self.by, "provider": self.provider, "model": self.model, "agent": self.agent,
             "has_key": !self.api_key.is_empty(), "key_from": self.key_from,
             "openrouter_zdr": self.routing.zdr, "openrouter_only": self.routing.only, "status": self.status,
+            "endpoint": self.target.describe(), "params": self.target.params(),
             "fine_tuned": llm::is_fine_tuned(self.provider, &self.model),
             "proposed_at_ms": self.proposed_at_ms, "decided_at_ms": self.decided_at_ms, "note": self.note,
         })
@@ -611,8 +613,11 @@ impl Session {
             role == Role::Auditor || !api_key.is_empty(),
             "api_key is required"
         );
-        ensure!(api_key.len() < 1000, "key too long");
         let mock_endpoint = clean(v["mock_endpoint"].as_str());
+        let target = llm::Target::resolve(provider, &model, v, mock_endpoint.as_deref())?;
+        if !api_key.is_empty() {
+            llm::Creds::check(&target, &api_key)?;
+        }
         let only: Vec<String> = match &v["openrouter_only"] {
             Value::Null => vec![],
             Value::Array(a) => a
@@ -631,7 +636,7 @@ impl Session {
             only,
         };
         let agent = clean(v["agent"].as_str()).unwrap_or_else(|| "builtin".into());
-        crate::harnesses::supports(&agent, provider)?;
+        crate::harnesses::supports(&agent, &target)?;
         ensure!(
             provider != Provider::Mock || mock_endpoint.is_some(),
             "mock_endpoint is required for the mock provider"
@@ -657,7 +662,7 @@ impl Session {
             model: model.clone(),
             api_key,
             routing,
-            mock_endpoint,
+            target,
             agent: agent.clone(),
             key_from: role,
             status: if approved { "approved" } else { "pending" },
@@ -745,7 +750,26 @@ impl Session {
         }
         let m = st.models.iter_mut().find(|m| m.id == id).unwrap();
         if let (true, Some(k)) = (approve, own_key) {
-            ensure!(k.len() < 1000, "key too long");
+            // On a cloud, the region, project or resource decides whose
+            // account receives the requests, so it comes with the key: the
+            // auditor's project with the auditee's credentials could still
+            // log everything there.
+            let target = if m.target.has_account_params() {
+                llm::Target::resolve(m.provider, &m.model, v, None).map_err(|e| {
+                    anyhow!(
+                        "with your own key, also give your own {} ({e})",
+                        match m.provider {
+                            Provider::Bedrock => "region",
+                            Provider::Vertex => "project and location",
+                            _ => "resource and api",
+                        }
+                    )
+                })?
+            } else {
+                m.target.clone()
+            };
+            llm::Creds::check(&target, &k)?;
+            m.target = target;
             m.api_key = k;
             m.key_from = Role::Auditee;
         }
@@ -974,15 +998,14 @@ impl Session {
             .ok_or_else(|| anyhow!("no model"))?;
         let client = Client::new(
             ctx.net.clone(),
-            m.provider,
+            m.target.clone(),
             m.model.clone(),
             m.api_key.clone(),
             m.routing.clone(),
-            m.mock_endpoint.clone(),
         )?;
         let model_info = ModelInfo {
             provider: m.provider,
-            endpoint: llm::endpoint(m.provider).0.to_string(),
+            endpoint: m.target.describe(),
             requested_model: m.model.clone(),
             fine_tuned: llm::is_fine_tuned(m.provider, &m.model),
             proposed_by: m.by,
@@ -1000,7 +1023,7 @@ impl Session {
         let harness_job = crate::harnesses::Agent::parse(&m.agent).map(|agent| {
             (
                 agent,
-                m.provider,
+                m.target.clone(),
                 m.model.clone(),
                 m.api_key.clone(),
                 m.routing.clone(),
@@ -1480,7 +1503,7 @@ struct RunJob {
     /// For jailed harnesses: (provider, model, key), and the prompt.
     harness_job: Option<(
         crate::harnesses::Agent,
-        Provider,
+        llm::Target,
         String,
         String,
         llm::Routing,
@@ -1552,14 +1575,14 @@ impl RunJob {
                 upstream_providers: vec![],
                 key_owner: None,
             },
-            (Ok(_), Some((agent, provider, model, key, routing))) => {
+            (Ok(_), Some((agent, target, model, key, routing))) => {
                 let timeout = run_time_limit(self.question.max_steps);
                 crate::harnesses::run_agent(
                     *agent,
                     self.ctx.net.clone(),
                     &self.run_id,
                     &self.bundle,
-                    *provider,
+                    target.clone(),
                     model,
                     key,
                     routing.clone(),

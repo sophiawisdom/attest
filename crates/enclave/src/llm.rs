@@ -7,16 +7,7 @@ use attest_core::Provider;
 use serde_json::{json, Value};
 use std::time::Duration;
 
-/// Fixed endpoints. The auditee picks a provider, never a URL: a free-form
-/// base URL would let them point the enclave at a server they control.
-pub fn endpoint(p: Provider) -> (&'static str, &'static str) {
-    match p {
-        Provider::Openai => ("api.openai.com", "/v1/chat/completions"),
-        Provider::Anthropic => ("api.anthropic.com", "/v1/messages"),
-        Provider::Openrouter => ("openrouter.ai", "/api/v1/chat/completions"),
-        Provider::Mock => ("(dev mock)", "/v1/chat/completions"),
-    }
-}
+pub use crate::targets::{Api, Creds, Target, Wire};
 
 /// Refuse model identifiers that bring provider-side network access with
 /// them (web search, browsing, research agents) or let the provider pick
@@ -190,41 +181,17 @@ pub struct Reply {
 }
 
 pub struct Client {
-    pub provider: Provider,
+    pub target: Target,
     pub model: String,
-    api_key: String,
+    creds: Creds,
     pub routing: Routing,
-    mock: Option<(String, u16)>,
     net: Net,
 }
 
 impl Client {
-    pub fn new(
-        net: Net,
-        provider: Provider,
-        model: String,
-        api_key: String,
-        routing: Routing,
-        mock: Option<String>,
-    ) -> Result<Self> {
-        let mock = match (provider, mock) {
-            (Provider::Mock, Some(m)) => {
-                let (h, p) = m
-                    .rsplit_once(':')
-                    .ok_or_else(|| anyhow!("mock endpoint must be host:port"))?;
-                Some((h.to_string(), p.parse()?))
-            }
-            (Provider::Mock, None) => bail!("mock provider needs mock_endpoint"),
-            _ => None,
-        };
-        Ok(Self {
-            provider,
-            model,
-            api_key,
-            routing,
-            mock,
-            net,
-        })
+    pub fn new(net: Net, target: Target, model: String, api_key: String, routing: Routing) -> Result<Self> {
+        let creds = Creds::new(&target, &api_key)?;
+        Ok(Self { target, model, creds, routing, net })
     }
 
     pub async fn complete(
@@ -233,21 +200,29 @@ impl Client {
         turns: &[Turn],
         tools: &[(&str, &str, Value)],
     ) -> Result<Reply> {
-        let body = match self.provider {
-            Provider::Anthropic => anthropic_body(&self.model, system, turns, tools),
-            _ => openai_body(
-                &self.model,
-                system,
-                turns,
-                tools,
-                (self.provider == Provider::Openrouter).then_some(&self.routing),
+        let openrouter = self.target.provider == Provider::Openrouter;
+        let (api, body) = match self.target.wire {
+            Wire::Anthropic => {
+                let mut b = anthropic_body(&self.model, system, turns, tools);
+                if let Some(o) = b.as_object_mut() {
+                    self.target.adapt_body(o);
+                }
+                (Api::Messages, b)
+            }
+            Wire::Openai => (
+                Api::Chat,
+                openai_body(&self.model, system, turns, tools, openrouter.then_some(&self.routing)),
             ),
         };
+        let path = self
+            .target
+            .path(api, &self.model, false)
+            .ok_or_else(|| anyhow!("{} doesn't serve this API", self.target.provider.as_str()))?;
         let body = pad_json(serde_json::to_vec(&body)?);
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let resp = self.send(body.clone()).await;
+            let resp = self.send(api, &path, body.clone()).await;
             let retry = match &resp {
                 Err(_) => true,
                 Ok(r) => r.status == 429 || r.status >= 500,
@@ -260,16 +235,16 @@ impl Client {
             if resp.status != 200 {
                 bail!(
                     "{} returned HTTP {}: {}",
-                    self.provider.as_str(),
+                    self.target.provider.as_str(),
                     resp.status,
                     String::from_utf8_lossy(&resp.body[..resp.body.len().min(2000)])
                 );
             }
-            let reply = match self.provider {
-                Provider::Anthropic => parse_anthropic(&resp)?,
-                _ => parse_openai(&resp)?,
+            let reply = match self.target.wire {
+                Wire::Anthropic => parse_anthropic(&resp)?,
+                Wire::Openai => parse_openai(&resp)?,
             };
-            if self.provider == Provider::Openrouter {
+            if openrouter {
                 check_reported_model(&self.model, reply.model.as_deref())
                     .map_err(|e| anyhow!(e))?;
             }
@@ -277,48 +252,20 @@ impl Client {
         }
     }
 
-    async fn send(&self, body: Vec<u8>) -> Result<HttpResponse> {
-        let (host, path) = endpoint(self.provider);
-        let auth = format!("Bearer {}", self.api_key);
-        let timeout = Duration::from_secs(600);
-        match self.provider {
-            Provider::Anthropic => {
-                let h = [
-                    ("x-api-key", self.api_key.as_str()),
-                    ("anthropic-version", "2023-06-01"),
-                ];
-                self.net
-                    .request(true, host, 443, path, &h, body, timeout)
-                    .await
-            }
-            Provider::Mock => {
-                let (mh, mp) = self.mock.as_ref().unwrap();
-                self.net
-                    .request(
-                        false,
-                        mh,
-                        *mp,
-                        path,
-                        &[("authorization", &auth)],
-                        body,
-                        timeout,
-                    )
-                    .await
-            }
-            _ => {
-                self.net
-                    .request(
-                        true,
-                        host,
-                        443,
-                        path,
-                        &[("authorization", &auth)],
-                        body,
-                        timeout,
-                    )
-                    .await
-            }
+    async fn send(&self, api: Api, path: &str, body: Vec<u8>) -> Result<HttpResponse> {
+        let mut h = self.creds.headers(&self.net, api).await?;
+        h.push(("content-type".into(), "application/json".into()));
+        if api == Api::Messages && self.target.wants_version_header() {
+            h.push(("anthropic-version".into(), "2023-06-01".into()));
         }
+        let h: Vec<(&str, &str)> = h.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let (https, port) = match self.target.mock_port {
+            Some(p) => (false, p),
+            None => (true, 443),
+        };
+        self.net
+            .request(https, &self.target.host, port, path, &h, body, Duration::from_secs(600))
+            .await
     }
 }
 
