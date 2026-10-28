@@ -185,7 +185,21 @@ pub async fn run_agent(
     {
         let p2 = progress.clone();
         let scratch = format!("/jails/{run_id}");
+        let repo = format!("{scratch}/repo");
         let _ = std::fs::create_dir_all(&scratch);
+        // Owns the scratch directory and the repository mount from here on:
+        // they go however this function ends (error, panic, cancellation).
+        let jail_dir = JailDir {
+            scratch: scratch.clone(),
+            repo: repo.clone(),
+        };
+        // Each run gets its own cgroup (memory, process and CPU caps) and
+        // user id. Without the cgroup there's no dependable way to end the
+        // run, so no cgroup, no run.
+        let cgroup = match crate::cgroups::RunCgroup::create(run_id, &run_limits()) {
+            Ok(c) => c,
+            Err(e) => return fail(format!("setting up the run's resource limits: {e:#}")),
+        };
         let socket = format!("{scratch}/proxy.sock");
         let proxy = match ModelProxy::start(
             net,
@@ -201,26 +215,13 @@ pub async fn run_agent(
             Ok(p) => p,
             Err(e) => return fail(format!("model proxy: {e:#}")),
         };
-        let repo = format!("{scratch}/repo");
         progress(vec![
             json!({"type": "harness", "content": format!("Preparing the repository for {} ({} files)...", agent.label(), bundle.info.file_count)}),
         ]);
         if let Err(e) = crate::jail::materialize(bundle, &repo).await {
-            crate::jail::unmount(&repo);
             return fail(format!("preparing the repository: {e:#}"));
         }
         let (argv, env) = command(agent, &target, model, &proxy.token, prompt);
-        // Each run gets its own cgroup (memory, process and CPU caps) and
-        // user id. Without the cgroup there's no dependable way to end the
-        // run, so no cgroup, no run.
-        let cgroup = match crate::cgroups::RunCgroup::create(run_id, &run_limits()) {
-            Ok(c) => c,
-            Err(e) => {
-                crate::jail::unmount(&repo);
-                let _ = std::fs::remove_dir_all(&scratch);
-                return fail(format!("setting up the run's resource limits: {e:#}"));
-            }
-        };
         let spec = crate::jail::Spec {
             uid: next_uid(),
             cgroup_procs: cgroup.procs_files(),
@@ -241,8 +242,7 @@ pub async fn run_agent(
         // executor) dies here, before the repository is unmounted.
         tokio::task::spawn_blocking(move || drop(cgroup)).await.ok();
         let read = crate::jail::accessed_since(&repo, started);
-        crate::jail::unmount(&repo);
-        let _ = std::fs::remove_dir_all(&scratch);
+        tokio::task::spawn_blocking(move || drop(jail_dir)).await.ok();
 
         let usage = proxy.usage.lock().unwrap().clone();
         let mut files_read = BTreeMap::new();
@@ -490,7 +490,10 @@ async fn run_jailed(
         // The caller then kills everything in the run's cgroup.
         let _ = child.kill().await;
     }
-    let _ = tokio::time::timeout(Duration::from_secs(10), log_task).await;
+    // Give the log reader a moment to drain, then stop it either way.
+    let mut log_task = crate::sessions::AbortOnDrop(log_task);
+    let _ = tokio::time::timeout(Duration::from_secs(10), &mut log_task.0).await;
+    drop(log_task);
     match r {
         Err(_) => Err(format!(
             "the agent did not finish within {} minutes",
@@ -511,21 +514,34 @@ async fn run_jailed(
     }
 }
 
+/// A run's scratch directory and repository mount, removed on drop.
+#[cfg(target_os = "linux")]
+struct JailDir {
+    scratch: String,
+    repo: String,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for JailDir {
+    fn drop(&mut self) {
+        crate::jail::unmount(&self.repo);
+        if let Err(e) = std::fs::remove_dir_all(&self.scratch) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                crate::log(&format!("removing {}: {e}", self.scratch));
+            }
+        }
+    }
+}
+
 /// Memory, process and CPU caps for one jailed run: a share of the
 /// enclave's memory that leaves room for the service and other runs.
 #[cfg(target_os = "linux")]
 fn run_limits() -> crate::cgroups::Limits {
-    let total = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|m| {
-            m.lines()
-                .find(|l| l.starts_with("MemTotal:"))
-                .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
-        })
-        .map(|kib| kib * 1024)
-        .unwrap_or(8 << 30);
+    // Half of what all jails together may use (a cap on their shared parent
+    // cgroup), so one run can't starve the others.
+    let jails = crate::cgroups::jails_memory();
     crate::cgroups::Limits {
-        memory_bytes: (total / 5).clamp(1 << 30, 4 << 30),
+        memory_bytes: (jails / 2).clamp(1 << 30, 4 << 30).min(jails),
         pids: 512,
         cpus: 1.0,
     }

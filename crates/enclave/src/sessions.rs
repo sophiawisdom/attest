@@ -1477,6 +1477,7 @@ impl Session {
                     .acquire()
                     .await
                     .map_err(|_| anyhow!("shutting down"))?;
+                let _code_memory = reserve_code_memory(&bundle, 1).await;
                 let _pin = bundle.pin().await?;
                 let opened = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
                 let out = sandbox
@@ -1710,6 +1711,8 @@ impl RunJob {
     async fn execute(self) {
         let ctx = self.ctx.clone();
         let _permit = ctx.slots.acquire().await;
+        let copies = if self.harness_job.is_some() { 2 } else { 1 };
+        let _code_memory = reserve_code_memory(&self.bundle, copies).await;
         let started_at_ms = now_ms();
         let session = self.session.clone();
         let run_id = self.run_id.clone();
@@ -1908,6 +1911,28 @@ impl RunJob {
 }
 
 /// How long a run may take; also when the auditee is emailed about it.
+/// Memory for copies of the code held for runs and disclosures: the copy
+/// loaded into enclave memory, and for jailed agents the jail's own copy.
+/// 30% of the enclave's memory, in MiB; work waits for room. (Jailed
+/// agents' own memory has a separate cap; see cgroups::jails_memory.)
+fn code_memory() -> &'static tokio::sync::Semaphore {
+    static S: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    S.get_or_init(|| {
+        tokio::sync::Semaphore::new((crate::cgroups::mem_total() / 10 * 3 >> 20).max(1) as usize)
+    })
+}
+
+/// Reserve room for `copies` copies of `bundle` (a repository bigger than
+/// the whole budget gets the whole budget).
+async fn reserve_code_memory(bundle: &Bundle, copies: u64) -> tokio::sync::SemaphorePermit<'static> {
+    let budget = (crate::cgroups::mem_total() / 10 * 3 >> 20).max(1);
+    let mib = ((bundle.info.total_bytes.saturating_mul(copies) >> 20) + 1).min(budget);
+    code_memory()
+        .acquire_many(mib as u32)
+        .await
+        .expect("the code memory semaphore is never closed")
+}
+
 /// Aborts a background task when dropped.
 pub struct AbortOnDrop(pub tokio::task::JoinHandle<()>);
 

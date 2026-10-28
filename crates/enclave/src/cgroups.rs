@@ -45,29 +45,107 @@ fn layout() -> Result<&'static Layout> {
     }
 }
 
+/// The machine's (enclave's) memory, from /proc/meminfo.
+pub fn mem_total() -> u64 {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|m| {
+            m.lines()
+                .find(|l| l.starts_with("MemTotal:"))
+                .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
+        })
+        .map(|kib| kib * 1024)
+        .unwrap_or(8 << 30)
+}
+
+/// Memory all jailed agents together may use: 40% of the enclave's. The
+/// rest is for the service, the repositories it holds for runs (see
+/// sessions::code_memory) and the Python sandbox.
+pub fn jails_memory() -> u64 {
+    mem_total() / 10 * 4
+}
+
+/// CPU all jailed agents together may use: all but half a CPU, so the
+/// service always keeps some.
+fn jails_cpus() -> f64 {
+    let n = std::thread::available_parallelism().map_or(2, |n| n.get()) as f64;
+    (n - 0.5).max(0.5)
+}
+
+const PERIOD_US: u64 = 100_000;
+
 fn detect() -> Result<Layout> {
     let base = Path::new("/sys/fs/cgroup");
-    if base.join("cgroup.controllers").exists() {
+    let quota = (jails_cpus() * PERIOD_US as f64) as u64;
+    let layout = if base.join("cgroup.controllers").exists() {
         // Unified hierarchy. Enable the controllers for our subtree.
         let parent = base.join("attest");
         std::fs::create_dir_all(&parent).context("creating /sys/fs/cgroup/attest")?;
         let _ = std::fs::write(base.join("cgroup.subtree_control"), "+memory +pids +cpu");
         std::fs::write(parent.join("cgroup.subtree_control"), "+memory +pids +cpu")
             .context("enabling memory, pids and cpu controllers")?;
-        return Ok(Layout::V2 { parent });
-    }
-    let mut dirs = Vec::new();
-    for (name, opts) in [("memory", "memory"), ("pids", "pids"), ("cpu", "cpu,cpuacct")] {
-        let dir = find_v1(name).map(Ok).unwrap_or_else(|| mount_v1(name, opts))?;
-        let ours = dir.join("attest");
-        std::fs::create_dir_all(&ours).with_context(|| format!("creating {}", ours.display()))?;
-        dirs.push(ours);
-    }
-    let cpu = dirs.pop().unwrap();
-    let pids = dirs.pop().unwrap();
-    let memory = dirs.pop().unwrap();
-    Ok(Layout::V1 { memory, pids, cpu })
+        // Aggregate caps over every run's cgroup.
+        std::fs::write(parent.join("memory.max"), jails_memory().to_string())
+            .context("capping the jails' memory")?;
+        std::fs::write(parent.join("cpu.max"), format!("{quota} {PERIOD_US}"))
+            .context("capping the jails' CPU")?;
+        Layout::V2 { parent }
+    } else {
+        let mut dirs = Vec::new();
+        for (name, opts) in [("memory", "memory"), ("pids", "pids"), ("cpu", "cpu,cpuacct")] {
+            let dir = find_v1(name).map(Ok).unwrap_or_else(|| mount_v1(name, opts))?;
+            let ours = dir.join("attest");
+            std::fs::create_dir_all(&ours)
+                .with_context(|| format!("creating {}", ours.display()))?;
+            dirs.push(ours);
+        }
+        let cpu = dirs.pop().unwrap();
+        let pids = dirs.pop().unwrap();
+        let memory = dirs.pop().unwrap();
+        // Aggregate caps over every run's cgroup. In v1, memory limits only
+        // cover children with use_hierarchy, which must be set while the
+        // parent has none (it may already be on, and then can't be written).
+        let _ = std::fs::write(memory.join("memory.use_hierarchy"), "1");
+        std::fs::write(memory.join("memory.limit_in_bytes"), jails_memory().to_string())
+            .context("capping the jails' memory")?;
+        std::fs::write(cpu.join("cpu.cfs_period_us"), PERIOD_US.to_string())
+            .context("capping the jails' CPU")?;
+        std::fs::write(cpu.join("cpu.cfs_quota_us"), quota.to_string())
+            .context("capping the jails' CPU")?;
+        Layout::V1 { memory, pids, cpu }
+    };
+    reap_leftovers(&layout);
+    Ok(layout)
 }
+
+/// Kill and remove run cgroups left from an earlier service process, and
+/// any this process failed to remove before.
+fn reap_leftovers(layout: &Layout) {
+    let parents: Vec<&PathBuf> = match layout {
+        Layout::V2 { parent } => vec![parent],
+        Layout::V1 { memory, pids, cpu } => vec![memory, pids, cpu],
+    };
+    let mut dirs: Vec<PathBuf> = parents
+        .iter()
+        .filter_map(|p| std::fs::read_dir(p).ok())
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("run-"))
+        .map(|e| e.path())
+        .collect();
+    dirs.extend(std::mem::take(&mut *LEFTOVERS.lock().unwrap_or_else(|e| e.into_inner())));
+    dirs.sort();
+    dirs.dedup();
+    if dirs.is_empty() {
+        return;
+    }
+    // Dropping removes them, or puts them back on the list.
+    drop(RunCgroup { dirs });
+}
+
+/// Run cgroups whose processes couldn't all be killed yet; retried before
+/// every new run.
+static LEFTOVERS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
 /// Where a v1 controller is mounted, from /proc/self/mountinfo.
 fn find_v1(controller: &str) -> Option<PathBuf> {
@@ -116,17 +194,24 @@ impl RunCgroup {
             "bad run id"
         );
         let name = format!("run-{run_id}");
-        let period = 100_000u64;
+        let period = PERIOD_US;
         let quota = ((l.cpus * period as f64) as u64).max(1000);
         let w = |dir: &Path, file: &str, v: String| {
             std::fs::write(dir.join(file), &v)
                 .with_context(|| format!("setting {file} = {v} in {}", dir.display()))
         };
-        let cg = match layout()? {
+        let layout = layout()?;
+        // Retry anything an earlier run couldn't clean up.
+        if !LEFTOVERS.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+            reap_leftovers(layout);
+        }
+        // The guard owns each directory before it's created, so a failure
+        // halfway removes what was made.
+        let cg = match layout {
             Layout::V2 { parent } => {
                 let d = parent.join(&name);
-                std::fs::create_dir_all(&d)?;
                 let cg = RunCgroup { dirs: vec![d.clone()] };
+                std::fs::create_dir_all(&d)?;
                 w(&d, "memory.max", l.memory_bytes.to_string())?;
                 let _ = w(&d, "memory.swap.max", "0".into());
                 w(&d, "pids.max", l.pids.to_string())?;
@@ -135,10 +220,10 @@ impl RunCgroup {
             }
             Layout::V1 { memory, pids, cpu } => {
                 let (m, p, c) = (memory.join(&name), pids.join(&name), cpu.join(&name));
+                let cg = RunCgroup { dirs: vec![m.clone(), p.clone(), c.clone()] };
                 for d in [&m, &p, &c] {
                     std::fs::create_dir_all(d)?;
                 }
-                let cg = RunCgroup { dirs: vec![m.clone(), p.clone(), c.clone()] };
                 w(&m, "memory.limit_in_bytes", l.memory_bytes.to_string())?;
                 // Present only with swap accounting; the enclave has no swap anyway.
                 let _ = w(&m, "memory.memsw.limit_in_bytes", l.memory_bytes.to_string());
@@ -195,12 +280,19 @@ impl RunCgroup {
 
 impl Drop for RunCgroup {
     fn drop(&mut self) {
-        if !self.kill_all() {
-            crate::log("a jailed run's processes survived SIGKILL; leaving its cgroup in place");
-            return;
+        let emptied = self.kill_all();
+        let mut left = Vec::new();
+        for d in self.dirs.drain(..) {
+            if !d.exists() {
+                continue;
+            }
+            if !emptied || std::fs::remove_dir(&d).is_err() {
+                left.push(d);
+            }
         }
-        for d in &self.dirs {
-            let _ = std::fs::remove_dir(d);
+        if !left.is_empty() {
+            crate::log("a jailed run's cgroup couldn't be emptied yet; retrying before the next run");
+            LEFTOVERS.lock().unwrap_or_else(|e| e.into_inner()).extend(left);
         }
     }
 }

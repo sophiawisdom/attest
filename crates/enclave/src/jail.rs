@@ -573,16 +573,16 @@ unsafe fn child(spec: &Spec, root: &str) -> anyhow::Result<std::convert::Infalli
     )?;
     std::env::set_current_dir(&spec.cwd)?;
     cloexec_inherited();
-    let lim = |r, v: u64| {
+    let lim = |r, v: u64, what: &str| {
         let l = libc::rlimit {
             rlim_cur: v,
             rlim_max: v,
         };
-        libc::setrlimit(r, &l);
+        check(libc::setrlimit(r, &l), what)
     };
-    lim(libc::RLIMIT_NPROC, 512);
-    lim(libc::RLIMIT_NOFILE, 4096);
-    lim(libc::RLIMIT_CORE, 0);
+    lim(libc::RLIMIT_NPROC, 512, "process limit")?;
+    lim(libc::RLIMIT_NOFILE, 4096, "file limit")?;
+    lim(libc::RLIMIT_CORE, 0, "core dump limit")?;
     check(
         libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0),
         "no_new_privs",
