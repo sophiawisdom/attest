@@ -30,6 +30,7 @@ http = "1"
 hmac = "0.12"
 chacha20poly1305 = "0.10"
 lz4_flex = "0.11"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 wasmtime = { version = "46", default-features = false, features = ["cranelift", "async", "runtime", "std", "parallel-compilation"] }
 wasi-common = { version = "46", default-features = false, features = ["tokio", "wasmtime", "trace_log"] }
 async-trait = "0.1"

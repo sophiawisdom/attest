@@ -22,7 +22,9 @@ is written for an agent to follow, and takes one script.
   `https://HOST/s/SESSION_ID#TOKEN`. The auditee keeps one link and sends the
   other to the auditor over a channel they already trust (for example
   Signal). There are no accounts or long-term keys. Whoever holds a link acts
-  as that party.
+  as that party. If `GET /api/info` shows `"open": false`, the server is
+  private: only its operator starts sessions, sending the operator key as
+  the header `x-operator-key`. Anyone given a link takes part.
 - Every session call needs `Authorization: Bearer TOKEN`, where `TOKEN` is the
   part of the link after `#`. The token decides the role.
 - Sessions expire after 30 days. They're kept sealed on the parent and survive
@@ -49,7 +51,16 @@ is written for an agent to follow, and takes one script.
    `{"version": 1, "accept": true, "note": "optional"}`. A rejected or
    answered question can be revised (step 1 again). Each revision is a new
    version that needs acceptance.
-3. The auditee uploads code: `PUT /api/sessions/ID/code` with a tar archive
+3. The auditee provides code. From GitHub:
+   `POST /api/sessions/ID/code/github` `{"repo": "owner/name", "ref": "main",
+   "token": "..."}`. The enclave resolves the ref to a commit and downloads
+   that commit's archive itself, over its own TLS connections to GitHub; the
+   token (a fine-grained, read-only token for contents; omit it for a public
+   repository) is used for those requests and never stored. Send a token
+   only over a connection you checked ends in the enclave (`attest open`, or
+   your own attestation check; see "Verifying this service"). The response
+   adds `github.commit`, and only the auditee is told the repository. Or
+   upload: `PUT /api/sessions/ID/code` with a tar archive
    body (regular files only; no links). `attest upload LINK DIR` from the
    repository's CLI sends git-tracked files and checks the enclave first. The
    response includes `tree_sha256`, a hash of every (path, content) pair, and

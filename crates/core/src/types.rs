@@ -118,6 +118,10 @@ pub struct EnclaveInfo {
     /// Who runs this server, as the operator states it (not verified).
     #[serde(default)]
     pub operator: Option<String>,
+    /// Anyone may start a session. Otherwise only the operator can (with
+    /// its key); anyone the operator sends a session link to takes part.
+    #[serde(default)]
+    pub open: bool,
     pub harness: HarnessInfo,
     /// The lineage of enclaves (same image, handing sessions to each other)
     /// this boot belongs to. Absent on enclaves from before lineages.

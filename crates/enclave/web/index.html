@@ -181,8 +181,8 @@ const LOCAL = window.ATTEST_LOCAL || null;
 const ORIGIN = LOCAL ? LOCAL.origin : location.origin;
 const openCmd = () => `attest open '${ORIGIN}${location.pathname}${location.hash}'`;
 const S = { sid: null, token: null, view: null, info: null, traces: {}, last: {}, polling: false };
-async function api(path, { method = "GET", body, raw, timeout } = {}) {
-  const headers = {};
+async function api(path, { method = "GET", body, raw, timeout, extra } = {}) {
+  const headers = { ...(extra || {}) };
   const ctl = new AbortController(); const timer = timeout ? setTimeout(() => ctl.abort(), timeout) : null;
   if (S.token) headers.authorization = "Bearer " + S.token;
   if (body !== undefined && !raw) headers["content-type"] = "application/json";
@@ -246,18 +246,22 @@ function landing() {
     <p class="lead">An auditor asks a question. A model reads your code inside an attested AWS Nitro enclave and answers. You watch everything it does and decide whether the auditor sees the answer. Neither side sees the other's API key. Apart from you, only the model provider you approve receives the code.</p>
     <div class="steps3">
       <div class="panel s"><b>1. Start a session</b><span class="muted small">You get two private links. Send the auditor theirs over a channel you already trust, such as Signal.</span></div>
-      <div class="panel s"><b>2. Agree on the question</b><span class="muted small">The auditor asks; you accept, upload your code, confirm an affidavit, and approve the model.</span></div>
+      <div class="panel s"><b>2. Agree on the question</b><span class="muted small">The auditor asks; you accept, connect your code, confirm an affidavit, and approve the model.</span></div>
       <div class="panel s"><b>3. Release or decline</b><span class="muted small">You read the result and the full transcript first. The auditor gets a signed certificate if you release it.</span></div>
     </div>
-    <div id="created"><div class="row"><button class="btn primary big" data-act="create">Start a session</button><span class="faint small">You'll be the auditee (the party whose code is examined).</span></div></div>
-    <div class="callout warn" id="notice"><span class="ic">!</span><span>${S.info?.operator ? `This server is run by <b>${esc(S.info.operator)}</b> (their own description) as` : "This server is run"} a convenience, with no guarantees. Sessions live only in the enclave's memory and end whenever the server is updated, so don't count on one lasting more than about a day. If you need more than that, <a href="https://github.com/sophiawisdom/attest/blob/main/SELF_HOSTING.md" target="_blank" rel="noopener">run your own</a>: it's one script, and an agent can do it for you.</span></div>
+    <div id="created">${S.info && S.info.open === false
+      ? `<div class="stack"><p class="small muted">This server is private: only its operator starts sessions. Anyone the operator sends a session link to can take part.</p>
+        <div class="row"><input type="password" id="opKey" placeholder="Operator key" autocomplete="off" style="max-width:320px"><button class="btn primary big" data-act="create">Start a session</button></div></div>`
+      : `<div class="row"><button class="btn primary big" data-act="create">Start a session</button><span class="faint small">You'll be the auditee (the party whose code is examined).</span></div>`}</div>
+    ${S.info?.operator ? `<p class="small muted" id="notice">Operated by <b>${esc(S.info.operator)}</b>.</p>` : ""}
     <div class="foot"><a href="/agents.md">Guide for agents</a><a href="https://github.com/sophiawisdom/attest" target="_blank" rel="noopener">Source on GitHub</a><a href="#" data-act="show-verify">Verify this service</a></div>
     <div id="landingVerify"></div>
   </div>`;
 }
 async function createSession(btn) {
   await busy(btn, async () => {
-    const r = await api("/api/sessions", { method: "POST", body: {} });
+    const key = val("opKey").trim();
+    const r = await api("/api/sessions", { method: "POST", body: {}, extra: key ? { "x-operator-key": key } : undefined });
     $("#created").innerHTML = `<div class="panel pad stack">
       <h2>Session created</h2>
       <div class="callout warn"><span class="ic">!</span><span>Save both links now. They can't be shown again, and anyone with a link acts as that party.</span></div>
@@ -357,7 +361,16 @@ function renderCode(v) {
   if (isAuditee()) {
     const link = `${ORIGIN}/s/${S.sid}#${S.token}`;
     const cmd = `attest upload '${link}' ~/path/to/repo`;
-    body += `<details data-keep="upload-${c ? c.tree_sha256 : "none"}" ${c ? "" : "open"}><summary>${c ? "Replace the code" : "Upload your code"}</summary><div class="stack" style="margin-top:10px">
+    const tokenOk = LOCAL || S.info?.mode === "dev";
+    body += `<details data-keep="gh-${c ? c.tree_sha256 : "none"}" ${c ? "" : "open"}><summary>${c ? "Replace the code from GitHub" : "Connect a GitHub repository"}</summary><div class="stack" style="margin-top:10px">
+      <p class="small muted">The enclave fetches the repository from GitHub itself, over its own encrypted connection. The token is used for that one download and never stored; the auditor, the operator and the model never see it. Use a fine-grained token with read-only access to contents of this one repository. Public repositories need no token.</p>
+      <div class="grid2"><label class="f">Repository<input type="text" id="ghRepo" placeholder="owner/name"></label><label class="f">Branch, tag or commit<input type="text" id="ghRef" placeholder="main"></label></div>
+      ${tokenOk
+        ? `<label class="f">Read-only token (private repositories)<input type="password" id="ghToken" autocomplete="off" placeholder="github_pat_…"></label>`
+        : `<p class="small muted">Private repository? Enter tokens only where your computer has checked the enclave: open this session with <code>attest open</code> first (or have your agent do it):</p>
+           <div class="linkbox"><input type="text" readonly value="${esc(openCmd())}"><button class="btn" data-copy="${esc(openCmd())}">Copy</button></div>`}
+      <div class="row"><button class="btn primary" data-act="github">Import from GitHub</button></div></div></details>`;
+    body += `<details data-keep="upload-${c ? c.tree_sha256 : "none"}"><summary>Or upload files</summary><div class="stack" style="margin-top:10px">
       <p class="small muted">Recommended: the CLI sends exactly your git-tracked files and checks the enclave's attestation first.</p>
       <div class="linkbox"><input type="text" readonly value="${esc(cmd)}"><button class="btn" data-copy="${esc(cmd)}">Copy</button></div>
       <p class="small muted">Or choose a folder here. Everything in it is sent except <code>.git</code>, including untracked files.</p>
@@ -644,6 +657,7 @@ document.addEventListener("click", async (e) => {
     },
     "q-accept": () => sapi("/question/decision", { method: "POST", body: { version: Number(b.dataset.v), accept: true, note: val("qNote") } }),
     "q-reject": () => sapi("/question/decision", { method: "POST", body: { version: Number(b.dataset.v), accept: false, note: val("qNote") } }),
+    "github": () => sapi("/code/github", { method: "POST", timeout: 15 * 60 * 1000, body: { repo: val("ghRepo").trim(), ref: val("ghRef").trim() || undefined, token: val("ghToken").trim() || undefined } }),
     "affidavit": () => {
       if (!$("#aSign").checked) throw new Error("Tick the box to confirm the statement.");
       return sapi("/affidavit", { method: "POST", body: { organization: val("aOrg"), repo_url: val("aRepo"), git_commit: val("aCommit"), tree_sha256: b.dataset.tree } });

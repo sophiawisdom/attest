@@ -175,9 +175,10 @@ impl Bundle {
         cache: Arc<Cache>,
         rt: tokio::runtime::Handle,
         max_total: u64,
+        strip_top: bool,
     ) -> Result<Self> {
         let sealer = Sealer::new(session_id);
-        match Self::ingest_inner(reader, &sealer, &store, &rt, max_total) {
+        match Self::ingest_inner(reader, &sealer, &store, &rt, max_total, strip_top) {
             Ok((files, total_scan, dirs)) => {
                 Ok(Self::finish(files, dirs, total_scan, sealer, store, cache))
             }
@@ -195,6 +196,7 @@ impl Bundle {
         store: &BlobClient,
         rt: &tokio::runtime::Handle,
         max_total: u64,
+        strip_top: bool,
     ) -> Result<(BTreeMap<String, Entry>, ScanCounts, BTreeSet<String>)> {
         let mut archive = tar::Archive::new(reader);
         let mut files = BTreeMap::new();
@@ -243,6 +245,15 @@ impl Bundle {
                     .context("tar path")?
                     .to_string_lossy()
                     .into_owned(),
+            };
+            // A GitHub archive puts everything under one "owner-repo-sha/".
+            let raw = if strip_top {
+                match raw.split_once('/') {
+                    Some((_, rest)) if !rest.is_empty() => rest.to_string(),
+                    _ => continue,
+                }
+            } else {
+                raw
             };
             ensure!(
                 raw.len() <= MAX_PATH_BYTES,
@@ -919,7 +930,7 @@ mod tests {
         let rt = tokio::runtime::Handle::current();
         let store = BlobClient::memory();
         let cache = Arc::new(Cache::new(1 << 20));
-        std::thread::spawn(move || Bundle::ingest(&t[..], "s", store, cache, rt, max))
+        std::thread::spawn(move || Bundle::ingest(&t[..], "s", store, cache, rt, max, false))
             .join()
             .unwrap()
     }
@@ -981,7 +992,7 @@ mod tests {
         let t = tar_of(&[("a", b"x")]);
         let b = Arc::new(
             std::thread::spawn(move || {
-                Bundle::ingest(&t[..], "s", s2, Arc::new(Cache::new(1 << 20)), rt, 1 << 20)
+                Bundle::ingest(&t[..], "s", s2, Arc::new(Cache::new(1 << 20)), rt, 1 << 20, false)
             })
             .join()
             .unwrap()

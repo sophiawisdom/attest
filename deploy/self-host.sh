@@ -4,7 +4,7 @@
 #   deploy/self-host.sh [--name attest] [--region us-west-2] [--type m7g.xlarge]
 #                       [--email-from you@example.com] [--operator "Your Name"]
 #                       [--domain attest.example.com] [--commit SHA] [--repo URL]
-#                       [--acme-staging] [--bucket NAME | --no-s3]
+#                       [--acme-staging] [--bucket NAME | --no-s3] [--open]
 #   deploy/self-host.sh --standby-for NAME [--name NAME-standby] [--type ...]
 #
 # Only AWS is needed. Without --domain the server gets a Let's Encrypt
@@ -35,11 +35,15 @@
 # redeploy of NAME (a new image) stops the standby first; add it again
 # afterwards.
 #
+# The server is private: only you start sessions, with the operator key this
+# prints (kept in the state file); anyone you send a session link to takes
+# part. --open lets anyone start a session.
+#
 # Needs: aws CLI with credentials (EC2, IAM role creation, S3, SES, SSM read), ssh, git, curl, python3.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-NAME=attest REGION=us-west-2 TYPE=m7g.xlarge DOMAIN="" OPERATOR="" COMMIT="" REPO="" EMAIL_FROM="" BUCKET_ARG="" NO_S3="" STANDBY_FOR="" NAME_SET=""
+NAME=attest REGION=us-west-2 TYPE=m7g.xlarge DOMAIN="" OPERATOR="" COMMIT="" REPO="" EMAIL_FROM="" BUCKET_ARG="" NO_S3="" STANDBY_FOR="" NAME_SET="" OPEN=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --name) NAME=$2; NAME_SET=1; shift 2 ;;
@@ -54,6 +58,7 @@ while [ $# -gt 0 ]; do
     --acme-staging) ACME_DIR=https://acme-staging-v02.api.letsencrypt.org/directory; shift ;;
     --bucket) BUCKET_ARG=$2; shift 2 ;;
     --no-s3) NO_S3=1; shift ;;
+    --open) OPEN=1; shift ;;
     -h|--help) sed -n '2,39p' "$0"; exit 0 ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
@@ -83,7 +88,7 @@ if [ -n "$STANDBY_FOR" ]; then
   # shellcheck disable=SC1090
   pv() { ( source "$PSTATE"; eval "printf %s \"\${$1:-}\"" ); }
   P_INSTANCE=$(pv INSTANCE) P_IP=$(pv IP) P_ALLOC=$(pv ALLOC)
-  REGION=$(pv REGION) SG=$(pv SG) ALLOC=$P_ALLOC BUCKET=$(pv BUCKET) HANDOFF_TOKEN=$(pv HANDOFF_TOKEN)
+  REGION=$(pv REGION) SG=$(pv SG) ALLOC=$P_ALLOC BUCKET=$(pv BUCKET) HANDOFF_TOKEN=$(pv HANDOFF_TOKEN) OPERATOR_KEY=$(pv OPERATOR_KEY)
   [ -n "$P_INSTANCE" ] && [ -n "$HANDOFF_TOKEN" ] && [ -n "$P_ALLOC" ] || { echo "$STANDBY_FOR has no instance, Elastic IP or handoff token yet" >&2; exit 1; }
   KEY="$STATE_DIR/$STANDBY_FOR-key.pem"
   PSSH=(ssh -i "$KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$STATE_DIR/$STANDBY_FOR.known_hosts" -o ConnectTimeout=10 -o BatchMode=yes "ec2-user@$P_IP")
@@ -92,7 +97,9 @@ BUCKET=${BUCKET_ARG:-${BUCKET:-}}
 # The handoff token gates moving sessions between enclaves of this
 # deployment (see crates/enclave/src/handoff.rs). Made once, kept here.
 HANDOFF_TOKEN=${HANDOFF_TOKEN:-$(openssl rand -hex 24)}
-save() { printf 'REGION=%q\nINSTANCE=%q\nSG=%q\nALLOC=%q\nIP=%q\nBUCKET=%q\nHANDOFF_TOKEN=%q\nSTANDBY_FOR=%q\n' "$REGION" "${INSTANCE:-}" "${SG:-}" "${ALLOC:-}" "${IP:-}" "${BUCKET:-}" "$HANDOFF_TOKEN" "${STANDBY_FOR:-}" > "$STATE"; chmod 600 "$STATE"; }
+# Starts sessions on a private server (see --open). Made once, kept here.
+OPERATOR_KEY=${OPERATOR_KEY:-$(openssl rand -hex 16)}
+save() { printf 'REGION=%q\nINSTANCE=%q\nSG=%q\nALLOC=%q\nIP=%q\nBUCKET=%q\nHANDOFF_TOKEN=%q\nSTANDBY_FOR=%q\n' "$REGION" "${INSTANCE:-}" "${SG:-}" "${ALLOC:-}" "${IP:-}" "${BUCKET:-}" "$HANDOFF_TOKEN" "${STANDBY_FOR:-}" > "$STATE"; printf 'OPERATOR_KEY=%q\n' "$OPERATOR_KEY" >> "$STATE"; chmod 600 "$STATE"; }
 
 # Enclave size per instance type: the parent keeps the rest.
 case "$TYPE" in
@@ -304,10 +311,10 @@ if [ -n "$STANDBY_FOR" ]; then
   PEER="$P_PRIV:443"
 fi
 host_config() {  # $1: peer (host:port) or empty
-  ACME_DIR="${ACME_DIR:-}" DOMAIN="$DOMAIN" OPERATOR="$OPERATOR" IP="$PUBLIC_IP" EMAIL_FROM="$EMAIL_FROM" REGION="$REGION" HANDOFF_TOKEN="$HANDOFF_TOKEN" PEER="$1" python3 -c '
+  ACME_DIR="${ACME_DIR:-}" DOMAIN="$DOMAIN" OPERATOR="$OPERATOR" IP="$PUBLIC_IP" EMAIL_FROM="$EMAIL_FROM" REGION="$REGION" HANDOFF_TOKEN="$HANDOFF_TOKEN" OPERATOR_KEY="$OPERATOR_KEY" OPEN="$OPEN" PEER="$1" python3 -c '
 import json, os
 e = lambda k: os.environ[k] or None
-c = {"domain": e("DOMAIN"), "operator": e("OPERATOR"), "public_ip": e("IP"), "email_from": e("EMAIL_FROM"), "ses_region": e("REGION"), "acme_directory": e("ACME_DIR"), "handoff_token": e("HANDOFF_TOKEN")}
+c = {"domain": e("DOMAIN"), "operator": e("OPERATOR"), "public_ip": e("IP"), "email_from": e("EMAIL_FROM"), "ses_region": e("REGION"), "acme_directory": e("ACME_DIR"), "handoff_token": e("HANDOFF_TOKEN"), "operator_key": e("OPERATOR_KEY"), "open": bool(e("OPEN"))}
 if e("PEER"):
     c.update(peer=e("PEER"), standby=True)
 print(json.dumps(c))'
@@ -389,6 +396,7 @@ Server:   https://${DOMAIN:-$IP}  (the enclave gets its Let's Encrypt certificat
 Storage:  $STORAGE
 PCR0:     $PCR0
 Verify:   attest verify-service https://$IP --pcrs $PUBLISHED
+Sessions: $([ -n "$OPEN" ] && echo "anyone may start one (--open)" || echo "private: start one with operator key $OPERATOR_KEY")
 SSH:      ssh -i $KEY ec2-user@$IP
 EOF
 if [ -n "$DOMAIN" ]; then

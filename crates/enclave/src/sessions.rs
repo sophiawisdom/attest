@@ -831,6 +831,13 @@ impl Session {
         Ok(json!({"ok": true}))
     }
 
+    /// Tell the auditee where the code came from (only them: the auditor
+    /// sees the commitment).
+    pub fn note_source(self: &Arc<Self>, ctx: &Arc<Ctx>, text: &str) {
+        let mut st = lock(&self.st);
+        self.event(ctx, &mut st, "code_source", text.to_string(), Some(Role::Auditee), None, false);
+    }
+
     /// Install a freshly ingested bundle, replacing (and discarding) any earlier one.
     pub fn set_code(self: &Arc<Self>, ctx: &Arc<Ctx>, role: Role, bundle: Bundle) -> Result<Value> {
         ensure!(role == Role::Auditee, "only the auditee uploads code");

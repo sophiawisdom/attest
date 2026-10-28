@@ -14,6 +14,7 @@ mod budget;
 mod bundle;
 mod cgroups;
 mod handoff;
+mod github;
 mod harnesses;
 mod jail;
 mod llm;
@@ -90,6 +91,11 @@ struct HostConfig {
     /// The server's public IP, for an IP-address certificate when there's no domain.
     public_ip: Option<String>,
     max_code_mib: Option<usize>,
+    /// Who may start sessions: with `operator_key` set, only requests
+    /// carrying it (header `x-operator-key`) unless `open` is true. Without
+    /// a key, anyone.
+    operator_key: Option<String>,
+    open: Option<bool>,
     /// Sessions that may exist at once (budget.rs; default 100).
     max_sessions: Option<usize>,
     /// Enclave memory for session state, in MiB (budget.rs; default 15%
@@ -105,8 +111,8 @@ struct HostConfig {
     /// deployment: an enclave gives its sessions only to a request carrying
     /// it, and sends it when taking over. Unset: this enclave won't hand off.
     handoff_token: Option<String>,
-    /// With `peer`: take a copy of the lineage and stand by, following
-    /// `peer`'s writes, instead of taking its sessions over (replica.rs).
+    /// With `peer`: take the lineage's keys and stand by, instead of taking
+    /// the sessions over (replica.rs).
     #[serde(default)]
     standby: bool,
 }
@@ -371,6 +377,12 @@ async fn service() -> Result<()> {
     }
     let mut boot = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut boot);
+    let operator_key_hash = cfg
+        .operator_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| k.len() >= 16)
+        .map(|k| attest_core::sha256_hex(k.as_bytes()));
     let info = EnclaveInfo {
         service: "attest".into(),
         version: env!("CARGO_PKG_VERSION").into(),
@@ -383,6 +395,7 @@ async fn service() -> Result<()> {
         tls_spki_sha256: tls.as_ref().map(|t| t.spki_sha256.clone()),
         domain: domain.clone(),
         operator: cfg.operator.clone().map(|o| o.chars().take(120).collect()),
+        open: cfg.open.unwrap_or(false) || operator_key_hash.is_none(),
         harness: HarnessInfo {
             version: HARNESS_VERSION.into(),
             system_prompt_sha256: harness::system_prompt_sha256(),
@@ -414,6 +427,8 @@ async fn service() -> Result<()> {
     if let Some(n) = &cert_name {
         net.allow(n); // the DNS self-check before requesting a certificate
     }
+    net.allow(github::API);
+    net.allow(github::CODELOAD);
     if cfg.email_from.is_some() {
         net.allow(&format!(
             "email.{}.amazonaws.com",
@@ -479,6 +494,7 @@ async fn service() -> Result<()> {
         giver: handoff::Giver::new(cfg.handoff_token.clone()),
         follower,
         handoff_token: cfg.handoff_token.clone(),
+        operator_key_hash,
         attester,
         conns: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
         concurrency: args.concurrency,
@@ -584,6 +600,8 @@ struct App {
     /// Set on a standby: following the primary (replica.rs).
     follower: Option<Arc<replica::Follower>>,
     handoff_token: Option<String>,
+    /// sha256 of the operator key, if sessions need it.
+    operator_key_hash: Option<String>,
     attester: nsm::Attester,
     /// Open client connections (TLS handshakes included), bounded.
     conns: Arc<tokio::sync::Semaphore>,
@@ -959,6 +977,17 @@ fn base_url(app: &App, req: &Request<hyper::body::Incoming>) -> String {
 }
 
 fn create_session(app: &App, req: &Request<hyper::body::Incoming>) -> Result<Resp, ApiError> {
+    if !app.ctx.info.open {
+        let given = req.headers().get("x-operator-key").and_then(|h| h.to_str().ok()).unwrap_or("");
+        let want = app.operator_key_hash.as_deref().unwrap_or("");
+        let got = attest_core::sha256_hex(given.trim().as_bytes());
+        if given.is_empty() || ring::constant_time::verify_slices_are_equal(got.as_bytes(), want.as_bytes()).is_err() {
+            return Err(ApiError(
+                StatusCode::FORBIDDEN,
+                "this server is private: only its operator starts sessions (send the operator key as 'x-operator-key')".into(),
+            ));
+        }
+    }
     let (s, auditee, auditor) = app.ctx.store.create()?;
     let base = base_url(app, req);
     log(&format!("session {} created", &s.id[..8]));
@@ -981,24 +1010,34 @@ fn create_session(app: &App, req: &Request<hyper::body::Incoming>) -> Result<Res
 async fn ingest_upload(
     ctx: &Arc<Ctx>,
     session_id: &str,
+    body: hyper::body::Incoming,
+) -> Result<bundle::Bundle, ApiError> {
+    ingest_stream(ctx, session_id, body, false).await
+}
+
+/// A tar (gzipped, with one top directory, for a GitHub archive) streamed
+/// into a sealed bundle.
+async fn ingest_stream(
+    ctx: &Arc<Ctx>,
+    session_id: &str,
     mut body: hyper::body::Incoming,
+    github: bool,
 ) -> Result<bundle::Bundle, ApiError> {
     let max = ctx.max_code_bytes as u64;
     let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(16);
     let (store, cache, sid) = (ctx.blobs.clone(), ctx.cache.clone(), session_id.to_string());
     let rt = tokio::runtime::Handle::current();
     let job = tokio::task::spawn_blocking(move || {
-        bundle::Bundle::ingest(
-            ChannelReader {
-                rx,
-                buf: Bytes::new(),
-            },
-            &sid,
-            store,
-            cache,
-            rt,
-            max,
-        )
+        let reader = ChannelReader {
+            rx,
+            buf: Bytes::new(),
+        };
+        if github {
+            let gz = flate2::read::GzDecoder::new(reader);
+            bundle::Bundle::ingest(gz, &sid, store, cache, rt, max, true)
+        } else {
+            bundle::Bundle::ingest(reader, &sid, store, cache, rt, max, false)
+        }
     });
     // Deadlines: a frame at least every minute, and the whole upload within
     // an hour. On any error the parser is still awaited before returning,
@@ -1131,6 +1170,42 @@ async fn session_route(
             .await
             .map_err(|_| anyhow!("upload failed"))??;
             ok(s.set_code(ctx, role, bundle)?)
+        }
+        ("POST", ["code", "github"]) => {
+            if role != attest_core::Role::Auditee {
+                return Err(anyhow!("only the auditee provides code").into());
+            }
+            let v = body_json(req).await?;
+            let repo = v["repo"].as_str().unwrap_or("").trim().to_string();
+            let r = v["ref"].as_str().map(str::trim).filter(|r| !r.is_empty()).unwrap_or("HEAD").to_string();
+            let token = v["token"].as_str().unwrap_or("").trim().to_string();
+            github::check_repo(&repo)?;
+            github::check_ref(&r)?;
+            // No token: a public repository.
+            if token.len() > 400 {
+                return Err(anyhow!("that token is too long").into());
+            }
+            crate::budget::ensure_room(sessions::UPLOAD_ALLOWANCE).map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
+            let (ctx2, sid) = (ctx.clone(), s.id.clone());
+            let (repo2, r2) = (repo.clone(), r.clone());
+            let (bundle, commit) = tokio::spawn(async move {
+                let _slot = tokio::time::timeout(Duration::from_secs(30), ctx2.upload_slots.acquire())
+                    .await
+                    .map_err(|_| {
+                        ApiError(StatusCode::SERVICE_UNAVAILABLE, "the server is busy with other uploads; try again shortly".into())
+                    })?
+                    .map_err(|_| anyhow!("shutting down"))?;
+                let commit = github::resolve(&ctx2.net, &repo2, &r2, &token).await?;
+                let body = github::archive(&ctx2.net, &repo2, &commit, &token).await?;
+                drop(token);
+                Ok::<_, ApiError>((ingest_stream(&ctx2, &sid, body, true).await?, commit))
+            })
+            .await
+            .map_err(|_| anyhow!("import failed"))??;
+            let mut out = s.set_code(ctx, role, bundle)?;
+            s.note_source(ctx, &format!("Code imported from GitHub: {repo} at commit {commit} ({r})."));
+            out["github"] = json!({"repo": repo, "ref": r, "commit": commit});
+            ok(out)
         }
         ("POST", ["affidavit"]) => ok(s.confirm_affidavit(ctx, role, &body_json(req).await?)?),
         ("POST", ["models"]) => ok(s.propose_model(ctx, role, &body_json(req).await?)?),

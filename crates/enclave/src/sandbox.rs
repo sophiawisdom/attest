@@ -598,6 +598,7 @@ mod tests {
                         Arc::new(Cache::new(1 << 20)),
                         handle,
                         1 << 20,
+                        false,
                     )
                 })
                 .await

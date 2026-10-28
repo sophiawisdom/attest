@@ -231,6 +231,36 @@ impl Net {
         headers: &[(&str, &str)],
         body: Vec<u8>,
     ) -> Result<HttpResponse> {
+        let resp = self.send(method, https, verify, host, port, path, headers, body).await?;
+        Self::collect(resp).await
+    }
+
+    /// A GET over verified HTTPS whose response body is read as it arrives
+    /// (a repository archive). Only the headers are bounded by `timeout`.
+    pub async fn get_streaming(
+        &self,
+        host: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        timeout: Duration,
+    ) -> Result<hyper::Response<hyper::body::Incoming>> {
+        tokio::time::timeout(timeout, self.send("GET", true, true, host, 443, path, headers, Vec::new()))
+            .await
+            .map_err(|_| anyhow!("request to {host} timed out"))?
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send(
+        &self,
+        method: &str,
+        https: bool,
+        verify: bool,
+        host: &str,
+        port: u16,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> Result<hyper::Response<hyper::body::Incoming>> {
         let raw = self.tunnel(host, port).await?;
         let io: Stream = if https {
             let name = rustls::pki_types::ServerName::try_from(host.to_string())?;
@@ -276,9 +306,10 @@ impl Net {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        let resp = sender
-            .send_request(req.body(Full::new(Bytes::from(body)))?)
-            .await?;
+        Ok(sender.send_request(req.body(Full::new(Bytes::from(body)))?).await?)
+    }
+
+    async fn collect(resp: hyper::Response<hyper::body::Incoming>) -> Result<HttpResponse> {
         let status = resp.status().as_u16();
         let headers = resp
             .headers()
