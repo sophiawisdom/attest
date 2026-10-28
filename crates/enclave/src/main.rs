@@ -305,7 +305,20 @@ async fn service() -> Result<()> {
     let mut follower = None;
     let (signing, keys, lineage, heads) = match cfg.peer.clone().filter(|p| !p.is_empty()) {
         Some(peer) => {
-            let r = take_over(&net, &attester, args.dev, &peer, cfg.handoff_token.as_deref().unwrap_or(""), cfg.standby).await?;
+            let token = cfg.handoff_token.as_deref().unwrap_or("");
+            // A standby waits for its peer to be a primary that can give it
+            // the keys (after a failover the peer may still be starting, or
+            // be a standby itself until it's promoted). A move fails at once.
+            let r = loop {
+                match take_over(&net, &attester, args.dev, &peer, token, cfg.standby).await {
+                    Ok(r) => break r,
+                    Err(e) if cfg.standby => {
+                        log(&format!("standby: couldn't take the keys from {peer} yet ({e:#}); retrying in 20s"));
+                        tokio::time::sleep(Duration::from_secs(20)).await;
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
             let p = r.payload;
             let heads = if cfg.standby {
                 follower = Some(Arc::new(replica::Follower::new(&peer, args.dev, r.id, r.channel)));
