@@ -660,7 +660,7 @@ fn health(app: &App) -> Value {
     let expires_in = cert.as_ref().and_then(|c| c.not_after).map(|n| n - now);
     let ctx = &app.ctx;
     let python = ctx.sandbox.get().is_some();
-    let jail = !ctx.dev && cgroups::init().is_ok();
+    let jail = cgroups::init().is_ok();
     // Unhealthy: a CA-issued certificate within a day of expiring, or
     // nearly every connection slot taken.
     let conns_open = MAX_CONNECTIONS - app.conns.available_permits();
