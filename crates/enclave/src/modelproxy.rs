@@ -341,26 +341,56 @@ fn vet_content(provider: Provider, v: &Value, depth: usize) -> Result<(), String
 /// Anthropic beta flags that only change formatting, thinking or how the
 /// request's own context is handled. Others (server tools, files, MCP
 /// connectors and anything new) are dropped, so they stay off.
+/// Anthropic beta flags a harness may turn on, exactly as Claude Code
+/// 2.1.311 sends them. Anything else is dropped (the feature stays off).
+const KNOWN_BETAS: &[&str] = &[
+    "interleaved-thinking-2025-05-14",
+    "context-management-2025-06-27",
+    "claude-code-20250219",
+    "mid-conversation-tool-changes-2026-07-01",
+    "thinking-token-count-2026-05-13",
+    "advanced-tool-use-2025-11-20",
+    "effort-2025-11-24",
+];
+
+/// The known flags among those requested, in a fixed order.
 fn known_betas(v: &str) -> String {
-    const OK: &[&str] = &[
-        "interleaved-thinking-",
-        "context-management-",
-        "claude-code-",
-        "mid-conversation-tool-changes-",
-        "thinking-token-count-",
-        "advanced-tool-use-",
-        "effort-",
-        "fine-grained-tool-streaming-",
-        "token-efficient-tools-",
-        "prompt-caching-",
-        "output-128k-",
-        "context-1m-",
-    ];
-    v.split(',')
-        .map(str::trim)
-        .filter(|b| OK.iter().any(|p| b.starts_with(p)))
+    let asked: Vec<&str> = v.split(',').map(str::trim).collect();
+    KNOWN_BETAS
+        .iter()
+        .filter(|b| asked.contains(b))
+        .copied()
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// Total size of the headers the proxy builds, before the API key. Padded to
+/// this so a harness can't vary request size through header choices (the
+/// body is padded separately).
+const HEADER_BYTES: usize = 1024;
+
+/// The headers sent upstream. None are copied from the harness: they are
+/// derived from the vetted request (endpoint, stream flag) and the known
+/// beta flags it asked for, then padded to a fixed total size.
+fn upstream_headers(messages_api: bool, stream: bool, betas: &str) -> Vec<(String, String)> {
+    let mut h = vec![
+        ("content-type".to_string(), "application/json".to_string()),
+        (
+            "accept".to_string(),
+            if stream { "text/event-stream" } else { "application/json" }.to_string(),
+        ),
+    ];
+    if messages_api {
+        h.push(("anthropic-version".into(), "2023-06-01".into()));
+        if !betas.is_empty() {
+            h.push(("anthropic-beta".into(), betas.to_string()));
+        }
+    }
+    let size = |h: &Vec<(String, String)>| h.iter().map(|(k, v)| k.len() + v.len() + 4).sum::<usize>();
+    let pad_name = "x-attest-pad";
+    let used = size(&h) + pad_name.len() + 4;
+    h.push((pad_name.into(), "0".repeat(HEADER_BYTES.saturating_sub(used).max(1))));
+    h
 }
 
 /// Map a harness request path to the provider path, or refuse it.
@@ -487,29 +517,14 @@ async fn handle(up: Arc<Upstream>, req: Request<hyper::body::Incoming>) -> Respo
             "only the model endpoint is forwarded",
         );
     };
-    // Forward only headers a model API needs.
-    let keep = [
-        "content-type",
-        "accept",
-        "openai-beta",
-        "anthropic-version",
-        "anthropic-beta",
-    ];
-    let headers: Vec<(String, String)> = req
+    let betas = req
         .headers()
+        .get_all("anthropic-beta")
         .iter()
-        .filter(|(k, _)| keep.contains(&k.as_str()))
-        .map(|(k, v)| {
-            let v = String::from_utf8_lossy(v.as_bytes()).into_owned();
-            let v = if k.as_str() == "anthropic-beta" {
-                known_betas(&v)
-            } else {
-                v
-            };
-            (k.to_string(), v)
-        })
-        .filter(|(_, v)| !v.is_empty())
-        .collect();
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+        .collect::<Vec<_>>()
+        .join(",");
+    let betas = known_betas(&betas);
     let raw = match http_body_util::Limited::new(req.into_body(), 32 << 20)
         .collect()
         .await
@@ -528,18 +543,18 @@ async fn handle(up: Arc<Upstream>, req: Request<hyper::body::Incoming>) -> Respo
             return reply(StatusCode::FORBIDDEN, &why);
         }
     };
+    let stream = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
+        .unwrap_or(false);
+    let headers = upstream_headers(path.ends_with("/messages"), stream, &betas);
     let mut h: Vec<(&str, &str)> = headers
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
     let auth = format!("Bearer {}", up.api_key);
     match up.provider {
-        Provider::Anthropic => {
-            h.push(("x-api-key", &up.api_key));
-            if !h.iter().any(|(k, _)| *k == "anthropic-version") {
-                h.push(("anthropic-version", "2023-06-01"));
-            }
-        }
+        Provider::Anthropic => h.push(("x-api-key", &up.api_key)),
         _ => h.push(("authorization", &auth)),
     }
     let host = crate::llm::endpoint(up.provider).0;
@@ -857,7 +872,19 @@ mod tests {
             Some("/api/v1/messages")
         );
         assert!(upstream_path(Provider::Openai, "/v1/messages").is_none());
-        assert_eq!(known_betas("interleaved-thinking-2025-05-14, mcp-client-2025-04-04,files-api-2025-04-14,effort-2025-11-24"), "interleaved-thinking-2025-05-14,effort-2025-11-24");
+        assert_eq!(known_betas("effort-2025-11-24, mcp-client-2025-04-04,files-api-2025-04-14,interleaved-thinking-2025-05-14"), "interleaved-thinking-2025-05-14,effort-2025-11-24");
+        assert_eq!(known_betas("effort-2025-11-24-and-more-text"), "");
+        // Every header combination comes out the same size.
+        let size = |h: Vec<(String, String)>| h.iter().map(|(k, v)| k.len() + v.len() + 4).sum::<usize>();
+        let all = KNOWN_BETAS.join(",");
+        let sizes = [
+            size(upstream_headers(false, false, "")),
+            size(upstream_headers(false, true, "")),
+            size(upstream_headers(true, true, "")),
+            size(upstream_headers(true, false, &all)),
+            size(upstream_headers(true, true, "effort-2025-11-24")),
+        ];
+        assert!(sizes.iter().all(|s| *s == HEADER_BYTES), "{sizes:?}");
         // Codex 0.164 sends tools as an input item, grouped in namespaces.
         let at = |tool: &str| {
             format!(
