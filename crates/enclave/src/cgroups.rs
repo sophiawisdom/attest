@@ -114,25 +114,31 @@ fn detect() -> Result<Layout> {
             .context("capping the jails' CPU")?;
         Layout::V1 { memory, pids, cpu }
     };
-    reap_leftovers(&layout);
+    reap_leftovers(&layout, true);
     Ok(layout)
 }
 
-/// Kill and remove run cgroups left from an earlier service process, and
-/// any this process failed to remove before.
-fn reap_leftovers(layout: &Layout) {
+/// Kill and remove run cgroups this process failed to remove before, and
+/// at startup (`all`, when no run of this process can exist yet) every run
+/// cgroup left by an earlier service process. Never a scan while running:
+/// other runs' live cgroups look the same.
+fn reap_leftovers(layout: &Layout, all: bool) {
     let parents: Vec<&PathBuf> = match layout {
         Layout::V2 { parent } => vec![parent],
         Layout::V1 { memory, pids, cpu } => vec![memory, pids, cpu],
     };
-    let mut dirs: Vec<PathBuf> = parents
-        .iter()
-        .filter_map(|p| std::fs::read_dir(p).ok())
-        .flatten()
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().starts_with("run-"))
-        .map(|e| e.path())
-        .collect();
+    let mut dirs: Vec<PathBuf> = if all {
+        parents
+            .iter()
+            .filter_map(|p| std::fs::read_dir(p).ok())
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("run-"))
+            .map(|e| e.path())
+            .collect()
+    } else {
+        Vec::new()
+    };
     dirs.extend(std::mem::take(&mut *LEFTOVERS.lock().unwrap_or_else(|e| e.into_inner())));
     dirs.sort();
     dirs.dedup();
@@ -203,7 +209,7 @@ impl RunCgroup {
         let layout = layout()?;
         // Retry anything an earlier run couldn't clean up.
         if !LEFTOVERS.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
-            reap_leftovers(layout);
+            reap_leftovers(layout, false);
         }
         // The guard owns each directory before it's created, so a failure
         // halfway removes what was made.
