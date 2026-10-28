@@ -162,10 +162,13 @@ impl Sealer {
         a
     }
 
-    /// Returns (blob id, sealed bytes = nonce || ciphertext of LZ4(plain)).
-    /// Compressing first means less to move over vsock and store.
+    /// Returns (blob id, sealed bytes = nonce || ciphertext of padded
+    /// LZ4(plain)). Compressing first means less to move over vsock and
+    /// store; padding to a size bucket (1 KiB and up, 1.25x apart) means the
+    /// host sees roughly how big a file is, not its exact compressed size,
+    /// which could be matched against guesses of the content.
     pub fn seal(&self, path: &str, digest: &[u8; 32], plain: &[u8]) -> Result<(BlobId, Vec<u8>)> {
-        let packed = lz4_flex::compress_prepend_size(plain);
+        let packed = pad_blob(lz4_flex::compress_prepend_size(plain));
         let plain = &packed[..];
         let mut id = [0u8; 24];
         id[..8].copy_from_slice(&self.tag);
@@ -204,13 +207,14 @@ impl Sealer {
                     "stored copy of {path} failed authentication (tampered or swapped by the host)"
                 )
             })?;
+        let plain = unpad_blob(&plain).ok_or_else(|| anyhow!("stored copy of {path} is malformed"))?;
         ensure!(plain.len() >= 4, "stored copy of {path} is malformed");
         let declared = u32::from_le_bytes(plain[..4].try_into().unwrap()) as usize;
         ensure!(
             declared <= MAX_FILE_BYTES,
             "stored copy of {path} is too large"
         );
-        let plain = lz4_flex::decompress_size_prepended(&plain)
+        let plain = lz4_flex::decompress_size_prepended(plain)
             .map_err(|_| anyhow!("stored copy of {path} is malformed"))?;
         ensure!(
             &attest_core::sha256(&plain) == digest,
@@ -218,6 +222,25 @@ impl Sealer {
         );
         Ok(plain)
     }
+}
+
+/// `len || data || zeros`, up to the next size bucket.
+fn pad_blob(data: Vec<u8>) -> Vec<u8> {
+    let need = data.len() + 4;
+    let mut bucket = 1024usize;
+    while bucket < need {
+        bucket = bucket + bucket / 4;
+    }
+    let mut out = Vec::with_capacity(bucket);
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    out.extend_from_slice(&data);
+    out.resize(bucket, 0);
+    out
+}
+
+fn unpad_blob(b: &[u8]) -> Option<&[u8]> {
+    let n = u32::from_le_bytes(b.get(..4)?.try_into().ok()?) as usize;
+    b.get(4..4 + n)
 }
 
 /// Decrypted-file cache shared by all sessions, bounded in bytes.
@@ -280,6 +303,18 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn padding_hides_exact_size() {
+        let s = Sealer::new("s");
+        let d = |b: &[u8]| attest_core::sha256(b);
+        let a = s.seal("a", &d(b"x"), b"x").unwrap().1.len();
+        let b = s.seal("b", &d(&[7u8; 300]), &[7u8; 300]).unwrap().1.len();
+        assert_eq!(a, b, "small files land in the same bucket");
+        let big: Vec<u8> = (0..100_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        let sealed = s.seal("c", &d(&big), &big).unwrap().1;
+        assert_eq!(s.open("c", &d(&big), &sealed).unwrap(), big);
+    }
 
     #[test]
     fn seal_open_and_tamper() {

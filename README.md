@@ -99,7 +99,13 @@ sandbox mode, so only confirmed addresses get mail. Agents poll instead. See
   responses to the browser and agents are padded the same way. If that matters, the auditee should run the enclave themselves
   (`deploy/self-host.sh`): then the parent is theirs.
 - Before release the auditor sees only a salted commitment to the code, not
-  its tree hash, size or file count; each released certificate opens it.
+  its tree hash, size or file count; a certificate opens it only if the
+  auditee releases the run details. The parent stores each file sealed and
+  padded to a size bucket (1 KiB and up, 1.25x apart), so it learns the
+  number of files and their rough sizes, not exact ones.
+- Each jailed run has its own cgroup (memory, process and CPU caps) and user
+  id. Runs still share the enclave's CPUs and memory bandwidth, so a run can
+  notice another's load; for the strict setting, don't share the server.
 - Sessions on one server share its CPUs and run slots. Someone running other
   sessions on the same server can notice when a run frees its slot, which
   says roughly when it finished (the auditor's own view never does). The

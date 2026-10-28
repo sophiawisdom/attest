@@ -146,6 +146,8 @@ def run(work):
     print("code upload through the CLI")
     link = f"{BASE}/s/{s['session_id']}#{s['auditee_token']}"
     out = subprocess.run([os.path.join(BIN, "attest"), "upload", link, repo, "--org", "Example Lab", "--allow-dev"], capture_output=True, text=True)
+    if out.returncode != 0:
+        print(out.stdout[-2000:], out.stderr[-2000:])
     check(out.returncode == 0 and "affidavit confirmed" in out.stdout, "attest upload sends code and confirms the affidavit")
     v = auditor.view()
     check(set(v["code"]) == {"commitment_sha256", "uploaded_at_ms"} and v["affidavit"]["current"] and "tree_sha256" not in v["affidavit"], "auditor sees only the code commitment and the affidavit")
