@@ -83,8 +83,16 @@ the enclave. `/agents.md` on the server describes the protocol.
   `attest`) and a newer `--commit`. This rebuilds and restarts the enclave,
   which ends every session on it.
 - **Logs:** `ssh -i ~/.config/attest/attest-key.pem ec2-user@IP`. The host
-  daemon logs to `~/attest-host.log`. The enclave itself has no console in
-  production mode, by design.
+  daemon logs to `~/attest-host.log`, including the enclave's own log lines.
+  The enclave has no console in production mode, by design.
+- **Staying up:** the host daemon runs as the `attest-host` systemd service
+  and restarts on failure; that doesn't affect the enclave or stored files.
+  The `attest-watchdog` timer starts the enclave after a reboot or if it
+  dies, and restarts it if `/healthz` fails five minutes in a row
+  (`journalctl -t attest-watchdog`). An enclave restart ends every session.
+- **Health:** `curl -sk https://IP/api/health` shows the certificate's
+  expiry, whether the Python sandbox and jail limits are ready, and busy run
+  slots and connections. It says nothing about any session.
 - **Remove:** `deploy/teardown.sh --name attest` terminates the instance and
   deletes the Elastic IP, security group and IAM role.
 
