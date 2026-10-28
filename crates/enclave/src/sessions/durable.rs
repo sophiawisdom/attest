@@ -245,6 +245,10 @@ impl Session {
         let slot = generation % SLOTS;
         let parts = p.put_large(&self.id, &format!("snap/{slot}"), &bytes).await?;
         let head = serde_json::to_vec(&Head { generation, slot, parts })?;
+        // Snapshots are measured as they're written: the serialized size,
+        // doubled for in-memory overhead.
+        let old = self.measured.swap(bytes.len() * 2, Ordering::Relaxed);
+        crate::budget::remeasure(&crate::budget::STATES, old, bytes.len() * 2);
         let hash = p.put(&self.id, &format!("head/{slot}"), &head).await?;
         *lock(&self.written) = (generation, Some(format!("{slot}:{hash}")));
         Ok(())
@@ -420,7 +424,7 @@ async fn restore_session(ctx: &Arc<Ctx>, sid: &str, head_ref: &str) -> Result<Ar
         None => None,
     };
     for (r, t) in runs.iter_mut().zip(traces) {
-        TRACE_BYTES.fetch_add(t.stored, Ordering::Relaxed);
+        crate::budget::add(&crate::budget::TRACES, t.stored);
         r.trace = t;
     }
     let mut st = State {
@@ -499,7 +503,9 @@ async fn restore_session(ctx: &Arc<Ctx>, sid: &str, head_ref: &str) -> Result<Ar
         st: Mutex::new(State::default()),
         dirty: AtomicBool::new(false),
         written: Mutex::new((head.generation, Some(head_ref.to_string()))),
+        measured: (bytes.len() * 2).into(),
     });
+    crate::budget::add(&crate::budget::STATES, bytes.len() * 2);
     {
         let mut guard = lock(&s.st);
         *guard = st;

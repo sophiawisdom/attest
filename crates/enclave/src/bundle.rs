@@ -41,6 +41,21 @@ pub struct Bundle {
     /// Hashes of this bundle's manifest record parts once stored (it never
     /// changes, so it's written once; see sessions.rs).
     pub persisted: std::sync::Mutex<Option<Vec<String>>>,
+    /// Estimated size of the index above, counted in budget::INDEXES.
+    pub index_bytes: usize,
+}
+
+/// What a bundle's index takes in memory, roughly: each path, its entry
+/// and the tree nodes around it.
+fn index_size(files: &BTreeMap<String, Entry>, dirs: &BTreeSet<String>) -> usize {
+    let f: usize = files
+        .iter()
+        .map(|(p, e)| p.len() + 160 + e.scan.iter().map(|(k, _)| k.len() + 40).sum::<usize>())
+        .sum();
+    let d: usize = dirs.iter().map(|p| p.len() + 64).sum();
+    let n = f + d;
+    crate::budget::add(&crate::budget::INDEXES, n);
+    n
 }
 
 /// Everything needed to rebuild a Bundle in a successor enclave: the index,
@@ -324,6 +339,7 @@ impl Bundle {
         store: BlobClient,
         cache: Arc<Cache>,
     ) -> Self {
+        let index_bytes = index_size(&files, &dirs);
         let digests: BTreeMap<String, [u8; 32]> =
             files.iter().map(|(k, f)| (k.clone(), f.digest)).collect();
         let tree = tree_hash(&digests);
@@ -350,6 +366,7 @@ impl Bundle {
             pinned: Default::default(),
             pin_load: Default::default(),
             persisted: Default::default(),
+            index_bytes,
         }
     }
 
@@ -400,17 +417,21 @@ impl Bundle {
                 },
             );
         }
+        let dirs = m.dirs.into_iter().collect();
+        let sealer = Sealer::from_parts(session_id, arr(&m.key)?, arr(&m.tag)?);
+        let index_bytes = index_size(&files, &dirs);
         Ok(Self {
             files,
-            dirs: m.dirs.into_iter().collect(),
+            dirs,
             info: m.info,
             scan_total: m.scan_total,
-            sealer: Sealer::from_parts(session_id, arr(&m.key)?, arr(&m.tag)?),
+            sealer,
             store,
             cache,
             pinned: Default::default(),
             pin_load: Default::default(),
             persisted: Default::default(),
+            index_bytes,
         })
     }
 
@@ -505,6 +526,7 @@ impl Drop for Bundle {
     fn drop(&mut self) {
         self.cache.forget_session(&self.sealer.tag);
         self.store.delete_later(self.sealer.tag);
+        crate::budget::sub(&crate::budget::INDEXES, self.index_bytes);
     }
 }
 

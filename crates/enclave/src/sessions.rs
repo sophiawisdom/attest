@@ -31,7 +31,7 @@ use tokio::sync::watch;
 mod durable;
 pub use durable::write_loop;
 
-pub const MAX_SESSIONS: usize = 2000;
+pub const UPLOAD_ALLOWANCE: usize = SESSION_ALLOWANCE;
 pub const SESSION_TTL_MS: u64 = 30 * 24 * 3600 * 1000;
 const MAX_QUESTION_CHARS: usize = 20_000;
 const MAX_MESSAGE_CHARS: usize = 20_000;
@@ -107,6 +107,8 @@ pub struct Session {
     dirty: AtomicBool,
     /// The last state written: snapshot generation and the head record's hash.
     written: Mutex<(u64, Option<String>)>,
+    /// This session's share of budget::STATES.
+    measured: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Default)]
@@ -355,12 +357,14 @@ const MAX_NAME_BYTES: usize = 500;
 const MAX_QUESTION_VERSIONS: usize = 100;
 const MAX_MODEL_PROPOSALS: usize = 50;
 const MAX_RUNS: usize = 50;
-/// Trace kept for one run, and for all runs on the server.
+/// Session memory free before a new session, question, model proposal or
+/// message is taken, so a full server refuses work instead of growing.
+const SESSION_ALLOWANCE: usize = 1 << 20;
+/// Free before a run starts: room for a good part of its trace.
+const RUN_ALLOWANCE: usize = 8 << 20;
 /// Raw trace content per run: model exchanges in full, tool calls and the
 /// agent's own log. Stored compressed.
 const MAX_TRACE_BYTES_PER_RUN: usize = 40 << 20;
-/// Compressed trace bytes across all sessions.
-const MAX_TRACE_BYTES_TOTAL: usize = 2 << 30;
 
 /// A run's trace entries, each kept LZ4-compressed: tool output and model
 /// exchanges are mostly text and JSON, which compress several times over.
@@ -377,7 +381,7 @@ impl Trace {
         for e in v {
             t.push(e);
         }
-        TRACE_BYTES.fetch_add(t.stored, std::sync::atomic::Ordering::Relaxed);
+        crate::budget::add(&crate::budget::TRACES, t.stored);
         t
     }
 
@@ -412,7 +416,6 @@ impl Trace {
         (out, i)
     }
 }
-static TRACE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn clean(s: Option<&str>) -> Option<String> {
     s.map(|x| x.trim().to_string()).filter(|x| !x.is_empty())
@@ -496,7 +499,8 @@ impl Store {
             drop(st.code.take());
             st.expired = true;
             let freed: usize = st.runs.iter().map(|r| r.trace.stored).sum();
-            TRACE_BYTES.fetch_sub(freed.min(TRACE_BYTES.load(std::sync::atomic::Ordering::Relaxed)), std::sync::atomic::Ordering::Relaxed);
+            crate::budget::sub(&crate::budget::TRACES, freed);
+            crate::budget::sub(&crate::budget::STATES, s.measured.swap(0, Ordering::Relaxed));
             // The session is gone from the map; drop what it held.
             st.runs.clear();
             st.disclosures.clear();
@@ -506,7 +510,8 @@ impl Store {
     pub fn create(&self) -> Result<(Arc<Session>, String, String)> {
         self.sweep();
         let now = now_ms();
-        let full = lock(&self.sessions).len() >= MAX_SESSIONS;
+        let max = crate::budget::max_sessions();
+        let full = lock(&self.sessions).len() >= max;
         if full {
             // Make room by dropping the oldest session nobody has used.
             let snapshot: Vec<Arc<Session>> = lock(&self.sessions).values().cloned().collect();
@@ -520,9 +525,10 @@ impl Store {
         }
         let mut map = lock(&self.sessions);
         ensure!(
-            map.len() < MAX_SESSIONS,
+            map.len() < max,
             "this server is at its session limit; try again later"
         );
+        crate::budget::ensure_room(SESSION_ALLOWANCE)?;
         let auditee = random_hex(32);
         let auditor = random_hex(32);
         let tx = [watch::channel(0).0, watch::channel(0).0];
@@ -537,6 +543,7 @@ impl Store {
             tx,
             dirty: AtomicBool::new(true),
             written: Mutex::new((0, None)),
+            measured: Default::default(),
         });
         map.insert(s.id.clone(), s.clone());
         Ok((s, auditee, auditor))
@@ -712,6 +719,7 @@ impl Session {
         v: &Value,
     ) -> Result<Value> {
         ensure!(role == Role::Auditor, "only the auditor asks the question");
+        crate::budget::ensure_room(SESSION_ALLOWANCE)?;
         let text = clean(v["text"].as_str()).ok_or_else(|| anyhow!("text is required"))?;
         ensure!(
             text.chars().count() <= MAX_QUESTION_CHARS,
@@ -824,6 +832,9 @@ impl Session {
     /// Install a freshly ingested bundle, replacing (and discarding) any earlier one.
     pub fn set_code(self: &Arc<Self>, ctx: &Arc<Ctx>, role: Role, bundle: Bundle) -> Result<Value> {
         ensure!(role == Role::Auditee, "only the auditee uploads code");
+        // The new index is already counted; the one it replaces isn't freed
+        // yet if runs still hold it.
+        crate::budget::ensure_room(0)?;
         let bundle = Arc::new(bundle);
         let info = bundle.info.clone();
         let mut st = lock(&self.st);
@@ -902,6 +913,7 @@ impl Session {
     }
 
     pub fn propose_model(self: &Arc<Self>, ctx: &Arc<Ctx>, role: Role, v: &Value) -> Result<Value> {
+        crate::budget::ensure_room(SESSION_ALLOWANCE)?;
         let provider: Provider = v["provider"].as_str().unwrap_or_default().parse()?;
         ensure!(
             provider != Provider::Mock || ctx.dev,
@@ -1150,6 +1162,7 @@ impl Session {
             role == Role::Auditor,
             "only the auditor sends follow-up messages"
         );
+        crate::budget::ensure_room(SESSION_ALLOWANCE)?;
         let text = clean(v["text"].as_str()).ok_or_else(|| anyhow!("text is required"))?;
         ensure!(
             text.chars().count() <= MAX_MESSAGE_CHARS,
@@ -1310,6 +1323,7 @@ impl Session {
             st.runs.len() < MAX_RUNS,
             "this session has had {MAX_RUNS} runs; start a new session"
         );
+        crate::budget::ensure_room(RUN_ALLOWANCE)?;
         let q = st
             .questions
             .iter()
@@ -1610,6 +1624,7 @@ impl Session {
     ) -> Result<Value> {
         use base64::Engine as _;
         ensure!(role == Role::Auditee, "only the auditee discloses");
+        crate::budget::ensure_room(SESSION_ALLOWANCE + 2 * MAX_DISCLOSED_FILE as usize)?;
         // Reserve a place before any slow work, so concurrent requests can't
         // all pass the limit check.
         let (bundle, _reservation) = {
@@ -1933,13 +1948,9 @@ impl RunJob {
                         return;
                     }
                     let size: usize = entries.iter().map(|e| e.to_string().len()).sum();
-                    use std::sync::atomic::Ordering::Relaxed;
-                    let total = TRACE_BYTES.load(Relaxed);
                     // The stored size is unknown until compressed; the raw
                     // size bounds it, so check the global budget with that.
-                    if r.trace_bytes + size > MAX_TRACE_BYTES_PER_RUN
-                        || total + size > MAX_TRACE_BYTES_TOTAL
-                    {
+                    if r.trace_bytes + size > MAX_TRACE_BYTES_PER_RUN || crate::budget::ensure_room(size).is_err() {
                         r.trace_full = true;
                         r.trace.push(&json!({"type": "error", "content": "the trace reached its size limit; later steps aren't recorded (the run continues)"}));
                         return;
@@ -1949,7 +1960,7 @@ impl RunJob {
                     for e in &entries {
                         r.trace.push(e);
                     }
-                    TRACE_BYTES.fetch_add(r.trace.stored - before, Relaxed);
+                    crate::budget::add(&crate::budget::TRACES, r.trace.stored - before);
                 }
                 // No wake-up here: the ticker below wakes the auditee on a
                 // fixed schedule, so the timing of their trace fetches (which

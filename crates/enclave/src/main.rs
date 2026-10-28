@@ -10,6 +10,7 @@ mod acme;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod aws;
 mod blobs;
+mod budget;
 mod bundle;
 mod cgroups;
 mod handoff;
@@ -89,6 +90,11 @@ struct HostConfig {
     /// The server's public IP, for an IP-address certificate when there's no domain.
     public_ip: Option<String>,
     max_code_mib: Option<usize>,
+    /// Sessions that may exist at once (budget.rs; default 100).
+    max_sessions: Option<usize>,
+    /// Enclave memory for session state, in MiB (budget.rs; default 15%
+    /// of the enclave's memory, at most 25%).
+    session_memory_mib: Option<usize>,
     /// Shown on the landing page as "run by ...". Unverified.
     operator: Option<String>,
     /// An enclave of this image to take the sessions over from
@@ -405,6 +411,8 @@ async fn service() -> Result<()> {
         "egress allowlist: {}",
         net.allowed_hosts().join(", ")
     ));
+    let (max_sessions, session_mib) = budget::set(cfg.max_sessions, cfg.session_memory_mib);
+    log(&format!("limits: {max_sessions} sessions, {session_mib} MiB of session memory"));
     let ctx = Arc::new(Ctx {
         dev: args.dev,
         net: net.clone(),
@@ -799,6 +807,7 @@ async fn handle(app: Arc<App>, req: Request<hyper::body::Incoming>) -> Resp {
         ("POST", ["api", "internal", "handoff"]) => give_handoff(&app, req).await,
         ("POST", ["api", "internal", "replica", "sync"]) => replica_sync(&app, req).await,
         ("POST", ["api", "internal", "replica", "promote"]) => promote(&app, req).await,
+        ("POST", ["api", "internal", "limits"]) => set_limits(&app, req).await,
         ("POST", ["api", "sessions"]) => create_session(&app, &req),
         (_, ["api", "sessions", id, rest @ ..]) => session_route(&app, id, rest, req).await,
         _ => Err(ApiError(
@@ -820,6 +829,14 @@ async fn replica_sync(app: &App, req: Request<hyper::body::Incoming>) -> Result<
         return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "this enclave isn't serving sessions".into()));
     }
     match app.ctx.repl.sync(&body).await {
+        Ok(v) => Ok(json_resp(StatusCode::OK, &v)),
+        Err(e) => Err(ApiError(StatusCode::FORBIDDEN, format!("{e:#}"))),
+    }
+}
+
+async fn set_limits(app: &App, req: Request<hyper::body::Incoming>) -> Result<Resp, ApiError> {
+    let body = body_json(req).await?;
+    match budget::change(app.handoff_token.as_deref(), &body, app.ctx.store.len()) {
         Ok(v) => Ok(json_resp(StatusCode::OK, &v)),
         Err(e) => Err(ApiError(StatusCode::FORBIDDEN, format!("{e:#}"))),
     }
@@ -1090,6 +1107,7 @@ async fn session_route(
             if role != attest_core::Role::Auditee {
                 return Err(anyhow!("only the auditee uploads code").into());
             }
+            crate::budget::ensure_room(sessions::UPLOAD_ALLOWANCE).map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
             // The upload runs in its own task, which holds the upload slot
             // until the parser has exited, even if this client disconnects.
             let (ctx2, sid, body) = (ctx.clone(), s.id.clone(), req.into_body());

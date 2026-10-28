@@ -7,6 +7,8 @@
 #
 # host.json is handed to the enclave at boot, e.g.
 #   {"public_ip": "1.2.3.4", "email_from": "you@example.com", "ses_region": "us-west-2", "operator": "...", "domain": null}
+# plus optional limits, "max_sessions" (default 100) and "session_memory_mib"
+# (default 15% of enclave memory); deploy/limits.py changes them live.
 # (deploy/self-host.sh writes it.) With S3_BUCKET the host keeps every
 # sealed file in that bucket and its disk as a cache (instance role
 # credentials; see deploy/self-host.sh).

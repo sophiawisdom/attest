@@ -104,6 +104,16 @@ sandbox mode, so only confirmed addresses get mail. Agents poll instead. See
   enclave of the lineage is running (both machines lost, or an image
   upgrade), the key is gone and so are the sessions. `/api/info` shows the lineage and
   which boot it came from; the boot id still makes restarts visible.
+- Capacity is set by the operator: at most `max_sessions` sessions at once
+  (default 100), and a budget of enclave memory for what sessions hold
+  (snapshots, traces, code indexes; default 15% of the enclave's memory, at
+  most 25%). Both go in `host.json` for boot, and `deploy/limits.py` changes
+  them live (a MAC under the handoff token). A full server refuses new
+  sessions, uploads, questions and runs; lowering a limit never drops a
+  session. (When full, the oldest session nobody has used yet, with no
+  question or code, makes room.) Nothing deletes another lineage's stored
+  state; an enclave deletes only its own records that were replaced, and a
+  session's records once it expires.
 - The auditee controls every byte the agent reads, so steering through the
   code is disclosed, not prevented. If the auditee operates the model
   endpoint, it controls which model answered. The certificate says so.
