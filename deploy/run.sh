@@ -68,6 +68,9 @@ After=attest-host.service nitro-enclaves-allocator.service
 [Service]
 Type=oneshot
 ExecStart=$SRC/deploy/watchdog.sh
+# The enclave it starts must outlive this run (systemd would otherwise
+# stop every process the run left behind, the enclave included).
+KillMode=process
 EOF
 
 sudo tee /etc/systemd/system/attest-watchdog.timer >/dev/null <<EOF
