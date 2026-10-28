@@ -10,8 +10,9 @@ Source: https://github.com/sophiawisdom/attest. This page, the web app and
 the API are served by the enclave itself, over TLS that ends inside it.
 
 **Stability.** A server is provided by its operator as-is (`operator` in
-`/api/info`). Sessions live only in enclave memory and end whenever the
-server is updated, so don't rely on one lasting more than about a day. For
+`/api/info`). Sessions survive moves between enclaves of the same image, but
+end when the server is updated to a new image, so don't rely on one lasting
+more than about a day. For
 anything longer, run your own instance: `SELF_HOSTING.md` in the repository
 is written for an agent to follow, and takes one script.
 
@@ -24,8 +25,14 @@ is written for an agent to follow, and takes one script.
   as that party.
 - Every session call needs `Authorization: Bearer TOKEN`, where `TOKEN` is the
   part of the link after `#`. The token decides the role.
-- Sessions live in enclave memory. They are lost if the enclave restarts (the
-  `boot_id` changes) and expire after 30 days.
+- Sessions expire after 30 days. They're kept sealed on the parent and survive
+  a move to another enclave of the same image, which takes them over after
+  proving its image (`/api/info` then shows a new `boot_id` and the same
+  `lineage.id`, with `restored_from_boot`). During the move session calls
+  answer HTTP 503 with `"moved": true`: retry shortly. A run that was going
+  is recorded as interrupted (an error outcome) for the auditee to decide on.
+  Without a running enclave of the lineage to hand over (a crash, or an image
+  upgrade), sessions are lost.
 
 ## Flow
 

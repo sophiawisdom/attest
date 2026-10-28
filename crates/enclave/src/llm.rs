@@ -56,7 +56,7 @@ pub fn vet_model(p: Provider, model: &str) -> anyhow::Result<()> {
 /// serve it (empty: any) and whether only zero-data-retention endpoints may.
 /// The parties agree on these out of band; the enclave enforces them on
 /// every request and records them in the certificate.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Routing {
     pub zdr: bool,
     pub only: Vec<String>,
@@ -162,7 +162,7 @@ pub struct ToolCall {
     pub args: Value,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Turn {
     User(String),
     Assistant { raw: Value },

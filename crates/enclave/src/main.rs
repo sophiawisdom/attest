@@ -12,6 +12,7 @@ mod aws;
 mod blobs;
 mod bundle;
 mod cgroups;
+mod handoff;
 mod harnesses;
 mod jail;
 mod llm;
@@ -19,6 +20,7 @@ mod modelproxy;
 mod net;
 mod notify;
 mod nsm;
+mod persist;
 mod run;
 mod sandbox;
 mod sessions;
@@ -88,6 +90,10 @@ struct HostConfig {
     max_code_mib: Option<usize>,
     /// Shown on the landing page as "run by ...". Unverified.
     operator: Option<String>,
+    /// An enclave of this image to take the sessions over from
+    /// (`host[:port]`, see handoff.rs). It must prove the same image, so
+    /// the parent naming it grants nothing.
+    peer: Option<String>,
 }
 
 const LOG_VSOCK_PORT: u32 = 5004;
@@ -197,6 +203,41 @@ async fn read_host_config(args: &Args) -> Result<HostConfig> {
     }
 }
 
+/// Obtain the lineage from `peer`, retrying for a few minutes (it may still
+/// be starting, or busy). Failing is fatal: starting a new lineage instead
+/// would clear the stored state a still-running peer depends on.
+async fn take_over(
+    net: &net::Net,
+    attester: &nsm::Attester,
+    dev: bool,
+    peer: &str,
+) -> Result<handoff::Payload> {
+    if let Some(host) = peer.rsplit_once(':').map(|(h, _)| h).or(Some(peer)) {
+        net.allow(host.trim_matches(['[', ']']));
+    }
+    let mut last = String::new();
+    for attempt in 0..30 {
+        match handoff::receive(net, attester, dev, peer).await {
+            Ok(p) => {
+                log(&format!(
+                    "handoff: took over {} sessions from boot {}",
+                    p.sessions.len(),
+                    p.giver_boot
+                ));
+                return Ok(p);
+            }
+            Err(e) => {
+                last = format!("{e:#}");
+                if attempt % 5 == 0 {
+                    log(&format!("handoff: not yet ({last}); retrying"));
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+    bail!("couldn't take the sessions over from {peer}: {last}")
+}
+
 fn main() -> Result<()> {
     // The jail executor runs before any async runtime exists, so it starts
     // as a plain single-threaded process.
@@ -248,8 +289,47 @@ async fn service() -> Result<()> {
         )?))
     };
 
-    // Inside Nitro the kernel RNG is fed by the NSM hardware RNG.
-    let signing = SigningKey::generate(&mut rand::rngs::OsRng);
+    let net = net::Net::new(args.dev, args.dev_tunnel.clone())?;
+    let blobs = blobs::BlobClient::new(args.dev, args.dev_blobs.clone());
+    // Take the sessions over from a running enclave of this image, or start
+    // a new lineage. Inside Nitro the kernel RNG is fed by the NSM hardware
+    // RNG.
+    let (signing, keys, lineage, heads) = match cfg.peer.clone().filter(|p| !p.is_empty()) {
+        Some(peer) => {
+            let p = take_over(&net, &attester, args.dev, &peer).await?;
+            // The stored state is the lineage's: never clear it.
+            blobs.skip_reset();
+            let key = |h: &str| -> Result<[u8; 32]> {
+                hex::decode(h)?
+                    .try_into()
+                    .map_err(|_| anyhow!("malformed key in the handoff"))
+            };
+            (
+                SigningKey::from_bytes(&key(&p.signing_key)?),
+                persist::Keys::new(key(&p.master_key)?),
+                persist::Lineage {
+                    id: p.lineage_id,
+                    generation: p.generation + 1,
+                    restored_from_boot: Some(p.giver_boot),
+                },
+                p.sessions,
+            )
+        }
+        None => {
+            let mut id = [0u8; 16];
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut id);
+            (
+                SigningKey::generate(&mut rand::rngs::OsRng),
+                persist::Keys::generate(),
+                persist::Lineage {
+                    id: hex::encode(id),
+                    generation: 0,
+                    restored_from_boot: None,
+                },
+                Vec::new(),
+            )
+        }
+    };
     let mut endpoints = BTreeMap::new();
     for (p, url) in [
         (Provider::Openai, "https://api.openai.com/v1/"),
@@ -283,6 +363,7 @@ async fn service() -> Result<()> {
             endpoints,
             agents: harnesses::available(),
         },
+        lineage: Some(lineage.clone()),
     };
     let info_json = serde_json::to_string(&info)?;
     let boot_doc = attester.attest(
@@ -290,7 +371,6 @@ async fn service() -> Result<()> {
         &signing.verifying_key().to_bytes(),
         None,
     )?;
-    let net = net::Net::new(args.dev, args.dev_tunnel.clone())?;
     // Egress allowlist: model hosts are fixed patterns (targets::EGRESS);
     // ACME, SES and the DNS self-check are added below.
     let acme_dir = cfg
@@ -330,7 +410,13 @@ async fn service() -> Result<()> {
         email_limiter: notify::Limiter::default(),
         public_name: domain.clone().or(cfg.public_ip.clone()),
         max_code_bytes: cfg.max_code_mib.unwrap_or(1024).clamp(1, 4096) << 20,
-        blobs: blobs::BlobClient::new(args.dev, args.dev_blobs.clone()),
+        persist: Arc::new(persist::Persist {
+            keys,
+            blobs: blobs.clone(),
+        }),
+        lineage,
+        moved: std::sync::atomic::AtomicBool::new(false),
+        blobs,
         // Fixed in the image: a host-chosen size would let the host shape
         // which reads miss and reach it.
         cache: Arc::new(blobs::Cache::new(256 << 20)),
@@ -340,8 +426,16 @@ async fn service() -> Result<()> {
         disclosure_slots: tokio::sync::Semaphore::new(1),
         store: sessions::Store::default(),
     });
+    let _ = ctx.store.persist.set(ctx.persist.clone());
+    if !heads.is_empty() {
+        let n = heads.len();
+        let restored = ctx.store.restore(&ctx, heads).await;
+        log(&format!("handoff: restored {restored} of {n} sessions"));
+    }
+    tokio::spawn(sessions::write_loop(ctx.clone()));
     let app = Arc::new(App {
         ctx: ctx.clone(),
+        giver: handoff::Giver::default(),
         attester,
         conns: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
         concurrency: args.concurrency,
@@ -442,6 +536,8 @@ async fn measure_blob_store(store: blobs::BlobClient) {
 
 struct App {
     ctx: Arc<Ctx>,
+    /// Handing this enclave's sessions to a successor (handoff.rs).
+    giver: handoff::Giver,
     attester: nsm::Attester,
     /// Open client connections (TLS handshakes included), bounded.
     conns: Arc<tokio::sync::Semaphore>,
@@ -625,6 +721,16 @@ async fn handle(app: Arc<App>, req: Request<hyper::body::Incoming>) -> Resp {
     let path = req.uri().path().to_string();
     let method = req.method().as_str().to_string();
     let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+    // After a handoff the successor owns the sessions: answer nothing about
+    // them here (the parent moves traffic to the successor).
+    if app.ctx.moved.load(std::sync::atomic::Ordering::SeqCst)
+        && matches!(parts.as_slice(), ["api", "sessions", ..])
+    {
+        return json_resp(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"error": "this server's sessions moved to its successor; try again shortly", "moved": true}),
+        );
+    }
     let r: Result<Resp, ApiError> = match (method.as_str(), parts.as_slice()) {
         ("GET", [""]) | ("GET", ["s", _]) => Ok(respond(
             StatusCode::OK,
@@ -643,6 +749,10 @@ async fn handle(app: Arc<App>, req: Request<hyper::body::Incoming>) -> Resp {
             StatusCode::OK,
             &serde_json::to_value(&app.ctx.info).unwrap_or_default(),
         )),
+        ("GET", ["api", "internal", "handoff", "challenge"]) => {
+            Ok(json_resp(StatusCode::OK, &app.giver.challenge()))
+        }
+        ("POST", ["api", "internal", "handoff"]) => give_handoff(&app, req).await,
         ("POST", ["api", "sessions"]) => create_session(&app, &req),
         (_, ["api", "sessions", id, rest @ ..]) => session_route(&app, id, rest, req).await,
         _ => Err(ApiError(
@@ -651,6 +761,14 @@ async fn handle(app: Arc<App>, req: Request<hyper::body::Incoming>) -> Resp {
         )),
     };
     r.unwrap_or_else(|ApiError(s, m)| json_resp(s, &json!({"error": m})))
+}
+
+async fn give_handoff(app: &App, req: Request<hyper::body::Incoming>) -> Result<Resp, ApiError> {
+    let body = body_json(req).await?;
+    match app.giver.give(&app.ctx, &app.attester, &body).await {
+        Ok(v) => Ok(json_resp(StatusCode::OK, &v)),
+        Err(e) => Err(ApiError(StatusCode::FORBIDDEN, format!("{e:#}"))),
+    }
 }
 
 /// Service health for operators and watchdogs: nothing about any session.

@@ -7,7 +7,8 @@ actually returned. A question containing "CLARIFY" gets needs_clarification.
 import json
 import re
 import sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 9999
 
@@ -21,6 +22,8 @@ def respond(messages):
     tools = [m for m in messages[last_user:] if m.get("role") == "tool"]
     n, uid = len(tools), last_user
     question = messages[1]["content"]
+    if "SLOW" in question and n == 0:
+        time.sleep(30)  # a run still going when the test needs one
     if "CLARIFY" in question and "Follow-up" not in messages[last_user]["content"] and n == 0:
         return "", [tool_call(f"{uid}_c", "submit_verdict", {
             "answer": "needs_clarification", "confidence": 0.2,
@@ -74,4 +77,4 @@ class H(BaseHTTPRequestHandler):
         pass
 
 
-HTTPServer(("127.0.0.1", PORT), H).serve_forever()
+ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()

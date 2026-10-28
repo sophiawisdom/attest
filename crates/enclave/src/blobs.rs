@@ -61,8 +61,12 @@ pub struct BlobClient {
     dev_addr: String,
     /// Tests only: keep blobs in this process.
     memory: Option<Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>>,
-    /// Set once this boot's OP_RESET has reached the parent.
+    /// Set once this boot's OP_RESET has reached the parent (or when this
+    /// enclave took over another's state, which must be kept).
     reset: Arc<tokio::sync::OnceCell<()>>,
+    /// Set after this enclave handed its state to a successor: from then on
+    /// only the successor writes, so puts and deletes are refused.
+    fenced: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl BlobClient {
@@ -72,7 +76,26 @@ impl BlobClient {
             dev_addr,
             memory: None,
             reset: Arc::default(),
+            fenced: Arc::default(),
         }
+    }
+
+    /// This enclave continues another's state: never send OP_RESET.
+    pub fn skip_reset(&self) {
+        let _ = self.reset.set(());
+    }
+
+    /// Stop writing: a successor enclave owns the stored state now.
+    pub fn fence(&self) {
+        self.fenced.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn check_not_fenced(&self) -> Result<()> {
+        ensure!(
+            !self.fenced.load(std::sync::atomic::Ordering::SeqCst),
+            "this enclave handed its state to a successor; it no longer writes"
+        );
+        Ok(())
     }
 
     #[cfg(test)]
@@ -82,6 +105,7 @@ impl BlobClient {
             dev_addr: String::new(),
             memory: Some(Arc::default()),
             reset: Arc::default(),
+            fenced: Arc::default(),
         }
     }
 
@@ -159,6 +183,7 @@ impl BlobClient {
 
     pub async fn put(&self, id: &BlobId, data: &[u8]) -> Result<()> {
         ensure!(data.len() <= HOST_MAX_BLOB_BYTES, "sealed file too large for the blob store");
+        self.check_not_fenced()?;
         self.call(OP_PUT, id, data).await.map(|_| ())
     }
 
@@ -167,13 +192,15 @@ impl BlobClient {
     }
 
     pub async fn delete_session(&self, tag: &[u8; 8]) -> Result<()> {
+        self.check_not_fenced()?;
         self.call(OP_DELETE_PREFIX, tag, &[]).await.map(|_| ())
     }
 }
 
-/// Per-session sealing key and tag.
+/// Per-upload sealing key and tag.
 pub struct Sealer {
     pub tag: [u8; 8],
+    key: [u8; 32],
     cipher: ChaCha20Poly1305,
     session_id: String,
 }
@@ -184,11 +211,22 @@ impl Sealer {
         let mut tag = [0u8; 8];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key);
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut tag);
+        Self::from_parts(session_id, key, tag)
+    }
+
+    /// A sealer restored from durable state (see persist.rs).
+    pub fn from_parts(session_id: &str, key: [u8; 32], tag: [u8; 8]) -> Self {
         Self {
             tag,
+            key,
             cipher: ChaCha20Poly1305::new(Key::from_slice(&key)),
             session_id: session_id.to_string(),
         }
+    }
+
+    /// The key, for the sealed state record only.
+    pub fn key(&self) -> [u8; 32] {
+        self.key
     }
 
     fn aad(&self, path: &str, digest: &[u8; 32]) -> Vec<u8> {
@@ -265,7 +303,7 @@ impl Sealer {
 }
 
 /// `len || data || zeros`, up to the next size bucket.
-fn pad_blob(data: Vec<u8>) -> Vec<u8> {
+pub(crate) fn pad_blob(data: Vec<u8>) -> Vec<u8> {
     let bucket = bucket_for(data.len() + 4);
     let mut out = Vec::with_capacity(bucket);
     out.extend_from_slice(&(data.len() as u32).to_le_bytes());
@@ -274,7 +312,7 @@ fn pad_blob(data: Vec<u8>) -> Vec<u8> {
     out
 }
 
-fn unpad_blob(b: &[u8]) -> Option<&[u8]> {
+pub(crate) fn unpad_blob(b: &[u8]) -> Option<&[u8]> {
     let n = u32::from_le_bytes(b.get(..4)?.try_into().ok()?) as usize;
     b.get(4..4 + n)
 }

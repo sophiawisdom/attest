@@ -1,7 +1,9 @@
 //! Sessions: two parties, one question, the auditee's code, and agent runs.
 //!
-//! A party is whoever holds the session's auditee or auditor link. All
-//! state lives in enclave memory and is lost when the enclave restarts.
+//! A party is whoever holds the session's auditee or auditor link. State
+//! lives in enclave memory, and is also written, sealed, to the parent's
+//! store (see persist.rs) a couple of seconds after each change, so an
+//! enclave of the same image can take the sessions over (handoff.rs).
 //!
 //! Visibility, enforced here:
 //!   auditee  sees everything: question, proposals (never keys), live agent
@@ -18,12 +20,16 @@ use anyhow::{anyhow, bail, ensure, Result};
 use attest_core::harness::{self, MAX_STEPS_CAP};
 use attest_core::*;
 use ed25519_dalek::SigningKey;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
+
+mod durable;
+pub use durable::write_loop;
 
 pub const MAX_SESSIONS: usize = 2000;
 pub const SESSION_TTL_MS: u64 = 30 * 24 * 3600 * 1000;
@@ -52,6 +58,12 @@ pub struct Ctx {
     /// Python disclosures get their own slot, apart from runs.
     pub disclosure_slots: tokio::sync::Semaphore,
     pub store: Store,
+    /// Sealed durable state, under this lineage's master key.
+    pub persist: Arc<crate::persist::Persist>,
+    pub lineage: crate::persist::Lineage,
+    /// Set once this enclave handed its sessions to a successor: it serves
+    /// no session requests after that.
+    pub moved: AtomicBool,
 }
 
 #[derive(Default)]
@@ -60,6 +72,10 @@ pub struct Store {
     /// question text sha256 -> sessions that ran it
     text_index: Mutex<HashMap<String, HashSet<String>>>,
     last_sweep: std::sync::atomic::AtomicU64,
+    /// Durable state, for deleting a removed session's records.
+    pub persist: std::sync::OnceLock<Arc<crate::persist::Persist>>,
+    /// One round of state writes at a time.
+    persisting: tokio::sync::Mutex<()>,
 }
 
 pub struct Session {
@@ -72,6 +88,10 @@ pub struct Session {
     /// (the live trace, auditee-only events) never touch the auditor's,
     /// so the auditor can't observe the run through them.
     tx: [watch::Sender<u64>; 2],
+    /// Changed since its state was last written.
+    dirty: AtomicBool,
+    /// The last state written: snapshot generation and the head record's hash.
+    written: Mutex<(u64, Option<String>)>,
 }
 
 #[derive(Default)]
@@ -93,15 +113,41 @@ struct State {
     disclosures_in_flight: usize,
 }
 
+/// A status: one of a fixed set of strings. (An alias, so serde doesn't
+/// treat it as a borrowed string when reading stored state.)
+type Status = &'static str;
+
+/// Statuses are fixed strings in memory; stored state names them.
+mod status {
+    use serde::{de::Error, Deserialize, Deserializer, Serializer};
+    const KNOWN: &[&str] = &[
+        "proposed", "accepted", "rejected", "superseded", "pending", "approved", "running",
+        "awaiting_release", "released", "declined", "draft", "published", "discarded",
+    ];
+    pub fn serialize<S: Serializer>(s: &&'static str, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<&'static str, D::Error> {
+        let s = String::deserialize(d)?;
+        KNOWN
+            .iter()
+            .find(|k| **k == s)
+            .copied()
+            .ok_or_else(|| D::Error::custom(format!("unknown status {s:?}")))
+    }
+}
+
 /// A disclosure starts as a draft only the auditee sees; publishing signs
 /// it and shows it to the auditor.
+#[derive(Serialize, Deserialize)]
 struct DisclosureState {
     /// The auditee's handle for it. `body.number` is assigned only when it
     /// is published, so the auditor's numbering says nothing about drafts.
     draft: u32,
     body: DisclosureBody,
     /// draft | published | discarded
-    status: &'static str,
+    #[serde(with = "status")]
+    status: Status,
     signed: Option<Disclosure>,
 }
 
@@ -137,7 +183,7 @@ impl Drop for DisclosureReservation {
 const MAX_DISCLOSED_FILE: u64 = 1 << 20;
 const MAX_SCRIPT_BYTES: usize = 100_000;
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Question {
     version: u32,
     text: String,
@@ -146,11 +192,13 @@ struct Question {
     answer_format: AnswerFormat,
     asked_at_ms: u64,
     /// proposed | accepted | rejected | superseded
-    status: &'static str,
+    #[serde(with = "status")]
+    status: Status,
     note: Option<String>,
     decided_at_ms: Option<u64>,
 }
 
+#[derive(Serialize, Deserialize)]
 struct ModelProposal {
     id: u32,
     by: Role,
@@ -166,7 +214,8 @@ struct ModelProposal {
     /// Whose provider account the key belongs to.
     key_from: Role,
     /// pending | approved | rejected | superseded
-    status: &'static str,
+    #[serde(with = "status")]
+    status: Status,
     proposed_at_ms: u64,
     decided_at_ms: Option<u64>,
     note: Option<String>,
@@ -185,6 +234,7 @@ impl ModelProposal {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 struct RunState {
     id: String,
     number: u32,
@@ -196,9 +246,19 @@ struct RunState {
     /// Every auditor message in this conversation, including inherited ones.
     messages: Vec<(MessageRecord, String)>,
     /// running | awaiting_release | released | declined
-    status: &'static str,
+    #[serde(with = "status")]
+    status: Status,
     steps: u32,
+    /// Stored separately, in append-only chunks (`trace_chunks`).
+    #[serde(skip)]
     trace: Trace,
+    /// The stored chunks of `trace`, in order.
+    #[serde(default)]
+    trace_chunks: Vec<TraceChunk>,
+    /// The manifest as the run started, so a run cut short by an enclave
+    /// restart can still be recorded (and released) as failed.
+    #[serde(default)]
+    template: Option<Manifest>,
     /// Raw bytes recorded in `trace` (capped per run), and whether it hit
     /// its cap. The compressed size is what counts toward TRACE_BYTES.
     trace_bytes: usize,
@@ -215,6 +275,13 @@ struct RunState {
     started_at_ms: u64,
     finished_at_ms: Option<u64>,
     decided_at_ms: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct TraceChunk {
+    /// sha256 of the stored record, so a successor gets exactly this chunk.
+    hash: String,
+    entries: usize,
 }
 
 #[derive(Clone, Serialize)]
@@ -297,7 +364,10 @@ impl Trace {
     }
 
     fn push(&mut self, e: &Value) {
-        let c = lz4_flex::compress_prepend_size(e.to_string().as_bytes());
+        self.push_compressed(lz4_flex::compress_prepend_size(e.to_string().as_bytes()));
+    }
+
+    fn push_compressed(&mut self, c: Vec<u8>) {
         self.stored += c.len();
         self.entries.push(c);
     }
@@ -399,6 +469,9 @@ impl Store {
             idx.retain(|_, set| !set.is_empty());
         }
         for s in gone {
+            if let Some(p) = self.persist.get() {
+                p.delete_session(&s.id);
+            }
             let mut st = lock(&s.st);
             // Runs still going hold their own reference to the code; its
             // stored files go once they end (Bundle's Drop).
@@ -444,6 +517,8 @@ impl Store {
             ],
             st: Mutex::new(State::default()),
             tx,
+            dirty: AtomicBool::new(true),
+            written: Mutex::new((0, None)),
         });
         map.insert(s.id.clone(), s.clone());
         Ok((s, auditee, auditor))
@@ -473,6 +548,10 @@ impl Store {
         lock(&self.sessions).get(id).cloned()
     }
 
+    pub fn len(&self) -> usize {
+        lock(&self.sessions).len()
+    }
+
     fn note_text_run(&self, text_sha: &str, session: &str) -> u32 {
         let mut idx = lock(&self.text_index);
         let set = idx.entry(text_sha.to_string()).or_default();
@@ -497,6 +576,7 @@ impl Session {
     fn changed_for(&self, st: &mut State, role: Role) {
         let i = ri(role);
         st.versions[i] += 1;
+        self.dirty.store(true, Ordering::Relaxed);
         // send_replace stores the value even when nobody is waiting, so a
         // long-poll that subscribes later sees it at once.
         self.tx[i].send_replace(st.versions[i]);
@@ -1290,6 +1370,43 @@ impl Session {
         };
         let id = random_hex(12);
         let number = st.runs.len() as u32 + 1;
+        let question = QuestionRecord {
+            version: q.version,
+            text: q.text.clone(),
+            text_sha256: text_sha,
+            max_steps: q.max_steps,
+            allow_fine_tuned: q.allow_fine_tuned,
+            asked_at_ms: q.asked_at_ms,
+            accepted_at_ms: q.decided_at_ms.unwrap_or(q.asked_at_ms),
+            answer_format: q.answer_format.clone(),
+        };
+        let started_at_ms = now_ms();
+        let template = Manifest {
+            schema: "attest/manifest/v2".into(),
+            session_id: self.id.clone(),
+            run_id: id.clone(),
+            run_number: number,
+            parent_run_id: spec.parent.clone(),
+            boot_id: ctx.info.boot_id.clone(),
+            started_at_ms,
+            finished_at_ms: 0,
+            question: question.clone(),
+            auditor_messages: messages.iter().map(|(r, _)| r.clone()).collect(),
+            affidavit: affidavit.clone(),
+            code: bundle.info.clone(),
+            model: model_info.clone(),
+            harness: ctx.info.harness.clone(),
+            activity: Activity::default(),
+            instruction_scan: InstructionScan {
+                patterns_version: scan::PATTERNS_VERSION.into(),
+                whole_bundle: bundle.scan_all(),
+                files_read: ScanCounts::default(),
+            },
+            history: history.clone(),
+            outcome: Outcome::Completed,
+            detail: "full".into(),
+            ran_on_boot_id: None,
+        };
         st.runs.push(RunState {
             id: id.clone(),
             number,
@@ -1303,6 +1420,8 @@ impl Session {
             steps: 0,
             trace_bytes: trace.iter().map(|e| e.to_string().len()).sum(),
             trace: Trace::from_entries(&trace),
+            trace_chunks: Vec::new(),
+            template: Some(template),
             trace_full: false,
             turns: None,
             full: None,
@@ -1310,7 +1429,7 @@ impl Session {
             verdict: None,
             outcome: None,
             decision_note: None,
-            started_at_ms: now_ms(),
+            started_at_ms,
             finished_at_ms: None,
             decided_at_ms: None,
         });
@@ -1339,16 +1458,6 @@ impl Session {
             spec.message.is_some(),
         );
 
-        let question = QuestionRecord {
-            version: q.version,
-            text: q.text.clone(),
-            text_sha256: text_sha,
-            max_steps: q.max_steps,
-            allow_fine_tuned: q.allow_fine_tuned,
-            asked_at_ms: q.asked_at_ms,
-            accepted_at_ms: q.decided_at_ms.unwrap_or(q.asked_at_ms),
-            answer_format: q.answer_format.clone(),
-        };
         let job = RunJob {
             session: self.clone(),
             ctx: ctx.clone(),
@@ -1656,6 +1765,8 @@ impl Session {
         d.body.number = published + 1;
         let number = d.body.number;
         d.body.published_at_ms = now_ms();
+        // Signed by this boot, which verifiers check against the body.
+        d.body.boot_id = ctx.info.boot_id.clone();
         let signed = sign::sign(&ctx.signing, DOMAIN_DISCLOSURE, &d.body)?;
         d.signed = Some(Disclosure {
             enclave_info_json: ctx.info_json.clone(),
@@ -1929,6 +2040,7 @@ impl RunJob {
             history: self.history.clone(),
             outcome: out.outcome.clone(),
             detail: "full".into(),
+            ran_on_boot_id: None,
         };
         let body = CertificateBody {
             manifest,
@@ -2078,10 +2190,18 @@ fn public_body(full: &CertificateBody, details: bool, strict: bool) -> Certifica
 }
 
 fn sign_certificate(ctx: &Ctx, body: &CertificateBody) -> Result<Certificate> {
+    // A certificate names the boot that signs it (verifiers check its
+    // attestation). A run from an earlier boot of this lineage says so.
+    let mut body = body.clone();
+    let m = &mut body.manifest;
+    if m.boot_id != ctx.info.boot_id {
+        m.ran_on_boot_id.get_or_insert(m.boot_id.clone());
+        m.boot_id = ctx.info.boot_id.clone();
+    }
     Ok(Certificate {
         enclave_info_json: ctx.info_json.clone(),
         boot_document_b64: ctx.boot_doc_b64.clone(),
-        signed: sign::sign(&ctx.signing, DOMAIN_CERTIFICATE, body)?,
+        signed: sign::sign(&ctx.signing, DOMAIN_CERTIFICATE, &body)?,
     })
 }
 

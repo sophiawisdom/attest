@@ -76,8 +76,15 @@ sandbox mode, so only confirmed addresses get mail. Agents poll instead. See
 
 ## Limits
 
-- Sessions live in enclave memory: a restart loses them. The boot id makes
-  restarts visible.
+- Sessions are written, sealed, to the parent's store a couple of seconds
+  after each change, under a master key only enclaves of the same image hold.
+  They survive a move to another enclave of that image (a bigger machine, a
+  second region): started with the running one as its peer, the new enclave
+  proves its image and takes over the key, the signing key and the latest
+  state; runs that were going are recorded as interrupted. If no enclave of
+  the lineage is running (a crash with no successor, or an image upgrade),
+  the key is gone and so are the sessions. `/api/info` shows the lineage and
+  which boot it came from; the boot id still makes restarts visible.
 - The auditee controls every byte the agent reads, so steering through the
   code is disclosed, not prevented. If the auditee operates the model
   endpoint, it controls which model answered. The certificate says so.
