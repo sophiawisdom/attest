@@ -64,9 +64,13 @@ pub struct BlobClient {
     dev_addr: String,
     /// Tests only: keep blobs in this process.
     memory: Option<Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>>,
-    /// Set once this boot's OP_RESET has reached the parent (or when this
-    /// enclave took over another's state, which must be kept).
+    /// Set once this boot's OP_RESET (namespace selection) has reached the
+    /// parent.
     reset: Arc<tokio::sync::OnceCell<()>>,
+    /// The lineage id: the parent keeps each lineage's records apart, so a
+    /// new lineage never touches the records another enclave may still
+    /// hold the key to.
+    lineage: Arc<std::sync::OnceLock<String>>,
     /// Set after this enclave handed its state to a successor: from then on
     /// only the successor writes, so puts and deletes are refused.
     fenced: Arc<std::sync::atomic::AtomicBool>,
@@ -79,13 +83,15 @@ impl BlobClient {
             dev_addr,
             memory: None,
             reset: Arc::default(),
+            lineage: Arc::default(),
             fenced: Arc::default(),
         }
     }
 
-    /// This enclave continues another's state: never send OP_RESET.
-    pub fn skip_reset(&self) {
-        let _ = self.reset.set(());
+    /// Which lineage's records this enclave reads and writes. Set before
+    /// any other call.
+    pub fn set_lineage(&self, id: &str) {
+        let _ = self.lineage.set(id.to_string());
     }
 
     /// Stop writing: a successor enclave owns the stored state now.
@@ -108,6 +114,7 @@ impl BlobClient {
             dev_addr: String::new(),
             memory: Some(Arc::default()),
             reset: Arc::default(),
+            lineage: Arc::default(),
             fenced: Arc::default(),
         }
     }
@@ -150,7 +157,10 @@ impl BlobClient {
         }
         if op != OP_RESET {
             self.reset
-                .get_or_try_init(|| async { self.call_raw(OP_RESET, &[], &[]).await.map(|_| ()) })
+                .get_or_try_init(|| async {
+                    let lineage = self.lineage.get().ok_or_else(|| anyhow!("no lineage set for the blob store"))?;
+                    self.call_raw(OP_RESET, &[], lineage.as_bytes()).await.map(|_| ())
+                })
                 .await
                 .context("telling the blob store about this boot")?;
         }
@@ -158,6 +168,10 @@ impl BlobClient {
     }
 
     async fn call_raw(&self, op: u8, id: &[u8], data: &[u8]) -> Result<Option<Vec<u8>>> {
+        // Bounded, so the parent can't make many replies' buffers exist at
+        // once.
+        static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(64);
+        let _slot = SLOTS.acquire().await.map_err(|_| anyhow!("blob store closed"))?;
         let fut = async {
             let mut s = self.connect().await?;
             let mut head = Vec::with_capacity(33);
@@ -171,7 +185,9 @@ impl BlobClient {
             s.flush().await?;
             let status = s.read_u8().await?;
             let len = s.read_u64_le().await? as usize;
-            ensure!(len <= max_sealed_len(), "blob store reply too large");
+            // Only a successful get carries a blob; anything else is short.
+            let cap = if status == 0 && op == OP_GET { max_sealed_len() } else { 4096 };
+            ensure!(len <= cap, "blob store reply too large");
             let mut buf = vec![0u8; len];
             s.read_exact(&mut buf).await?;
             match status {
@@ -197,6 +213,44 @@ impl BlobClient {
 
     pub async fn drop_cache(&self) -> Result<()> {
         self.call(OP_DROP_CACHE, &[], &[]).await.map(|_| ())
+    }
+
+    /// Delete everything stored under `tag`, after a delay (a standby that
+    /// hasn't seen the change yet may still need it: replica.rs), retrying
+    /// for a while if the parent's store is unreachable. Bounded: past
+    /// MAX_PENDING_DELETES the records are left in the store instead.
+    pub fn delete_later(&self, tag: [u8; 8]) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static PENDING: AtomicUsize = AtomicUsize::new(0);
+        const MAX_PENDING_DELETES: usize = 4096;
+        const DELETE_AFTER: Duration = Duration::from_secs(600);
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if PENDING.fetch_add(1, Ordering::SeqCst) >= MAX_PENDING_DELETES {
+            PENDING.fetch_sub(1, Ordering::SeqCst);
+            return;
+        }
+        struct Done;
+        impl Drop for Done {
+            fn drop(&mut self) {
+                PENDING.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let store = self.clone();
+        rt.spawn(async move {
+            let _done = Done;
+            if store.memory.is_none() {
+                tokio::time::sleep(DELETE_AFTER).await;
+            }
+            for attempt in 0..6u32 {
+                if store.delete_session(&tag).await.is_ok() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(15 << attempt)).await;
+            }
+            crate::log("couldn't delete discarded records from the parent's store");
+        });
     }
 
     pub async fn delete_session(&self, tag: &[u8; 8]) -> Result<()> {

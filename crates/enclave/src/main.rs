@@ -30,7 +30,7 @@ mod targets;
 mod tls;
 
 #[allow(unused_imports)]
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use attest_core::harness::{self, HARNESS_VERSION, MAX_STEPS_CAP, TOOLS};
 use attest_core::*;
 use base64::Engine;
@@ -292,6 +292,10 @@ async fn service() -> Result<()> {
     // Take the sessions over from a running enclave of this image, or start
     // a new lineage. Inside Nitro the kernel RNG is fed by the NSM hardware
     // RNG.
+    ensure!(
+        !cfg.standby || cfg.peer.as_deref().is_some_and(|p| !p.is_empty()),
+        "standby needs a peer to follow; refusing to start a new lineage instead"
+    );
     let mut follower = None;
     let (signing, keys, lineage, heads) = match cfg.peer.clone().filter(|p| !p.is_empty()) {
         Some(peer) => {
@@ -303,8 +307,6 @@ async fn service() -> Result<()> {
             } else {
                 p.sessions
             };
-            // The stored state is the lineage's: never clear it.
-            blobs.skip_reset();
             let key = |h: &str| -> Result<[u8; 32]> {
                 hex::decode(h)?
                     .try_into()
@@ -336,6 +338,7 @@ async fn service() -> Result<()> {
             )
         }
     };
+    blobs.set_lineage(&lineage.id);
     let mut endpoints = BTreeMap::new();
     for (p, url) in [
         (Provider::Openai, "https://api.openai.com/v1/"),
@@ -747,6 +750,17 @@ async fn handle(app: Arc<App>, req: Request<hyper::body::Incoming>) -> Resp {
     // (shared) to the end, so a handoff waits for it, and checks `moved`
     // only once it holds it.
     let is_session = matches!(parts.as_slice(), ["api", "sessions", ..]);
+    let moved = || {
+        json_resp(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"error": "this server's sessions moved to its successor; try again shortly", "moved": true}),
+        )
+    };
+    // Checked before waiting for the lock too: after a handoff the lock is
+    // held for good.
+    if app.ctx.moved.load(std::sync::atomic::Ordering::SeqCst) && is_session {
+        return moved();
+    }
     let _owner = if is_session && method != "GET" {
         Some(app.ctx.owner.read().await)
     } else {
@@ -755,10 +769,7 @@ async fn handle(app: Arc<App>, req: Request<hyper::body::Incoming>) -> Resp {
     // After a handoff the successor owns the sessions: answer nothing about
     // them here (the parent moves traffic to the successor).
     if app.ctx.moved.load(std::sync::atomic::Ordering::SeqCst) && is_session {
-        return json_resp(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &json!({"error": "this server's sessions moved to its successor; try again shortly", "moved": true}),
-        );
+        return moved();
     }
     if app.ctx.standby.load(std::sync::atomic::Ordering::SeqCst) && is_session {
         return json_resp(
@@ -779,7 +790,7 @@ async fn handle(app: Arc<App>, req: Request<hyper::body::Incoming>) -> Resp {
         )),
         ("GET", ["healthz"]) => Ok(json_resp(StatusCode::OK, &json!({"ok": true}))),
         ("GET", ["api", "health"]) => Ok(json_resp(StatusCode::OK, &health(&app))),
-        ("GET", ["api", "attestation"]) => attestation(&app, &query(&req)),
+        ("GET", ["api", "attestation"]) => attestation(&app, &query(&req)).await,
         ("GET", ["api", "info"]) => Ok(json_resp(
             StatusCode::OK,
             &serde_json::to_value(&app.ctx.info).unwrap_or_default(),
@@ -871,21 +882,30 @@ fn health(app: &App) -> Value {
     })
 }
 
-fn attestation(app: &App, q: &HashMap<String, String>) -> Result<Resp, ApiError> {
+/// Fresh attestations at once: each is a blocking call to the NSM device.
+static ATTEST_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+async fn attestation(app: &App, q: &HashMap<String, String>) -> Result<Resp, ApiError> {
     let doc = match q.get("nonce") {
         Some(n) => {
             let nonce = hex::decode(n).map_err(|_| anyhow!("nonce must be hex"))?;
             if nonce.is_empty() || nonce.len() > 64 {
                 return Err(anyhow!("nonce must be 1-64 bytes").into());
             }
+            let _slot = tokio::time::timeout(Duration::from_secs(10), ATTEST_SLOTS.acquire())
+                .await
+                .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "busy; try again".into()))?
+                .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "busy; try again".into()))?;
             let ctx = &app.ctx;
-            app.attester
-                .attest(
+            // Off the async workers: the device call blocks.
+            tokio::task::block_in_place(|| {
+                app.attester.attest(
                     &sha256(ctx.info_json.as_bytes()),
                     &ctx.signing.verifying_key().to_bytes(),
                     Some(&nonce),
-                )?
-                .map(|d| base64::engine::general_purpose::STANDARD.encode(d))
+                )
+            })?
+            .map(|d| base64::engine::general_purpose::STANDARD.encode(d))
         }
         None => app.ctx.boot_doc_b64.clone(),
     };

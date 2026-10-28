@@ -271,9 +271,19 @@ impl Giver {
                 return Err(e.context("writing state before the handoff"));
             }
         };
+        // Sealed and attested before anything irreversible: if this fails,
+        // the enclave just keeps serving.
+        let resp = match seal_payload(ctx, att, sessions, &r_pub, &n_r) {
+            Ok((resp, _)) => resp,
+            Err(e) => {
+                drop(owner);
+                ctx.moved.store(false, Ordering::SeqCst);
+                self.done.store(false, Ordering::SeqCst);
+                return Err(e.context("preparing the handoff"));
+            }
+        };
         ctx.blobs.fence();
         std::mem::forget(owner);
-        let (resp, _) = seal_payload(ctx, att, sessions, &r_pub, &n_r)?;
         crate::log(&format!(
             "handoff: sessions handed to a successor ({} sessions); this enclave now only answers that they moved",
             ctx.store.len()

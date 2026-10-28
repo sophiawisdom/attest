@@ -523,12 +523,18 @@ async fn handle(up: Arc<Upstream>, req: Request<hyper::body::Incoming>) -> Respo
         .collect::<Vec<_>>()
         .join(",");
     let betas = known_betas(&betas);
-    let raw = match http_body_util::Limited::new(req.into_body(), 32 << 20)
-        .collect()
-        .await
+    // One request at a time per run, taken before the body is read, so
+    // waiting requests hold no buffers.
+    let _one_at_a_time = up.inflight.acquire().await;
+    let raw = match tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        http_body_util::Limited::new(req.into_body(), 32 << 20).collect(),
+    )
+    .await
     {
-        Ok(b) => b.to_bytes().to_vec(),
-        Err(_) => return reply(StatusCode::PAYLOAD_TOO_LARGE, "request too large"),
+        Ok(Ok(b)) => b.to_bytes().to_vec(),
+        Ok(Err(_)) => return reply(StatusCode::PAYLOAD_TOO_LARGE, "request too large"),
+        Err(_) => return reply(StatusCode::REQUEST_TIMEOUT, "request body too slow"),
     };
     let body = match vet_request_routed(&up.target, &harness_path, &up.model, &raw, &up.routing) {
         Ok(b) => b,
@@ -570,7 +576,6 @@ async fn handle(up: Arc<Upstream>, req: Request<hyper::body::Incoming>) -> Respo
         let mut seen = up.seen_items.lock().unwrap_or_else(|e| e.into_inner());
         new_input(&raw, &mut seen)
     };
-    let _one_at_a_time = up.inflight.acquire().await;
     let resp = match up
         .net
         .request_full(
@@ -712,7 +717,8 @@ fn usage_of(text: &str) -> (u64, u64, Option<String>, Option<String>) {
     let mut take = |v: &Value| {
         let r = v.get("response").or(v.get("message")).unwrap_or(v);
         if let Some(u) = r.get("usage") {
-            let gi = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+            // Clamped: provider-reported counts are summed.
+            let gi = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0).min(1 << 40);
             let ni = gi("input_tokens") + gi("prompt_tokens") + gi("cache_read_input_tokens");
             let no = gi("output_tokens") + gi("completion_tokens");
             // Anthropic streams usage in pieces; others report it once.

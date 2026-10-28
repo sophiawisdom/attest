@@ -174,11 +174,20 @@ impl Replication {
         if !self.live() || ctx.standby.load(Ordering::SeqCst) {
             return;
         }
-        ctx.store.write_changed(&ctx.persist).await;
-        self.publish(ctx.store.heads_now());
-        let target = *self.seq.borrow();
-        let mut rx = self.acked.subscribe();
-        if tokio::time::timeout(CONFIRM, rx.wait_for(|a| *a >= target)).await.is_err() {
+        // The write runs on its own task, so a request that goes away
+        // doesn't cut it short; the whole wait is bounded.
+        let c = ctx.clone();
+        let write = tokio::spawn(async move {
+            c.store.write_changed(&c.persist).await;
+            c.repl.publish(c.store.heads_now());
+        });
+        let wait = async {
+            let _ = write.await;
+            let target = *self.seq.borrow();
+            let mut rx = self.acked.subscribe();
+            let _ = rx.wait_for(|a| *a >= target).await;
+        };
+        if tokio::time::timeout(CONFIRM, wait).await.is_err() {
             let now = attest_core::now_ms();
             if now.saturating_sub(self.warned.swap(now, Ordering::Relaxed)) > 60_000 {
                 crate::log("replica: the standby didn't confirm a change in time; answering anyway");
@@ -197,6 +206,7 @@ pub struct Follower {
     latest: Mutex<(u64, Vec<(String, String)>)>,
     contact: Mutex<Instant>,
     promoted: AtomicBool,
+    promoting: tokio::sync::Mutex<()>,
 }
 
 impl Follower {
@@ -210,6 +220,7 @@ impl Follower {
             latest: Mutex::new((0, heads)),
             contact: Mutex::new(Instant::now()),
             promoted: AtomicBool::new(false),
+            promoting: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -273,10 +284,17 @@ impl Follower {
     }
 
     /// Become the primary: only for the operator, and only once the old
-    /// primary has been out of contact for a while.
+    /// primary has been out of contact for a while. Runs on its own task, so
+    /// a dropped request can't leave it half done.
     pub async fn promote(self: &Arc<Self>, ctx: &Arc<Ctx>, token: Option<&str>, body: &Value) -> Result<Value> {
         let token = token.filter(|t| t.len() >= 16).context("promotion is not enabled on this enclave")?;
         ensure!(mac_ok(token, &[PROMOTE], &body["mac"]), "wrong handoff token");
+        let (me, ctx) = (self.clone(), ctx.clone());
+        tokio::spawn(async move { me.promote_inner(&ctx).await }).await.map_err(|e| anyhow!("promotion failed: {e}"))?
+    }
+
+    async fn promote_inner(&self, ctx: &Arc<Ctx>) -> Result<Value> {
+        let _one = self.promoting.lock().await;
         ensure!(ctx.standby.load(Ordering::SeqCst), "this enclave is already serving");
         let silence = self.silence();
         ensure!(
@@ -285,11 +303,13 @@ impl Follower {
             silence.as_secs(),
             FAILOVER_SILENCE.as_secs()
         );
-        ensure!(!self.promoted.swap(true, Ordering::SeqCst), "a promotion is already under way");
-        if let Err(e) = ctx.blobs.drop_cache().await {
-            self.promoted.store(false, Ordering::SeqCst);
-            return Err(e.context("clearing the parent's cache before reading state"));
-        }
+        // Nothing changes until the cache is cleared; on failure the standby
+        // just keeps following.
+        ctx.blobs
+            .drop_cache()
+            .await
+            .context("clearing the parent's cache before reading state")?;
+        self.promoted.store(true, Ordering::SeqCst);
         let (seq, heads) = self.latest.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let total = heads.len();
         let restored = ctx.store.restore(ctx, heads).await;

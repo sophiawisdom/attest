@@ -166,19 +166,9 @@ impl Persist {
         Ok(out)
     }
 
-    /// Drop every record of a session (best effort, retried a few times).
+    /// Drop every record of a session (later, best effort).
     pub fn delete_session(&self, sid: &str) {
-        let (blobs, tag) = (self.blobs.clone(), self.keys.tag(sid));
-        if let Ok(rt) = tokio::runtime::Handle::try_current() {
-            rt.spawn(async move {
-                for attempt in 0..4u32 {
-                    if blobs.delete_session(&tag).await.is_ok() {
-                        return;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(15 << attempt)).await;
-                }
-            });
-        }
+        self.blobs.delete_later(self.keys.tag(sid));
     }
 }
 

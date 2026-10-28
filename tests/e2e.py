@@ -74,7 +74,7 @@ PY_SHA256 = "252e2e17fab9f51a51fbfc73d51e18805cb633e9f9200c9753b4b801c70ad32c"
 
 def blob_files(work):
     """Sealed files the host stores (one directory per session)."""
-    return [os.path.join(d, f) for d, _, fs in os.walk(os.path.join(work, "blobs")) for f in fs]
+    return [os.path.join(d, f) for d, _, fs in os.walk(os.path.join(work, "blobs")) for f in fs if f != ".generation"]
 
 
 def python_wasi():

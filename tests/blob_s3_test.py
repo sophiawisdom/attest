@@ -4,7 +4,7 @@
     cargo build -p attest-host && python3 tests/blob_s3_test.py
 
 Covers: put/get, a get with the local cache wiped (served from S3),
-delete-by-tag, reset (new generation; old objects go), cache trimming under
+delete-by-tag, namespace selection (a new lineage never deletes another's objects), cache trimming under
 a tiny quota, a daemon restart, and an S3 outage failing puts.
 """
 import json
@@ -152,20 +152,23 @@ def main():
         check(local_size(work) <= 1 << 20, f"the local cache stays under its quota ({local_size(work)} bytes)")
         check(all(blob(2, ident(4, n)) == (0, d) for n, d in enumerate(big)), "every blob is still readable")
 
-        print("reset")
-        old_cur = [k for k in s3_stats()["keys"] if k.endswith("CURRENT")]
-        check(blob(4, ident(0, 0)) == (0, b""), "reset is acknowledged")
-        check(blob(2, ident(1, 1))[0] == 1, "earlier blobs are gone")
-        check(blob(1, ident(5, 0), b"new") == (0, b"") and blob(2, ident(5, 0)) == (0, b"new"), "new puts work right away")
-        check(wait_until(lambda: [k for k in s3_stats()["keys"] if not k.endswith("CURRENT")]
-                         == [k for k in s3_stats()["keys"] if (b"\x05" * 8).hex() in k]),
-              "the old generation is deleted from S3; the new blob stays")
-        check(len(old_cur) == 1, "one CURRENT throughout")
+        print("namespaces")
+        A, B = b"a" * 32, b"b" * 32
+        check(blob(4, ident(0, 0), A) == (0, b""), "selecting lineage A's namespace is acknowledged")
+        check(blob(2, ident(1, 1))[0] == 1, "blobs of the earlier namespace aren't visible in A's")
+        check(blob(1, ident(5, 0), b"new") == (0, b"") and blob(2, ident(5, 0)) == (0, b"new"), "puts work in A")
+        check(blob(4, ident(0, 0), B) == (0, b""), "a new lineage B selects its own namespace")
+        check(blob(2, ident(5, 0))[0] == 1, "B doesn't see A's blobs")
+        time.sleep(1)
+        check(any(k.startswith("attest/" + "a" * 32 + "/") or ("/" + "a" * 32 + "/") in k for k in s3_stats()["keys"]),
+              "A's objects are still in S3 after B started (nothing is deleted)")
+        check(blob(4, ident(0, 0), A) == (0, b""), "A again (an enclave of lineage A taking over)")
+        check(blob(2, ident(5, 0)) == (0, b"new"), "A's blobs are all there")
 
         print("restart after reset")
         stop(host)
         host = start_host(work, 1)
-        check(blob(2, ident(5, 0)) == (0, b"new"), "the new generation is picked up from CURRENT")
+        check(blob(2, ident(5, 0)) == (0, b"new"), "after a daemon restart this machine keeps the namespace its enclave chose")
 
         print("drop cache (a standby taking over)")
         blob(1, ident(7, 0), b"current")

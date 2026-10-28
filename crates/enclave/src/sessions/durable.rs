@@ -3,10 +3,13 @@
 //! enclave of the same image after a handoff (handoff.rs).
 //!
 //! Each session is a set of records:
-//!   head              which snapshot is current: its generation, slot, and
+//!   head/{s}          which snapshot is current: its generation, slot, and
 //!                     the hashes of its parts
-//!   snap/{0,1}/{i}    the snapshot, alternating between two slots so a
-//!                     write cut short never damages the current one
+//!   snap/{s}/{i}      the snapshot
+//!   Head and snapshot rotate through SLOTS slots, so the last few versions
+//!   stay readable: a write cut short never damages the current one, and a
+//!   standby a few writes behind (replica.rs) can still read the version it
+//!   knows. A head is referred to as "SLOT:HASH".
 //!   code/{id}/{i}     an upload's index and sealing key (written once)
 //!   trace/{run}/{k}   a run's trace, in append-only chunks
 //! Every record but the head is named by hash from the record before it, and
@@ -14,6 +17,9 @@
 //! state the giver last wrote.
 
 use super::*;
+
+/// Head and snapshot slots per session.
+const SLOTS: u64 = 4;
 
 /// How often changed sessions are written.
 pub const WRITE_INTERVAL: Duration = Duration::from_secs(2);
@@ -236,11 +242,11 @@ impl Session {
             })?
         };
         let generation = lock(&self.written).0 + 1;
-        let slot = generation % 2;
+        let slot = generation % SLOTS;
         let parts = p.put_large(&self.id, &format!("snap/{slot}"), &bytes).await?;
         let head = serde_json::to_vec(&Head { generation, slot, parts })?;
-        let hash = p.put(&self.id, "head", &head).await?;
-        *lock(&self.written) = (generation, Some(hash));
+        let hash = p.put(&self.id, &format!("head/{slot}"), &head).await?;
+        *lock(&self.written) = (generation, Some(format!("{slot}:{hash}")));
         Ok(())
     }
 }
@@ -336,14 +342,21 @@ impl Store {
         n
     }
 
-    /// Try the pending sessions again.
+    /// Try the pending sessions again. Each stays listed in `pending` until
+    /// it is restored, so a standby or successor never loses sight of it.
     async fn retry_pending(&self, ctx: &Arc<Ctx>) {
-        let pending = std::mem::take(&mut *lock(&self.pending));
-        if !pending.is_empty() {
-            let n = self.restore(ctx, pending).await;
-            if n > 0 {
-                crate::log(&format!("state: restored {n} session(s) that were pending"));
+        let pending = lock(&self.pending).clone();
+        let mut n = 0;
+        for (sid, head) in pending {
+            if let Ok(s) = restore_session(ctx, &sid, &head).await {
+                let mut p = lock(&self.pending);
+                p.retain(|(x, h)| !(x == &sid && h == &head));
+                lock(&self.sessions).insert(sid, s);
+                n += 1;
             }
+        }
+        if n > 0 {
+            crate::log(&format!("state: restored {n} session(s) that were pending"));
         }
     }
 }
@@ -368,9 +381,12 @@ pub async fn write_loop(ctx: Arc<Ctx>) {
     }
 }
 
-async fn restore_session(ctx: &Arc<Ctx>, sid: &str, head_hash: &str) -> Result<Arc<Session>> {
+async fn restore_session(ctx: &Arc<Ctx>, sid: &str, head_ref: &str) -> Result<Arc<Session>> {
     let p = &ctx.persist;
-    let head: Head = serde_json::from_slice(&p.get(sid, "head", head_hash).await?)?;
+    let (slot, hash) = head_ref.split_once(':').ok_or_else(|| anyhow!("malformed head reference"))?;
+    ensure!(slot.parse::<u64>().is_ok_and(|s| s < SLOTS), "malformed head slot");
+    let head: Head = serde_json::from_slice(&p.get(sid, &format!("head/{slot}"), hash).await?)?;
+    ensure!(head.slot.to_string() == slot, "head names another slot");
     let bytes = p
         .get_large(sid, &format!("snap/{}", head.slot), &head.parts)
         .await?;
@@ -482,7 +498,7 @@ async fn restore_session(ctx: &Arc<Ctx>, sid: &str, head_hash: &str) -> Result<A
         ],
         st: Mutex::new(State::default()),
         dirty: AtomicBool::new(false),
-        written: Mutex::new((head.generation, Some(head_hash.to_string()))),
+        written: Mutex::new((head.generation, Some(head_ref.to_string()))),
     });
     {
         let mut guard = lock(&s.st);

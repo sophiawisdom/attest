@@ -420,11 +420,10 @@ fn parse_anthropic(resp: &HttpResponse) -> Result<Reply> {
         model: v["model"].as_str().map(String::from),
         upstream_provider: None,
         key_owner: resp.header("anthropic-organization-id").map(String::from),
-        input_tokens: v["usage"]["input_tokens"].as_u64().unwrap_or(0)
-            + v["usage"]["cache_read_input_tokens"].as_u64().unwrap_or(0)
-            + v["usage"]["cache_creation_input_tokens"]
-                .as_u64()
-                .unwrap_or(0),
+        input_tokens: ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
+            .iter()
+            .map(|k| v["usage"][*k].as_u64().unwrap_or(0).min(1 << 40))
+            .sum(),
         output_tokens: v["usage"]["output_tokens"].as_u64().unwrap_or(0),
     })
 }

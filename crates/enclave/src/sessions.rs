@@ -35,6 +35,8 @@ pub const MAX_SESSIONS: usize = 2000;
 pub const SESSION_TTL_MS: u64 = 30 * 24 * 3600 * 1000;
 const MAX_QUESTION_CHARS: usize = 20_000;
 const MAX_MESSAGE_CHARS: usize = 20_000;
+/// Events kept per session (the activity feed).
+const MAX_EVENTS: usize = 500;
 
 /// Application context shared by every session.
 pub struct Ctx {
@@ -649,6 +651,12 @@ impl Session {
             important,
         };
         st.events.push(ev.clone());
+        // The activity feed keeps the latest events only: a party repeating
+        // an action can't grow a session without bound.
+        if st.events.len() > MAX_EVENTS {
+            let extra = st.events.len() - MAX_EVENTS;
+            st.events.drain(..extra);
+        }
         match to {
             Some(r) => self.changed_for(st, r),
             None => self.changed(st),
@@ -2129,7 +2137,10 @@ fn code_memory() -> &'static tokio::sync::Semaphore {
 /// the whole budget gets the whole budget).
 async fn reserve_code_memory(bundle: &Bundle, copies: u64) -> tokio::sync::SemaphorePermit<'static> {
     let budget = (crate::cgroups::mem_total() / 10 * 3 >> 20).max(1);
-    let mib = ((bundle.info.total_bytes.saturating_mul(copies) >> 20) + 1).min(budget);
+    // Files take whole pages in memory, plus inode and directory entries:
+    // a repository of tiny files costs far more than its byte count.
+    let per_copy = (bundle.info.total_bytes as u64).saturating_add((bundle.info.file_count as u64).saturating_mul(4096 + 512));
+    let mib = ((per_copy.saturating_mul(copies) >> 20) + 1).min(budget);
     code_memory()
         .acquire_many(mib as u32)
         .await

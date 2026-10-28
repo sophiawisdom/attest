@@ -362,9 +362,11 @@ struct Blobs {
     trimming: tokio::sync::Mutex<()>,
 }
 
-/// The bucket side. A reset starts a new generation (recorded in
-/// `<prefix>/CURRENT`) and deletes older ones in the background, so it's
-/// instant and can't race the new boot's first writes.
+/// The bucket side. Each enclave lineage has its own namespace (its
+/// "generation", named by the lineage id the enclave sends at boot), so a
+/// new lineage never touches another's objects: an enclave elsewhere may
+/// still hold the key to them. Nothing is deleted automatically; teardown
+/// with --delete-data removes everything.
 struct Remote {
     s3: std::sync::Arc<s3::S3>,
     prefix: String,
@@ -406,15 +408,14 @@ impl Remote {
         })
     }
 
-    /// Remove older generations, keeping CURRENT and this one.
-    fn delete_old_generations(&self) {
-        let (keep_gen, keep_cur) = (format!("{}/{}/", self.prefix, self.gen()), self.current_key());
-        let _ = self.delete_later(format!("{}/", self.prefix), move |k| k.starts_with(&keep_gen) || k == keep_cur);
-    }
 }
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn is_generation(g: &[u8]) -> bool {
+    g.len() == 32 && g.iter().all(|c| c.is_ascii_hexdigit())
 }
 
 fn new_generation() -> Result<String> {
@@ -571,19 +572,23 @@ impl Blobs {
                 }
             }
         }
-        let generation = match found {
-            None => return Err(last.unwrap_or_else(|| anyhow::anyhow!("S3 unreachable"))),
-            Some(Some(g)) if g.len() == 32 && g.iter().all(|c| c.is_ascii_hexdigit()) => {
-                String::from_utf8(g).unwrap_or_default()
-            }
-            Some(_) => {
+        let marker = dir.join(GENERATION_FILE);
+        let local = std::fs::read_to_string(&marker).ok().filter(|g| is_generation(g.as_bytes()));
+        let generation = match (local, found) {
+            // The namespace this machine's enclave chose last, even if
+            // another instance has since moved CURRENT.
+            (Some(g), _) => g,
+            (None, None) => return Err(last.unwrap_or_else(|| anyhow::anyhow!("S3 unreachable"))),
+            (None, found) => match found {
+            Some(Some(g)) if is_generation(&g) => String::from_utf8(g).unwrap_or_default(),
+            _ => {
                 let g = new_generation()?;
                 s3.put(&cur, g.clone().into_bytes()).await?;
                 g
             }
+            },
         };
         // A cache from another generation is stale.
-        let marker = dir.join(GENERATION_FILE);
         if std::fs::read_to_string(&marker).ok().as_deref() != Some(generation.as_str()) {
             let d = dir.to_path_buf();
             let freed = blocking(move || remove_all_under(&d)).await?;
@@ -600,8 +605,6 @@ impl Blobs {
             deleting: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             deleted_tags: Default::default(),
         };
-        // Finish any deletion of old generations that a restart cut short.
-        r.delete_old_generations();
         Ok(r)
     }
 
@@ -775,57 +778,61 @@ impl Blobs {
     }
 
     /// A standby taking over: forget the local cache, which may hold records
-    /// the primary has since overwritten in S3, and pick up S3's current
-    /// generation. Without S3 the directory is the store itself: kept.
+    /// the primary has since overwritten in S3. Without S3 the directory is
+    /// the store itself: kept.
     async fn drop_cache(self: &std::sync::Arc<Self>) -> Result<()> {
-        let Some(r) = &self.remote else {
+        if self.remote.is_none() {
             return Ok(());
-        };
-        let g = match r.s3.get(&r.current_key()).await? {
-            Some(g) if g.len() == 32 && g.iter().all(|c| c.is_ascii_hexdigit()) => String::from_utf8(g).unwrap_or_default(),
-            _ => anyhow::bail!("S3 has no current generation"),
-        };
-        *r.generation.write().unwrap_or_else(|p| p.into_inner()) = g.clone();
+        }
         let dir = self.dir.clone();
-        let freed = blocking(move || {
-            let n = remove_all_under(&dir);
-            let _ = std::fs::write(dir.join(GENERATION_FILE), &g);
-            n
-        })
-        .await?;
+        let freed = blocking(move || remove_all_under(&dir)).await?;
         self.add(-(freed as i64));
         log(&format!("blob store: standby taking over; cleared {} MiB of cache", freed >> 20));
         Ok(())
     }
 
-    /// A new enclave lineage: everything stored is unreadable now.
-    async fn reset(self: &std::sync::Arc<Self>) -> Result<()> {
+    /// An enclave booted and names its lineage's namespace. Without a name
+    /// (an older enclave), a fresh one. Nothing of any other namespace is
+    /// deleted. The local cache is cleared: it may be stale.
+    async fn select(self: &std::sync::Arc<Self>, name: &[u8]) -> Result<()> {
+        let g = if is_generation(name) { String::from_utf8(name.to_vec())? } else { new_generation()? };
         let dir = self.dir.clone();
+        let marker = dir.join(GENERATION_FILE);
         if let Some(r) = &self.remote {
-            let g = new_generation()?;
             r.s3.put(&r.current_key(), g.clone().into_bytes()).await?;
             *r.generation.write().unwrap_or_else(|p| p.into_inner()) = g.clone();
+            let g2 = g.clone();
             let freed = blocking(move || {
                 let n = remove_all_under(&dir);
-                let _ = std::fs::write(dir.join(GENERATION_FILE), &g);
+                let _ = std::fs::write(&marker, &g2);
                 n
             })
             .await?;
             self.add(-(freed as i64));
-            r.delete_old_generations();
-            log(&format!("blob store: new enclave boot; new S3 generation, cleared {} MiB of cache", freed >> 20));
+            log(&format!("blob store: enclave booted for namespace {g}; cleared {} MiB of cache", freed >> 20));
             return Ok(());
         }
-        let freed = blocking(move || remove_all_under(&dir)).await?;
+        // Without S3 the directory is the store: kept for the same lineage.
+        if std::fs::read_to_string(&marker).ok().as_deref() == Some(g.as_str()) {
+            log(&format!("blob store: enclave booted for namespace {g} (kept)"));
+            return Ok(());
+        }
+        let g2 = g.clone();
+        let freed = blocking(move || {
+            let n = remove_all_under(&dir);
+            let _ = std::fs::write(&marker, &g2);
+            n
+        })
+        .await?;
         self.add(-(freed as i64));
-        log(&format!("blob store: new enclave boot; cleared {} MiB", freed >> 20));
+        log(&format!("blob store: enclave booted for new namespace {g}; cleared {} MiB", freed >> 20));
         Ok(())
     }
 }
 
 /// op u8 | id [24] | len u64le | data  ->  status u8 | len u64le | data
 ///   1 put, 2 get, 3 delete everything with this id's 8-byte session tag,
-///   4 reset: a new enclave booted, so everything stored is unreadable now,
+///   4 select: an enclave booted; data names its lineage's namespace,
 ///   5 drop the local cache (a standby taking over: another instance may
 ///     have overwritten records since they were cached here).
 /// Status: 0 ok, 1 not found, 2 error (message in data).
@@ -860,7 +867,7 @@ async fn handle_blob<S: Io>(b: std::sync::Arc<Blobs>, mut s: S) -> Result<()> {
             Ok(()) => reply(0, b""),
             Err(e) => reply(2, format!("{e:#}").as_bytes()),
         },
-        4 => match b.reset().await {
+        4 => match b.select(&data).await {
             Ok(()) => reply(0, b""),
             Err(e) => reply(2, format!("{e:#}").as_bytes()),
         },

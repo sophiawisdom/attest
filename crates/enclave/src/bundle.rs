@@ -500,24 +500,11 @@ impl Bundle {
 }
 
 /// The stored files go when the last user of the code does (the session,
-/// a run, a disclosure). Deletion is retried for a while if the parent's
-/// store is unreachable.
+/// a run, a disclosure), after a delay (see BlobClient::delete_later).
 impl Drop for Bundle {
     fn drop(&mut self) {
         self.cache.forget_session(&self.sealer.tag);
-        let Ok(rt) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let (store, tag) = (self.store.clone(), self.sealer.tag);
-        rt.spawn(async move {
-            for attempt in 0..6u32 {
-                if store.delete_session(&tag).await.is_ok() {
-                    return;
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(15 << attempt)).await;
-            }
-            crate::log("couldn't delete a discarded upload's stored files from the parent");
-        });
+        self.store.delete_later(self.sealer.tag);
     }
 }
 
