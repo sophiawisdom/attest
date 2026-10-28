@@ -672,9 +672,10 @@ fn health(app: &App) -> Value {
         "certificate": cert.map(|c| json!({"issuer": c.issuer, "not_after": c.not_after, "expires_in_s": expires_in})),
         "python_sandbox": python,
         "jail_limits": jail,
-        "run_slots": {"total": app.concurrency, "busy": app.concurrency - ctx.slots.available_permits().min(app.concurrency)},
-        "upload_slots_busy": 2 - ctx.upload_slots.available_permits().min(2),
-        "connections": {"open": conns_open, "max": MAX_CONNECTIONS},
+        // No busy-slot or connection counts: this endpoint is public, and
+        // when a run frees its slot says when it finished, which is
+        // model-controlled (see README "Limits").
+        "run_slots": app.concurrency,
     })
 }
 

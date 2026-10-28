@@ -239,6 +239,9 @@ impl Conn {
             }
             None => Full::new(Bytes::new()),
         };
+        // The connection is ready for the next request only once the
+        // previous exchange has fully finished on it.
+        self.sender.ready().await?;
         let resp = self.sender.send_request(req.body(body)?).await?;
         let status = resp.status();
         let bytes = resp.into_body().collect().await?.to_bytes();
