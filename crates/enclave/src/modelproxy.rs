@@ -56,8 +56,10 @@ struct Upstream {
     token: String,
     usage: Arc<Mutex<Usage>>,
     record: Arc<dyn Fn(Value) + Send + Sync>,
-    /// Input items the previous request had, to record only what's new.
-    seen_items: Mutex<usize>,
+    /// Input items each conversation's previous request had, to record
+    /// only what's new. Subagents run their own conversations through the
+    /// same proxy, interleaved, so this is per conversation.
+    seen_items: Mutex<std::collections::HashMap<String, usize>>,
     /// One upstream request at a time.
     inflight: tokio::sync::Semaphore,
 }
@@ -429,7 +431,7 @@ impl ModelProxy {
             usage: usage.clone(),
             record,
             inflight: tokio::sync::Semaphore::new(1),
-            seen_items: Mutex::new(0),
+            seen_items: Mutex::new(Default::default()),
         });
         let task = tokio::spawn(async move {
             // Connections live in this set, so dropping the proxy (which
@@ -636,12 +638,14 @@ async fn handle(up: Arc<Upstream>, req: Request<hyper::body::Incoming>) -> Respo
 }
 
 
-/// What a request adds to the conversation, in full: the input items after
-/// those the previous request already had (each request resends the whole
-/// history), plus the instructions and tools the first time. If the history
-/// got shorter (the harness compacted it), everything is recorded again.
-/// Together the exchanges are the complete record of what the model saw.
-fn new_input(body: &[u8], seen: &mut usize) -> Value {
+/// What a request adds to its conversation, in full: the input items after
+/// those the conversation's previous request had (each request resends the
+/// whole history), plus the instructions and tools the first time. A
+/// conversation is identified by its instructions and first item; if its
+/// history got shorter (the harness compacted it), everything is recorded
+/// again. Together the exchanges are the complete record of what the model
+/// saw.
+fn new_input(body: &[u8], seen: &mut std::collections::HashMap<String, usize>) -> Value {
     let Ok(v) = serde_json::from_slice::<Value>(body) else {
         return json!({"bytes": body.len()});
     };
@@ -651,10 +655,23 @@ fn new_input(body: &[u8], seen: &mut usize) -> Value {
         .and_then(|x| x.as_array())
         .map(|a| a.as_slice())
         .unwrap_or(&[]);
-    let restart = items.len() < *seen || *seen == 0;
-    let from = if restart { 0 } else { *seen };
-    *seen = items.len();
+    let conversation = attest_core::sha256_hex(
+        format!(
+            "{}\n{}",
+            v.get("system").or(v.get("instructions")).unwrap_or(&Value::Null),
+            items.first().unwrap_or(&Value::Null)
+        )
+        .as_bytes(),
+    );
+    if seen.len() > 1000 {
+        seen.clear();
+    }
+    let prev = seen.get(&conversation).copied().unwrap_or(0);
+    let restart = items.len() < prev || prev == 0;
+    let from = if restart { 0 } else { prev };
+    seen.insert(conversation.clone(), items.len());
     let mut out = json!({
+        "conversation": &conversation[..12],
         "model": v.get("model"),
         "items": items.len(),
         "new_from": from,

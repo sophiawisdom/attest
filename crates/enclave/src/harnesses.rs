@@ -355,6 +355,17 @@ fn command(
                 ("ANTHROPIC_API_KEY", token),
                 ("ANTHROPIC_SMALL_FAST_MODEL", model),
                 ("ANTHROPIC_DEFAULT_HAIKU_MODEL", model),
+                // Subagents and model aliases all resolve to the approved
+                // model; the proxy refuses any other.
+                ("ANTHROPIC_DEFAULT_SONNET_MODEL", model),
+                ("ANTHROPIC_DEFAULT_OPUS_MODEL", model),
+                ("CLAUDE_CODE_SUBAGENT_MODEL", model),
+                // Not --bare (that leaves only Bash, Edit and Read, with no
+                // subagents), so switch off what it would: CLAUDE.md files,
+                // memory and bundled skills. Hooks: see --settings below.
+                ("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1"),
+                ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1"),
+                ("CLAUDE_CODE_DISABLE_BUNDLED_SKILLS", "1"),
                 ("CLAUDE_CONFIG_DIR", "/work/.claude"),
                 ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
                 ("DISABLE_AUTOUPDATER", "1"),
@@ -372,7 +383,12 @@ fn command(
                 s("--disallowedTools"),
                 s("WebSearch,WebFetch"),
                 s("-p"),
-                s("--bare"),
+                // Claude Code's usual tools, subagents included, minus the
+                // web tools and Skill (skills could come from the repository).
+                s("--tools"),
+                s("Bash,Read,Edit,Write,Glob,Grep,Agent,TodoWrite"),
+                s("--settings"),
+                s(r#"{"disableAllHooks":true,"disableSkillShellExecution":true}"#),
                 s("--setting-sources"),
                 s("user"),
                 s("--strict-mcp-config"),
