@@ -86,12 +86,19 @@ is written for an agent to follow, and takes one script.
    upstream host may serve the model (OpenRouter slugs: `google-vertex`,
    `amazon-bedrock`, `azure`, `anthropic`, `openai`, or a region such as
    `google-vertex/us`). The enclave sends that list with fallbacks off on
-   every request, switches off OpenRouter's plugins (account defaults
-   included), refuses router models (`openrouter/...`), and rejects any reply
-   naming a different model. The certificate records the pin. Which model
-   and host to use is for the parties to agree; for example, an auditee
-   that isn't the model's maker serving it (Claude on Vertex or Bedrock,
-   GPT on Azure) can't steer its answers.
+   every request, asks OpenRouter to switch off every plugin (web search,
+   web fetch, the routers), refuses router models (`openrouter/...`), and
+   rejects any reply naming a different model. The certificate records the
+   pin. Two limits: an OpenRouter account can set "prevent overrides" on a
+   plugin, and then the request can't switch it off (check the key's account
+   settings first, or use a direct provider for strict work); and the model
+   check happens after the request was sent, so it catches a swap but can't
+   undo it. Which model and host to use is for the parties to agree. A model
+   served by someone other than its maker (Claude on Vertex or Bedrock, GPT
+   on Azure) takes the maker out of serving it, but whoever owns the account
+   still chooses what runs there: an Azure deployment name, in particular,
+   can stand for that account's own fine-tune, which the certificate warns
+   about but can't check.
    To use a real coding agent instead of the built-in tools, add `"agent"`:
    `"codex"` (OpenAI's Codex CLI; any OpenAI-API model: openai, openrouter,
    GPT on bedrock or azure), `"claude-code"` (Claude Code; any Anthropic-API

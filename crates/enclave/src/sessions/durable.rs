@@ -365,22 +365,12 @@ async fn restore_session(ctx: &Arc<Ctx>, sid: &str, head_hash: &str) -> Result<A
         .await?;
     let snap: Snapshot = serde_json::from_slice(&bytes)?;
     ensure!(snap.id == sid, "stored state names another session");
-    let code = match &snap.code {
-        Some(c) => {
-            let m = p.get_large(sid, &c.name, &c.parts).await?;
-            let b = Bundle::restore(
-                sid,
-                serde_json::from_slice(&m)?,
-                ctx.blobs.clone(),
-                ctx.cache.clone(),
-            )?;
-            *lock(&b.persisted) = Some(c.parts.clone());
-            Some(Arc::new(b))
-        }
-        None => None,
-    };
+    // Every read that can fail comes first. A Bundle deletes its stored
+    // files when dropped, so it's made only once nothing else can fail:
+    // otherwise a temporarily missing trace chunk would delete the code.
     let mut runs = snap.runs;
-    for r in &mut runs {
+    let mut traces = Vec::with_capacity(runs.len());
+    for r in &runs {
         let mut t = Trace::default();
         for (k, c) in r.trace_chunks.iter().enumerate() {
             let chunk = p.get(sid, &format!("trace/{}/{k}", r.id), &c.hash).await?;
@@ -388,6 +378,21 @@ async fn restore_session(ctx: &Arc<Ctx>, sid: &str, head_hash: &str) -> Result<A
                 t.push_compressed(e);
             }
         }
+        traces.push(t);
+    }
+    let manifest = match &snap.code {
+        Some(c) => Some((serde_json::from_slice(&p.get_large(sid, &c.name, &c.parts).await?)?, c.parts.clone())),
+        None => None,
+    };
+    let code = match manifest {
+        Some((m, parts)) => {
+            let b = Bundle::restore(sid, m, ctx.blobs.clone(), ctx.cache.clone())?;
+            *lock(&b.persisted) = Some(parts);
+            Some(Arc::new(b))
+        }
+        None => None,
+    };
+    for (r, t) in runs.iter_mut().zip(traces) {
         TRACE_BYTES.fetch_add(t.stored, Ordering::Relaxed);
         r.trace = t;
     }

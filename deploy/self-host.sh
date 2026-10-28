@@ -261,7 +261,11 @@ PCR0=$("${SSH[@]}" "python3 -c 'import json; print(json.load(open(\"attest-src/b
 PUBLISHED="measurements/$COMMIT.pcrs.json"
 if [ -f "$PUBLISHED" ] || git show "$COMMIT:$PUBLISHED" >/dev/null 2>&1 || git show "HEAD:$PUBLISHED" >/dev/null 2>&1; then
   WANT=$( (cat "$PUBLISHED" 2>/dev/null || git show "HEAD:$PUBLISHED") | python3 -c 'import json,sys; print(json.load(sys.stdin)["Measurements"]["PCR0"])')
-  if [ "$WANT" = "$PCR0" ]; then echo "PCR0 matches the published measurements for $COMMIT"; else echo "WARNING: PCR0 $PCR0 differs from published $WANT" >&2; fi
+  if [ "$WANT" = "$PCR0" ]; then echo "PCR0 matches the published measurements for $COMMIT"
+  else
+    echo "PCR0 $PCR0 differs from the published $WANT for $COMMIT: not starting it. The build isn't reproducing; report it." >&2
+    exit 1
+  fi
 else
   echo "no published measurements for $COMMIT; your PCR0 is $PCR0"
 fi

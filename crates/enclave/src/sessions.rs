@@ -567,12 +567,11 @@ impl Store {
         lock(&self.sessions).len()
     }
 
-    fn note_text_run(&self, text_sha: &str, session: &str) -> u32 {
-        let mut idx = lock(&self.text_index);
-        let set = idx.entry(text_sha.to_string()).or_default();
-        let others = set.iter().filter(|s| *s != session).count() as u32;
-        set.insert(session.to_string());
-        others
+    /// Always 0 now: counting runs of the same question text across the
+    /// whole server told any session's auditee whether other customers had
+    /// asked it (a membership oracle on unrelated engagements).
+    fn note_text_run(&self, _text_sha: &str, _session: &str) -> u32 {
+        0
     }
 }
 
@@ -1167,8 +1166,17 @@ impl Session {
             "run {} ran before this service moved to a new enclave and can't be continued; revise the question to run it again",
             parent.number
         );
+        // A follow-up continues that run as agreed: same code, same model and
+        // account. If either changed since, the old conversation (and its
+        // excerpts of the old code) mustn't mix with the new, nor new code go
+        // to a model or account that was replaced.
         let model = st.models.iter().find(|m| m.id == parent.model_id).unwrap();
-        ensure!(model.status != "rejected", "that run's model was rejected");
+        ensure!(
+            model.status == "approved"
+                && st.code.as_ref().map(|c| &c.info.tree_sha256) == Some(&parent.tree),
+            "the code or the model changed since run {}; revise the question to run it again",
+            parent.number
+        );
         let rec = MessageRecord {
             sent_at_ms: now_ms(),
             blinded,

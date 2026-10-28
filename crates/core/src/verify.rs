@@ -228,6 +228,13 @@ pub fn manifest_warnings(m: &Manifest) -> Vec<String> {
     if m.model.key_from == Some(Role::Auditor) {
         w.push("the auditor's own provider account was used: it may have logged everything the model saw (the auditee accepted this)".into());
     }
+    if m.model.provider == Provider::Azure {
+        w.push(format!(
+            "Azure deployment \"{}\": a deployment name can stand for a fine-tuned model, which this doesn't check; the model Azure reported was {}",
+            m.model.requested_model,
+            if m.model.response_models.is_empty() { "not given".into() } else { m.model.response_models.join(", ") }
+        ));
+    }
     if m.model.fine_tuned {
         w.push(format!(
             "model {} is a fine-tune (the question allowed it)",
