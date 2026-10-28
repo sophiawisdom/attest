@@ -3,11 +3,13 @@
 # checkout where build/build-eif.sh has run. Defaults match the allocator
 # set by deploy/launch-graviton.sh (2 CPUs, 10 GiB).
 #
-#   CONFIG=/etc/attest/host.json deploy/run.sh
+#   CONFIG=/etc/attest/host.json [S3_BUCKET=name S3_REGION=us-west-2] deploy/run.sh
 #
 # host.json is handed to the enclave at boot, e.g.
 #   {"public_ip": "1.2.3.4", "email_from": "you@example.com", "ses_region": "us-west-2", "operator": "...", "domain": null}
-# (deploy/self-host.sh writes it.)
+# (deploy/self-host.sh writes it.) With S3_BUCKET the host keeps every
+# sealed file in that bucket and its disk as a cache (instance role
+# credentials; see deploy/self-host.sh).
 #
 # The host daemon runs as a systemd service that restarts on failure (its
 # restarts don't affect the enclave or stored files). A watchdog timer
@@ -21,6 +23,12 @@ CPUS=${CPUS:-2}
 MEM_MIB=${MEM_MIB:-10240}
 CID=${CID:-16}
 CONFIG=${CONFIG:-/etc/attest/host.json}
+S3_ARGS=""
+if [ -n "${S3_BUCKET:-}" ]; then
+  [[ "$S3_BUCKET" =~ ^[a-z0-9-]+$ ]] || { echo "bad S3_BUCKET" >&2; exit 2; }
+  [[ "${S3_REGION:-}" =~ ^[a-z0-9-]+$ ]] || { echo "S3_REGION is required with S3_BUCKET" >&2; exit 2; }
+  S3_ARGS="--s3-bucket $S3_BUCKET --s3-region $S3_REGION"
+fi
 NAME=attest
 LOG=$HOME/attest-host.log
 
@@ -40,7 +48,7 @@ After=network-online.target nitro-enclaves-allocator.service
 Wants=network-online.target
 
 [Service]
-ExecStart=$SRC/build/out/bin/attest-host --enclave-cid $CID --listen 0.0.0.0:443 --config $CONFIG
+ExecStart=$SRC/build/out/bin/attest-host --enclave-cid $CID --listen 0.0.0.0:443 --config $CONFIG $S3_ARGS
 Restart=always
 RestartSec=2
 StandardOutput=append:$LOG

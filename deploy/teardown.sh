@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # Delete what deploy/self-host.sh created for --name: the instance, its
 # Elastic IP, security group and IAM role. The key pair is kept unless
-# --delete-key. A confirmed SES sender address is left as is.
+# --delete-key, and the S3 bucket of sealed files (with every version)
+# unless --delete-data. A confirmed SES sender address is left as is.
 #
-#   deploy/teardown.sh --name attest [--delete-key]
+#   deploy/teardown.sh --name attest [--delete-key] [--delete-data]
 set -euo pipefail
-NAME=attest DELETE_KEY=0
+NAME=attest DELETE_KEY=0 DELETE_DATA=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --name) NAME=$2; shift 2 ;;
     --delete-key) DELETE_KEY=1; shift ;;
+    --delete-data) DELETE_DATA=1; shift ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -42,6 +44,21 @@ if aws iam get-instance-profile --instance-profile-name "$ROLE" >/dev/null 2>&1;
   aws iam remove-role-from-instance-profile --instance-profile-name "$ROLE" --role-name "$ROLE" || true
   aws iam delete-instance-profile --instance-profile-name "$ROLE" || true
   aws iam delete-role-policy --role-name "$ROLE" --policy-name ses || true
+  aws iam delete-role-policy --role-name "$ROLE" --policy-name s3 >/dev/null 2>&1 || true
   aws iam delete-role --role-name "$ROLE" && echo "deleted IAM role $ROLE"
+fi
+if [ -n "${BUCKET:-}" ]; then
+  if [ "$DELETE_DATA" = 1 ]; then
+    # Every version and delete marker, 1000 at a time, then the bucket.
+    while :; do
+      BATCH=$(awsr s3api list-object-versions --bucket "$BUCKET" --max-items 1000 --output json \
+        | python3 -c 'import json,sys; v=json.load(sys.stdin); o=[{"Key":x["Key"],"VersionId":x["VersionId"]} for x in (v.get("Versions") or [])+(v.get("DeleteMarkers") or [])]; print(json.dumps({"Objects":o,"Quiet":True}) if o else "")')
+      [ -n "$BATCH" ] || break
+      awsr s3api delete-objects --bucket "$BUCKET" --delete "$BATCH" >/dev/null
+    done
+    awsr s3api delete-bucket --bucket "$BUCKET" && echo "deleted s3://$BUCKET"
+  else
+    echo "kept s3://$BUCKET (sealed files; pass --delete-data to delete it)"
+  fi
 fi
 rm -f "$STATE" "$STATE_DIR/$NAME.known_hosts"

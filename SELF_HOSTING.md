@@ -11,8 +11,8 @@ github.com/sophiawisdom/attest and deploy attest in my AWS account."
 ## What you need
 
 - An AWS account and the `aws` CLI with credentials that can create EC2
-  instances, key pairs, security groups, Elastic IPs and an IAM role, use
-  SES, and read SSM parameters. Check with `aws sts get-caller-identity`.
+  instances, key pairs, security groups, Elastic IPs, an S3 bucket and an
+  IAM role, use SES, and read SSM parameters. Check with `aws sts get-caller-identity`.
 - `git`, `ssh`, `curl` and `python3` locally.
 
 That's all. No domain is needed: the enclave gets a Let's Encrypt
@@ -23,7 +23,8 @@ record pointing at the IP, not proxied through a CDN).
 
 The default `m7g.xlarge` (4 vCPU, 16 GiB; the enclave gets 2 vCPU and
 10 GiB) costs about $0.16/hour, roughly $120/month, plus about $3.60/month
-for the Elastic IP. SES email costs $0.10 per thousand. `--type m7g.large`
+for the Elastic IP. SES email costs $0.10 per thousand. Sealed files in
+S3 cost about $0.023 per GB-month (old versions are kept 30 days). `--type m7g.large`
 halves the instance cost, with a 4 GiB enclave, of which the agent harnesses (Codex, Claude Code, pi) take about 1 GB (fine for repositories up to a few hundred MB). You also pay your model
 provider for each audit.
 
@@ -37,9 +38,15 @@ deploy/self-host.sh --region us-west-2 --operator "Example Lab" --email-from you
 The script:
 
 1. Creates a key pair (saved in `~/.config/attest/`), a security group
-   (HTTPS from anywhere, SSH from your current IP only), an IAM role that
-   can only send and verify SES email, an Elastic IP, and a Graviton
-   instance with Nitro Enclaves enabled. With `--email-from`, SES emails that
+   (HTTPS from anywhere, SSH from your current IP only), a private,
+   encrypted, versioned S3 bucket (`NAME-ACCOUNT-REGION`, or `--bucket`),
+   an IAM role that can only send and verify SES email and read and write
+   that bucket, an Elastic IP, and a Graviton instance with Nitro Enclaves
+   enabled. The host daemon writes every sealed file to the bucket before
+   acknowledging it and keeps its disk as a cache, so stored files survive
+   the instance. The bucket only ever holds ciphertext the enclave sealed;
+   the role's credentials also reach the enclave (for SES), which is fine
+   for the same reason. `--no-s3` keeps files on the instance's disk only. With `--email-from`, SES emails that
    address a confirmation link; click it once.
 2. Clones the repository on the instance at the newest commit with
    published measurements (or `--commit`), and builds the enclave image
@@ -94,7 +101,9 @@ the enclave. `/agents.md` on the server describes the protocol.
   expiry, whether the Python sandbox and jail limits are ready, and busy run
   slots and connections. It says nothing about any session.
 - **Remove:** `deploy/teardown.sh --name attest` terminates the instance and
-  deletes the Elastic IP, security group and IAM role.
+  deletes the Elastic IP, security group and IAM role. It keeps the S3
+  bucket unless you add `--delete-data`, which deletes every object and
+  version, then the bucket.
 
 ## Notes for agents doing this
 
