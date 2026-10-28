@@ -357,7 +357,14 @@ impl Creds {
             .as_str()
             .ok_or_else(|| anyhow!("Google refused the service-account key (HTTP {}): {}", resp.status, v["error_description"].as_str().or(v["error"].as_str()).unwrap_or("")))?
             .to_string();
-        let ttl = v["expires_in"].as_u64().unwrap_or(3600).saturating_sub(300).max(60);
+        // Google says an hour; clamp whatever it says, so a bogus value can't
+        // overflow the deadline.
+        let ttl = v["expires_in"]
+            .as_u64()
+            .unwrap_or(3600)
+            .min(3600)
+            .saturating_sub(300)
+            .max(60);
         *self.token.lock().unwrap() = Some((tok.clone(), Instant::now() + Duration::from_secs(ttl)));
         Ok(tok)
     }

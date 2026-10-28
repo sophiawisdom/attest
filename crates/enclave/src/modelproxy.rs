@@ -429,9 +429,13 @@ impl ModelProxy {
             inflight: tokio::sync::Semaphore::new(1),
         });
         let task = tokio::spawn(async move {
+            // Connections live in this set, so dropping the proxy (which
+            // aborts this task) ends them too.
+            let mut conns = tokio::task::JoinSet::new();
             while let Ok((s, _)) = l.accept().await {
+                while conns.try_join_next().is_some() {}
                 let up = up.clone();
-                tokio::spawn(async move {
+                conns.spawn(async move {
                     let svc = hyper::service::service_fn(move |req| {
                         let up = up.clone();
                         async move { Ok::<_, std::convert::Infallible>(handle(up, req).await) }
@@ -591,10 +595,10 @@ async fn handle(up: Arc<Upstream>, req: Request<hyper::body::Incoming>) -> Respo
     }
     {
         let mut u = up.usage.lock().unwrap();
-        u.calls += 1;
+        u.calls = u.calls.saturating_add(1);
         let (i, o, m, prov) = usage_of(&text);
-        u.input_tokens += i;
-        u.output_tokens += o;
+        u.input_tokens = u.input_tokens.saturating_add(i);
+        u.output_tokens = u.output_tokens.saturating_add(o);
         if let Some(m) = m {
             u.models.insert(m);
         }

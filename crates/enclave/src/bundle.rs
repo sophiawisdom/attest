@@ -55,6 +55,72 @@ impl Drop for Pin {
 
 pub const MAX_FILES: usize = 500_000;
 
+/// Lines `start..=end` (1-based, model-chosen) of `text`, numbered. Any
+/// numbers are accepted: out-of-range or reversed ranges get a message, not
+/// a panic, and no per-line index of the whole file is built.
+fn select_lines(path: &str, text: &str, start: Option<u64>, end: Option<u64>) -> String {
+    let total = text.lines().count() as u64;
+    let start = start.unwrap_or(1).max(1);
+    if start > total {
+        return format!("{path} has only {total} lines");
+    }
+    let end = end
+        .unwrap_or(start.saturating_add(499))
+        .min(total)
+        .min(start.saturating_add(1999));
+    if end < start {
+        return format!("{path}: end_line {end} is before start_line {start}");
+    }
+    let mut out = format!("{path} (lines {start}-{end} of {total})\n");
+    let skip = (start - 1) as usize;
+    let take = (end - start + 1) as usize;
+    for (i, l) in text.lines().skip(skip).take(take).enumerate() {
+        let n = start + i as u64;
+        let line = format!("{n:>6}\t{}\n", truncate_line(l, 2000));
+        if out.len() + line.len() > MAX_OUTPUT {
+            out.push_str(&format!(
+                "... output truncated at line {n}; request a smaller range\n"
+            ));
+            break;
+        }
+        out.push_str(&line);
+    }
+    out
+}
+/// Archive metadata limits, checked as entries stream in, so a tiny archive
+/// can't make the enclave build huge path or directory indexes.
+pub const MAX_PATH_BYTES: usize = 1024;
+pub const MAX_PATH_DEPTH: usize = 48;
+pub const MAX_DIRS: usize = 200_000;
+/// Sum of all path lengths.
+pub const MAX_PATH_TOTAL: usize = 64 << 20;
+/// Size of a GNU long-name or PAX extension record.
+const MAX_EXT_RECORD: u64 = 64 << 10;
+
+/// The `path` value of a PAX extended header, if it has one.
+fn pax_path(rec: &[u8]) -> Result<Option<String>> {
+    let mut rest = rec;
+    let mut path = None;
+    while !rest.is_empty() {
+        let sp = rest
+            .iter()
+            .position(|&b| b == b' ')
+            .context("malformed PAX record")?;
+        let len: usize = std::str::from_utf8(&rest[..sp])
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .context("malformed PAX record length")?;
+        ensure!(len > sp + 1 && len <= rest.len(), "malformed PAX record");
+        let kv = &rest[sp + 1..len];
+        let kv = kv.strip_suffix(b"\n").unwrap_or(kv);
+        if let Some(v) = kv.strip_prefix(b"path=") {
+            path = Some(String::from_utf8_lossy(v).into_owned());
+        }
+        rest = &rest[len..];
+    }
+    Ok(path)
+}
+
 fn is_text(bytes: &[u8]) -> bool {
     !bytes[..bytes.len().min(8192)].contains(&0)
 }
@@ -72,7 +138,9 @@ impl Bundle {
     ) -> Result<Self> {
         let sealer = Sealer::new(session_id);
         match Self::ingest_inner(reader, &sealer, &store, &rt, max_total) {
-            Ok((files, total_scan)) => Ok(Self::finish(files, total_scan, sealer, store, cache)),
+            Ok((files, total_scan, dirs)) => {
+                Ok(Self::finish(files, dirs, total_scan, sealer, store, cache))
+            }
             Err(e) => {
                 // Don't leave a half-uploaded bundle's blobs behind.
                 let _ = rt.block_on(store.delete_session(&sealer.tag));
@@ -87,27 +155,78 @@ impl Bundle {
         store: &BlobClient,
         rt: &tokio::runtime::Handle,
         max_total: u64,
-    ) -> Result<(BTreeMap<String, Entry>, ScanCounts)> {
+    ) -> Result<(BTreeMap<String, Entry>, ScanCounts, BTreeSet<String>)> {
         let mut archive = tar::Archive::new(reader);
         let mut files = BTreeMap::new();
+        let mut dirs = BTreeSet::new();
+        dirs.insert(String::new());
         let mut total = 0u64;
+        let mut path_total = 0usize;
         let mut scan_total = ScanCounts::default();
-        for entry in archive.entries().context("reading tar")? {
+        // Raw entries: GNU long names and PAX headers reach us as entries,
+        // so their size is checked before anything is buffered.
+        let mut long_name: Option<String> = None;
+        for entry in archive.entries().context("reading tar")?.raw(true) {
             let mut entry = entry.context("tar entry")?;
             let kind = entry.header().entry_type();
-            if kind.is_dir() || kind.is_pax_global_extensions() {
+            if kind.is_gnu_longname()
+                || kind.is_pax_local_extensions()
+                || kind.is_pax_global_extensions()
+            {
+                ensure!(
+                    entry.size() <= MAX_EXT_RECORD,
+                    "an archive header record is too large"
+                );
+                let mut rec = Vec::new();
+                (&mut entry).take(MAX_EXT_RECORD).read_to_end(&mut rec)?;
+                if kind.is_gnu_longname() {
+                    let end = rec.iter().position(|&b| b == 0).unwrap_or(rec.len());
+                    long_name = Some(String::from_utf8_lossy(&rec[..end]).into_owned());
+                } else if kind.is_pax_local_extensions() {
+                    if let Some(p) = pax_path(&rec)? {
+                        long_name = Some(p);
+                    }
+                }
+                continue;
+            }
+            let name = long_name.take();
+            if kind.is_dir() {
                 continue;
             }
             if !kind.is_file() {
                 bail!("the archive contains a non-regular file (links are not allowed)");
             }
-            let raw = entry
-                .path()
-                .context("tar path")?
-                .to_string_lossy()
-                .into_owned();
+            let raw = match name {
+                Some(n) => n,
+                None => entry
+                    .path()
+                    .context("tar path")?
+                    .to_string_lossy()
+                    .into_owned(),
+            };
+            ensure!(
+                raw.len() <= MAX_PATH_BYTES,
+                "a path is longer than {MAX_PATH_BYTES} bytes"
+            );
             let path =
                 normalize_path(&raw).with_context(|| format!("unsafe path in archive: {raw:?}"))?;
+            ensure!(
+                path.split('/').count() <= MAX_PATH_DEPTH,
+                "{path} is nested more than {MAX_PATH_DEPTH} levels deep"
+            );
+            path_total += path.len();
+            ensure!(
+                path_total <= MAX_PATH_TOTAL,
+                "the archive's paths are too long in total"
+            );
+            let mut cur = path.as_str();
+            while let Some(i) = cur.rfind('/') {
+                cur = &cur[..i];
+                if !dirs.insert(cur.to_string()) {
+                    break;
+                }
+            }
+            ensure!(dirs.len() <= MAX_DIRS, "more than {MAX_DIRS} directories");
             let size = entry.size();
             ensure!(
                 size as usize <= MAX_FILE_BYTES,
@@ -166,27 +285,17 @@ impl Bundle {
             }
         }
         ensure!(!files.is_empty(), "the archive is empty");
-        Ok((files, scan_total))
+        Ok((files, scan_total, dirs))
     }
 
     fn finish(
         files: BTreeMap<String, Entry>,
+        dirs: BTreeSet<String>,
         scan_total: ScanCounts,
         sealer: Sealer,
         store: BlobClient,
         cache: Arc<Cache>,
     ) -> Self {
-        let mut dirs = BTreeSet::new();
-        dirs.insert(String::new());
-        for p in files.keys() {
-            let mut cur = p.as_str();
-            while let Some(i) = cur.rfind('/') {
-                cur = &cur[..i];
-                if !dirs.insert(cur.to_string()) {
-                    break;
-                }
-            }
-        }
         let digests: BTreeMap<String, [u8; 32]> =
             files.iter().map(|(k, f)| (k.clone(), f.digest)).collect();
         let tree = tree_hash(&digests);
@@ -298,11 +407,27 @@ impl Bundle {
         }
         c
     }
+}
 
-    /// Remove this bundle's sealed files from the parent.
-    pub async fn discard(&self) {
+/// The stored files go when the last user of the code does (the session,
+/// a run, a disclosure). Deletion is retried for a while if the parent's
+/// store is unreachable.
+impl Drop for Bundle {
+    fn drop(&mut self) {
         self.cache.forget_session(&self.sealer.tag);
-        let _ = self.store.delete_session(&self.sealer.tag).await;
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (store, tag) = (self.store.clone(), self.sealer.tag);
+        rt.spawn(async move {
+            for attempt in 0..6u32 {
+                if store.delete_session(&tag).await.is_ok() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(15 << attempt)).await;
+            }
+            crate::log("couldn't delete a discarded upload's stored files from the parent");
+        });
     }
 }
 
@@ -529,30 +654,12 @@ impl<'a> Tools<'a> {
         let digest = e.digest;
         let bytes = self.bundle.read(&path).await?;
         self.files_read.insert(path.clone(), digest);
-        let text = String::from_utf8_lossy(&bytes);
-        let lines: Vec<&str> = text.lines().collect();
-        let start = start.unwrap_or(1).max(1) as usize;
-        let end = end
-            .map(|e| e as usize)
-            .unwrap_or(start + 499)
-            .min(lines.len())
-            .min(start + 1999);
-        if start > lines.len() {
-            return Ok(format!("{path} has only {} lines", lines.len()));
-        }
-        let mut out = format!("{path} (lines {start}-{end} of {})\n", lines.len());
-        for (i, l) in lines[start - 1..end].iter().enumerate() {
-            let line = format!("{:>6}\t{}\n", start + i, truncate_line(l, 2000));
-            if out.len() + line.len() > MAX_OUTPUT {
-                out.push_str(&format!(
-                    "... output truncated at line {}; request a smaller range\n",
-                    start + i
-                ));
-                break;
-            }
-            out.push_str(&line);
-        }
-        Ok(out)
+        // Off the async workers: a large file takes a while to scan.
+        tokio::task::spawn_blocking(move || {
+            select_lines(&path, &String::from_utf8_lossy(&bytes), start, end)
+        })
+        .await
+        .context("reading the file")
     }
 
     async fn grep(
@@ -595,20 +702,40 @@ impl<'a> Tools<'a> {
             (p, r)
         }))
         .buffered(8);
-        while let Some((p, bytes)) = fetched.next().await {
-            let bytes = bytes?;
-            let t = String::from_utf8_lossy(&bytes);
+        // Matching lines of one file, up to `room` of them, plus the count.
+        fn scan(re: &regex::Regex, p: &str, bytes: &[u8], room: usize) -> (usize, Vec<String>) {
+            let t = String::from_utf8_lossy(bytes);
             if !re.is_match(&t) {
-                continue;
+                return (0, vec![]);
             }
-            files_matched += 1;
+            let (mut n, mut hits) = (0, vec![]);
             for (i, l) in t.lines().enumerate() {
                 if re.is_match(l) {
-                    total += 1;
-                    if out.len() < max {
-                        out.push(format!("{p}:{}: {}", i + 1, truncate_line(l.trim(), 300)));
+                    n += 1;
+                    if hits.len() < room {
+                        hits.push(format!("{p}:{}: {}", i + 1, truncate_line(l.trim(), 300)));
                     }
                 }
+            }
+            (n, hits)
+        }
+        while let Some((p, bytes)) = fetched.next().await {
+            let bytes = bytes?;
+            let room = max - out.len();
+            // Big files are matched off the async workers, which the HTTP
+            // server shares.
+            let (n, hits) = if bytes.len() > 64 << 10 {
+                let re = re.clone();
+                tokio::task::spawn_blocking(move || scan(&re, &p, &bytes, room))
+                    .await
+                    .context("grep")?
+            } else {
+                scan(&re, &p, &bytes, room)
+            };
+            if n > 0 {
+                files_matched += 1;
+                total += n;
+                out.extend(hits);
             }
         }
         let mut s = if out.is_empty() {
@@ -745,6 +872,61 @@ mod tests {
         h.set_cksum();
         b.append(&h, &b"x"[..]).unwrap();
         assert!(ingest(b.into_inner().unwrap(), 1 << 30).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stored_files_go_with_the_last_user() {
+        let store = BlobClient::memory();
+        let rt = tokio::runtime::Handle::current();
+        let s2 = store.clone();
+        let t = tar_of(&[("a", b"x")]);
+        let b = Arc::new(
+            std::thread::spawn(move || {
+                Bundle::ingest(&t[..], "s", s2, Arc::new(Cache::new(1 << 20)), rt, 1 << 20)
+            })
+            .join()
+            .unwrap()
+            .unwrap(),
+        );
+        let blob = b.files["a"].blob;
+        let run = b.clone(); // a run still holding the code
+        drop(b);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(store.get(&blob).await.unwrap().is_some());
+        drop(run);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(store.get(&blob).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn line_ranges_never_panic() {
+        let t = "a\nb\nc\nd\n";
+        assert!(select_lines("f", t, Some(3), Some(1)).contains("before"));
+        assert!(select_lines("f", t, Some(u64::MAX), None).contains("only 4 lines"));
+        assert!(select_lines("f", t, Some(2), Some(u64::MAX)).contains("lines 2-4 of 4"));
+        assert!(select_lines("f", t, Some(0), Some(0)).contains("before"));
+        assert!(select_lines("f", "", None, None).contains("only 0 lines"));
+        let r = select_lines("f", t, Some(2), Some(3));
+        assert!(r.contains("     2\tb") && r.contains("     3\tc") && !r.contains("\td"), "{r}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn long_paths_and_metadata_limits() {
+        // A long name (GNU long-name record) is accepted...
+        let long = format!("{}/x.rs", "d".repeat(200));
+        let b = ingest(tar_of(&[(long.as_str(), b"ok")]), 1 << 30).unwrap();
+        assert!(b.files.contains_key(&long));
+        // ...but too long, or too deep, is refused.
+        let too_long = "a".repeat(MAX_PATH_BYTES + 1);
+        assert!(ingest(tar_of(&[(too_long.as_str(), b"x")]), 1 << 30).is_err());
+        let deep = vec!["a"; MAX_PATH_DEPTH + 1].join("/");
+        assert!(ingest(tar_of(&[(deep.as_str(), b"x")]), 1 << 30).is_err());
+        // PAX path records parse.
+        assert_eq!(
+            pax_path(b"21 path=some/file.rs\n").unwrap().as_deref(),
+            Some("some/file.rs")
+        );
+        assert!(pax_path(b"99 path=x\n").is_err());
     }
 
     #[tokio::test(flavor = "multi_thread")]

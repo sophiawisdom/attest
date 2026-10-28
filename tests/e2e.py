@@ -245,7 +245,8 @@ def run(work):
     a3, o3 = Party(s3["session_id"], s3["auditee_token"]), Party(s3["session_id"], s3["auditor_token"])
     o3.post("/question", {"text": "PYTHON: does trainer/train.py compute loss on CoT tokens?"})
     a3.post("/question/decision", {"version": 1, "accept": True})
-    subprocess.run([os.path.join(BIN, "attest"), "upload", f"{BASE}/s/{s3['session_id']}#{s3['auditee_token']}", repo, "--org", "X", "--allow-dev"], check=True, capture_output=True)
+    up = subprocess.run([os.path.join(BIN, "attest"), "upload", f"{BASE}/s/{s3["session_id"]}#{s3["auditee_token"]}", repo, "--org", "X", "--allow-dev"], capture_output=True, text=True)
+    assert up.returncode == 0, up.stdout[-2000:] + up.stderr[-2000:]
     for _ in range(600):  # the sandbox compiles python.wasm at boot
         if "python sandbox ready" in open(os.path.join(work, "enclave.log")).read():
             break
@@ -294,7 +295,8 @@ def run(work):
         a, o = Party(s["session_id"], s["auditee_token"]), Party(s["session_id"], s["auditor_token"])
         o.post("/question", {"text": text, "answer_format": fmt})
         a.post("/question/decision", {"version": 1, "accept": True})
-        subprocess.run([os.path.join(BIN, "attest"), "upload", f"{BASE}/s/{s['session_id']}#{s['auditee_token']}", repo, "--org", "X", "--allow-dev"], check=True, capture_output=True)
+        up = subprocess.run([os.path.join(BIN, "attest"), "upload", f"{BASE}/s/{s['session_id']}#{s['auditee_token']}", repo, "--org", "X", "--allow-dev"], capture_output=True, text=True)
+        assert up.returncode == 0, up.stdout[-2000:] + up.stderr[-2000:]
         a.post("/models", {"provider": "mock", "model": "gpt-mock", "api_key": "test-key", "mock_endpoint": "127.0.0.1:19999"})
         v = a.wait_until(lambda v: v["runs"] and v["runs"][-1]["status"] != "running", text)
         ov = o.view()

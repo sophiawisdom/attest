@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Roughly 150k tokens of conversation.
 const CONTEXT_BUDGET_CHARS: usize = 600_000;
+const MAX_TOOL_CALLS_PER_TURN: usize = 16;
 const MAX_NUDGES: u32 = 3;
 
 pub struct AgentOutput {
@@ -60,8 +61,8 @@ pub async fn agent_loop(
             }
         };
         activity.llm_calls += 1;
-        activity.input_tokens += reply.input_tokens;
-        activity.output_tokens += reply.output_tokens;
+        activity.input_tokens = activity.input_tokens.saturating_add(reply.input_tokens);
+        activity.output_tokens = activity.output_tokens.saturating_add(reply.output_tokens);
         if let Some(m) = &reply.model {
             response_models.insert(m.clone());
         }
@@ -99,9 +100,14 @@ pub async fn agent_loop(
         }
 
         let mut results = Vec::new();
-        for call in &reply.calls {
+        for (i, call) in reply.calls.iter().enumerate() {
             activity.tool_calls += 1;
-            let out = if call.name == "submit_verdict" {
+            // Each call still gets a result (the APIs require one), but only
+            // the first few run: with each output capped, this bounds what
+            // one turn adds to the conversation and how long it takes.
+            let out = if i >= MAX_TOOL_CALLS_PER_TURN {
+                format!("error: at most {MAX_TOOL_CALLS_PER_TURN} tool calls run per turn; this one was skipped, call it again")
+            } else if call.name == "submit_verdict" {
                 match parse_verdict(&call.args, format) {
                     Ok(v) => {
                         verdict = Some(v);

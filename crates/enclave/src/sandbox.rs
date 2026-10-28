@@ -25,6 +25,8 @@ pub const MEMORY_LIMIT: usize = 512 << 20;
 pub const TIME_LIMIT: Duration = Duration::from_secs(60);
 const OUTPUT_LIMIT: usize = 30_000;
 const TICK: Duration = Duration::from_millis(100);
+/// Opens and directory-listing work one invocation may cause; see RoDir::charge.
+const HOST_WORK_BUDGET: u64 = 2_000_000;
 
 pub struct Sandbox {
     engine: Engine,
@@ -170,14 +172,31 @@ impl Sandbox {
         code: &str,
         opened: Arc<Mutex<BTreeMap<String, [u8; 32]>>>,
     ) -> Output {
+        self.run_python_within(bundle, code, opened, TIME_LIMIT).await
+    }
+
+    async fn run_python_within(
+        &self,
+        bundle: Arc<Bundle>,
+        code: &str,
+        opened: Arc<Mutex<BTreeMap<String, [u8; 32]>>>,
+        limit: Duration,
+    ) -> Output {
         let stdout = Capped::default();
         let stderr = Capped::default();
-        let result = self
-            .run_inner(bundle, code, opened, stdout.clone(), stderr.clone())
-            .await;
+        // Wall-clock limit for everything, including time the guest spends
+        // in host calls such as sleep(), which epoch checks don't see. The
+        // guest yields every tick (see run_inner), so this fires on time
+        // and dropping the future cancels whatever it was doing.
+        let result = tokio::time::timeout(
+            limit,
+            self.run_inner(bundle, code, opened, stdout.clone(), stderr.clone()),
+        )
+        .await;
         let (exit_code, timed_out, error) = match result {
-            Ok(code) => (Some(code), false, None),
-            Err(e) => {
+            Err(_) => (None, true, None),
+            Ok(Ok(code)) => (Some(code), false, None),
+            Ok(Err(e)) => {
                 let msg = format!("{e:#}");
                 let timed_out = msg.contains("interrupt") || msg.contains("epoch");
                 (None, timed_out, if timed_out { None } else { Some(msg) })
@@ -217,12 +236,14 @@ impl Sandbox {
         b.stderr(Box::new(wasi_common::pipe::WritePipe::new(stderr)));
         let wasi = b.build();
         // Both directories are read-only views of immutable data; nothing in
-        // the guest can write anywhere.
+        // the guest can write anywhere. They share one work budget.
+        let budget = Arc::new(std::sync::atomic::AtomicU64::new(HOST_WORK_BUDGET));
         wasi.push_preopened_dir(
             Box::new(RoDir {
                 source: Source::Static(self.stdlib.clone()),
                 prefix: String::new(),
                 opened: None,
+                budget: budget.clone(),
             }),
             "/usr/local/lib",
         )
@@ -232,6 +253,7 @@ impl Sandbox {
                 source: Source::Repo(bundle),
                 prefix: String::new(),
                 opened: Some(opened),
+                budget,
             }),
             "/repo",
         )
@@ -245,8 +267,11 @@ impl Sandbox {
             .build();
         let mut store = Store::new(&self.engine, GuestState { wasi, limits });
         store.limiter(|s| &mut s.limits);
-        store.set_epoch_deadline((TIME_LIMIT.as_millis() / TICK.as_millis()) as u64);
-        store.epoch_deadline_trap();
+        // Yield to the async runtime every tick, so a busy guest can't hold
+        // a worker thread (the HTTP server shares them); the overall limit
+        // is the timeout in run_python.
+        store.set_epoch_deadline(1);
+        store.epoch_deadline_async_yield_and_update(1);
         let mut linker: Linker<GuestState> = Linker::new(&self.engine);
         wasi_common::tokio::add_to_linker(&mut linker, |s| &mut s.wasi)
             .map_err(|e| anyhow!("{e}"))?;
@@ -345,6 +370,23 @@ struct RoDir {
     prefix: String,
     /// For the repository: record which files were opened.
     opened: Option<Arc<Mutex<BTreeMap<String, [u8; 32]>>>>,
+    /// Host-side work this invocation may still cause (see charge).
+    budget: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl RoDir {
+    /// Charge host-side work: an open is 1, a directory listing 1 per 64
+    /// entries. The 512 MiB memory limit covers only the guest's own
+    /// memory, so this bounds the host allocations a script can cause.
+    // fetch_update: the image's Rust (1.97) predates its newer name.
+    #[allow(deprecated)]
+    fn charge(&self, units: u64) -> Result<(), Error> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.budget
+            .fetch_update(Relaxed, Relaxed, |b| b.checked_sub(units))
+            .map(|_| ())
+            .map_err(|_| Error::perm().context("the script opened too many files or listed too many directories"))
+    }
 }
 
 #[async_trait::async_trait]
@@ -365,12 +407,14 @@ impl WasiDir for RoDir {
         if write || oflags.intersects(OFlags::CREATE | OFlags::TRUNCATE | OFlags::EXCLUSIVE) {
             return Err(Error::perm());
         }
+        self.charge(1)?;
         let full = join(&self.prefix, path)?;
         if self.source.is_dir(&full) {
             return Ok(OpenResult::Dir(Box::new(RoDir {
                 source: self.source.clone(),
                 prefix: full,
                 opened: self.opened.clone(),
+                budget: self.budget.clone(),
             })));
         }
         let (_, digest) = self.source.file(&full).ok_or_else(Error::not_found)?;
@@ -402,6 +446,7 @@ impl WasiDir for RoDir {
             ("..".into(), FileType::Directory),
         ];
         names.extend(self.source.children(&prefix));
+        self.charge(1 + names.len() as u64 / 64)?;
         let start = u64::from(cursor) as usize;
         let base = self.prefix.clone();
         let items: Vec<Result<ReaddirEntity, Error>> = names
@@ -486,13 +531,13 @@ impl WasiFile for RepoFile {
         let mut pos = self.pos.lock().unwrap();
         let len = self.data.len() as i64;
         let new = match to {
-            SeekFrom::Start(n) => n as i64,
-            SeekFrom::End(d) => len + d,
-            SeekFrom::Current(d) => *pos as i64 + d,
+            SeekFrom::Start(n) => i64::try_from(n).ok(),
+            SeekFrom::End(d) => len.checked_add(d),
+            SeekFrom::Current(d) => i64::try_from(*pos).ok().and_then(|p| p.checked_add(d)),
         };
-        if new < 0 {
+        let Some(new) = new.filter(|n| *n >= 0) else {
             return Err(Error::invalid_argument());
-        }
+        };
         *pos = new as u64;
         Ok(*pos)
     }
@@ -514,4 +559,78 @@ fn read_at(data: &[u8], offset: u64, bufs: &mut [IoSliceMut<'_>]) -> u64 {
         total += n;
     }
     total as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blobs::{BlobClient, Cache};
+
+    /// Needs the CPython WASI build (tests/e2e.py fetches it to
+    /// target/python-wasi); skipped without it.
+    #[test]
+    fn python_time_limit_covers_sleep_and_busy_loops() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/python-wasi");
+        if !dir.join("python.wasm").exists() {
+            eprintln!("skipping: no {}", dir.display());
+            return;
+        }
+        let sb = Sandbox::load(&dir).unwrap();
+        // One thread: if the guest didn't yield, nothing else could run.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut tar = tar::Builder::new(Vec::new());
+            let mut h = tar::Header::new_gnu();
+            h.set_size(1);
+            h.set_cksum();
+            tar.append_data(&mut h, "a.txt", &b"x"[..]).unwrap();
+            let t = tar.into_inner().unwrap();
+            let handle = tokio::runtime::Handle::current();
+            let bundle = Arc::new(
+                tokio::task::spawn_blocking(move || {
+                    Bundle::ingest(
+                        &t[..],
+                        "s",
+                        BlobClient::memory(),
+                        Arc::new(Cache::new(1 << 20)),
+                        handle,
+                        1 << 20,
+                    )
+                })
+                .await
+                .unwrap()
+                .unwrap(),
+            );
+            for code in ["import time\ntime.sleep(1000)", "while True:\n    pass"] {
+                let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let t2 = ticks.clone();
+                let counter = tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        t2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                });
+                let started = std::time::Instant::now();
+                let out = sb
+                    .run_python_within(
+                        bundle.clone(),
+                        code,
+                        Default::default(),
+                        Duration::from_secs(3),
+                    )
+                    .await;
+                counter.abort();
+                let took = started.elapsed();
+                assert!(out.timed_out, "{code}: {:?}", out.error);
+                assert!(took < Duration::from_secs(8), "{code}: took {took:?}");
+                assert!(
+                    ticks.load(std::sync::atomic::Ordering::Relaxed) > 10,
+                    "{code}: the runtime was starved"
+                );
+            }
+        });
+    }
 }
