@@ -417,7 +417,7 @@ Server:   https://${DOMAIN:-$IP}  (the enclave gets its Let's Encrypt certificat
 Storage:  $STORAGE
 PCR0:     $PCR0
 Verify:   attest verify-service https://$IP --pcrs $PUBLISHED
-Sessions: $([ -n "$OPEN" ] && echo "anyone may start one (--open)" || echo "private: start one with operator key $OPERATOR_KEY")
+Sessions: $(if [ -n "$STANDBY_FOR" ]; then echo "as on $STANDBY_FOR"; elif [ -n "$OPEN" ]; then echo "anyone may start one (--open)"; else echo "private: start one with operator key $OPERATOR_KEY"; fi)
 SSH:      ssh -i $KEY ec2-user@$IP
 EOF
 if [ -n "$DOMAIN" ]; then

@@ -32,9 +32,12 @@ tokio-vsock = "0.7"
 [profile.dev.package."*"]
 opt-level = 2
 
+# Fast to rebuild while iterating: no whole-program LTO, parallel codegen.
+# Still deterministic, so measurements reproduce. (For a release, consider
+# lto = true and codegen-units = 1 again: smaller, slightly faster.)
 [profile.release]
 opt-level = 3
-lto = true
-codegen-units = 1
+lto = false
+codegen-units = 16
 strip = true
 
