@@ -300,7 +300,7 @@ for _ in $(seq 60); do
 done
 "${SSH[@]}" 'test -f /var/lib/attest-bootstrapped' || { echo "instance setup did not finish; check /var/log/cloud-init-output.log on it" >&2; exit 1; }
 
-say "building the enclave image on the instance (about 10 minutes)"
+say "building the enclave image on the instance (10 minutes the first time; only changes after that)"
 PUBLIC_IP=$IP PEER=""
 if [ -n "$STANDBY_FOR" ]; then
   # The standby serves at the primary's address once it takes over, and
@@ -330,13 +330,34 @@ print(json.dumps(c))')
 else
   CONFIG=$(host_config "$PEER")
 fi
+# The checkout and the docker builder's caches stay between deploys, so a
+# rebuild recompiles only what changed (FRESH=1 build/build-eif.sh on the
+# instance builds from scratch). A built image is also put in the bucket
+# (images/COMMIT/), where a standby takes it instead of building its own:
+# its PCR0 is checked against the published measurements either way.
+IMAGES=""
+[ -n "$BUCKET" ] && IMAGES="s3://$BUCKET/images/$COMMIT"
 "${SSH[@]}" "set -euo pipefail
-  if [ \"\$(cat attest-src/build/out/built-commit 2>/dev/null)\" = '$COMMIT' ]; then
-    echo 'enclave image for $COMMIT already built; reusing it'; cd attest-src
+  if [ -d attest-src/.git ]; then
+    cd attest-src && git fetch -q origin && git checkout -q --detach '$COMMIT'
   else
-  rm -rf attest-src && git clone -q '$REPO' attest-src && cd attest-src && git checkout -q '$COMMIT'
-  nice -n 5 build/build-eif.sh > ~/build-eif.log 2>&1 || { tail -30 ~/build-eif.log; exit 1; }
-  echo '$COMMIT' > build/out/built-commit
+    git clone -q '$REPO' attest-src && cd attest-src && git checkout -q '$COMMIT'
+  fi
+  mkdir -p build/out/bin
+  if [ \"\$(cat build/out/built-commit 2>/dev/null)\" = '$COMMIT' ]; then
+    echo 'enclave image for $COMMIT already built; reusing it'
+  elif [ -n '$IMAGES' ] && aws s3 cp --quiet '$IMAGES/attest.eif' build/out/attest.eif.new 2>/dev/null \
+       && aws s3 cp --quiet '$IMAGES/attest-host' build/out/bin/attest-host.new; then
+    mv build/out/attest.eif.new build/out/attest.eif && mv build/out/bin/attest-host.new build/out/bin/attest-host && chmod +x build/out/bin/attest-host
+    nitro-cli describe-eif --eif-path build/out/attest.eif | python3 -c 'import json,sys; print(json.dumps({\"Measurements\": json.load(sys.stdin)[\"Measurements\"]}))' > build/out/pcrs.json
+    echo '$COMMIT' > build/out/built-commit
+    echo 'took the image for $COMMIT from the bucket'
+  else
+    nice -n 5 build/build-eif.sh > ~/build-eif.log 2>&1 || { tail -30 ~/build-eif.log; exit 1; }
+    echo '$COMMIT' > build/out/built-commit
+    if [ -n '$IMAGES' ]; then
+      aws s3 cp --quiet build/out/attest.eif '$IMAGES/attest.eif' && aws s3 cp --quiet build/out/bin/attest-host '$IMAGES/attest-host' || echo 'note: couldn'\''t store the image in the bucket'
+    fi
   fi
   sudo mkdir -p /etc/attest && echo '$(printf '%s' "$CONFIG" | base64 | tr -d '\n')' | base64 -d | sudo tee /etc/attest/host.json >/dev/null
   cat build/out/pcrs.json"

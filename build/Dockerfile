@@ -36,9 +36,19 @@ ENV ATTEST_GIT_SHA=$ATTEST_GIT_SHA \
     CARGO_HOME=/cargo \
     RUSTFLAGS="--remap-path-prefix=/src=/build --remap-path-prefix=/cargo=/cargo-home --remap-path-prefix=/usr/local/rustup=/rustup -C target-feature=+crt-static"
 
-RUN T=$(cat /target-triple) \
+# Compiled crates and downloads are kept in cache mounts between builds, so
+# a rebuild recompiles only what changed. (Tests run before deploying, not
+# here.) The target directory isn't part of the image, so the binaries are
+# copied out in the same step.
+# FRESH=1 build/build-eif.sh uses empty caches: a from-scratch build, to
+# check a release reproduces.
+ARG CACHE_ID=shared
+RUN --mount=type=cache,id=attest-cargo-registry-$CACHE_ID,target=/cargo/registry \
+    --mount=type=cache,id=attest-target-$TARGETARCH-$CACHE_ID,target=/src/target \
+    T=$(cat /target-triple) \
  && cargo build --release --locked --target "$T" -p attest-enclave -p attest-host -p attest-cli \
- && cargo test --release --locked --target "$T" -p attest-core -p attest-enclave
+ && mkdir -p /out \
+ && cp target/$T/release/attest-enclave target/$T/release/attest-host target/$T/release/attest /out/
 
 # CPython compiled to WASI, for the agent's python sandbox. Pinned by hash.
 ADD --checksum=sha256:252e2e17fab9f51a51fbfc73d51e18805cb633e9f9200c9753b4b801c70ad32c \
@@ -46,10 +56,7 @@ ADD --checksum=sha256:252e2e17fab9f51a51fbfc73d51e18805cb633e9f9200c9753b4b801c7
 RUN mkdir -p /opt/python-wasi && cd /opt/python-wasi && unzip -q /tmp/python-wasi.zip \
  && find /opt/python-wasi -exec touch -h -d @0 {} +
 
-RUN mkdir -p /out && \
-    T=$(cat /target-triple) && \
-    cp target/$T/release/attest-enclave target/$T/release/attest-host target/$T/release/attest /out/ && \
-    cd /out && sha256sum * > SHA256SUMS
+RUN cd /out && sha256sum * > SHA256SUMS
 
 # Jail image for the agent harnesses (Codex, Claude Code, pi): busybox and a
 # static bash for the shell, each harness pinned by sha256 (pi through its npm lockfile),

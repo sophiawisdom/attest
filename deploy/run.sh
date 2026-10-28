@@ -91,9 +91,10 @@ sudo systemctl enable attest-host.service >/dev/null 2>&1
 sudo systemctl restart attest-host.service
 sleep 2
 
-if nitro-cli describe-enclaves | grep -q "\"EnclaveName\": \"$NAME\""; then
-  nitro-cli terminate-enclave --enclave-name "$NAME"
-fi
+# Every enclave on this machine (one is ours), and any nitro-cli left from an
+# earlier start: a stale one makes describe-enclaves fail.
+nitro-cli terminate-enclave --all >/dev/null 2>&1 || true
+sudo pkill -x nitro-cli 2>/dev/null || true
 # Never pass --debug-mode: it zeroes the PCRs and lets the parent read
 # enclave memory. Verifiers reject zero PCRs.
 nitro-cli run-enclave --enclave-name "$NAME" --eif-path "$EIF" --cpu-count "$CPUS" --memory "$MEM_MIB" --enclave-cid "$CID"

@@ -7,6 +7,10 @@
 #
 #   build/build-eif.sh            binaries + EIF + pcrs.json
 #   build/build-eif.sh --bins     binaries only (no nitro-cli needed)
+#
+# Rebuilds reuse compiled crates (a cache in the docker builder), so only
+# what changed recompiles. FRESH=1 builds from scratch, with no cache: do
+# that to check a release reproduces.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 OUT="$PWD/build/out"
@@ -30,6 +34,10 @@ case "${ARCH:-$(uname -m)}" in
 esac
 echo "== platform $PLATFORM"
 COMMON=(--builder "$BUILDER" --file build/Dockerfile --build-arg SOURCE_DATE_EPOCH=0 --build-arg "ATTEST_GIT_SHA=$GIT_SHA" --platform "$PLATFORM")
+if [ -n "${FRESH:-}" ]; then
+  COMMON+=(--no-cache --build-arg "CACHE_ID=fresh-$(date +%s)-$$")
+  echo "== from scratch (no caches)"
+fi
 
 echo "== binaries"
 docker buildx build "${COMMON[@]}" --target artifacts --output "type=local,dest=$OUT/bin" .
