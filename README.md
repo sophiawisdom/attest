@@ -38,18 +38,28 @@ error text). The auditee can choose to release those details too.
 - `crates/enclave`: sessions, agent loop, provider adapters, TLS and ACME
   inside the enclave, web app (`web/index.html`), agent guide (`web/agents.md`).
 - `crates/host`: untrusted parent daemon that forwards ciphertext and serves boot config.
-- `crates/cli`: `attest verify-service`, `attest upload`, `attest verify`.
+- `crates/cli`: `attest open`, `attest verify-service`, `attest upload`, `attest verify`.
 - `build/`: reproducible enclave image build. `deploy/`: AWS launch and run scripts.
 - `measurements/`: published PCRs per commit.
 
 ## Use
 
 ```sh
+attest open 'https://32.190.88.43/s/ID#TOKEN'
 attest verify-service https://32.190.88.43 --pcrs measurements/<commit>.pcrs.json
 attest upload 'https://32.190.88.43/s/ID#TOKEN' ~/repo --org "Example Lab" --pcrs ...
 attest verify certificate.json --pcrs ...
 attest verify disclosure.json --pcrs ...
 ```
+
+`attest open` is the safe way to use the web app. A browser can't check
+which server its TLS session reaches, so whoever controls the address could
+get their own certificate and serve a page that copies links, code or keys.
+`attest open` checks the attestation first (against `--pcrs`, or by default
+the measurements published in this repository for the commit the server
+reports), serves the app on `http://127.0.0.1`, and relays every API call
+over TLS sessions it checked end inside the enclave. If a later check fails,
+it stops relaying.
 
 The auditee can also publish **disclosures**: a file from the uploaded code,
 or what a Python script prints when run over it in the enclave's sandbox.

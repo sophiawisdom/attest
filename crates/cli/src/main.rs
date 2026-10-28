@@ -3,6 +3,7 @@
 //! (see /agents.md on any attest server).
 
 mod bundle;
+mod local;
 
 use anyhow::{anyhow, bail, Context, Result};
 use attest_core::nitro::ExpectedPcrs;
@@ -87,6 +88,25 @@ enum Cmd {
         /// Upload even if tracked files have uncommitted changes.
         #[arg(long)]
         allow_dirty: bool,
+        #[command(flatten)]
+        policy: PolicyArgs,
+    },
+    /// Open a session in your browser through a local client: it checks the
+    /// enclave's attestation, serves the web app on 127.0.0.1, and sends every
+    /// API call over TLS sessions it has checked end inside that enclave.
+    Open {
+        /// A session link (https://HOST/s/ID#TOKEN) or the server's URL.
+        link: String,
+        /// Local port (default: any free port).
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        /// Print the local link instead of opening a browser.
+        #[arg(long)]
+        no_browser: bool,
+        /// Where to fetch published measurements when --pcrs isn't given
+        /// (a GitHub owner/repo with a measurements/ directory).
+        #[arg(long, default_value = local::MEASUREMENTS_REPO)]
+        measurements_repo: String,
         #[command(flatten)]
         policy: PolicyArgs,
     },
@@ -216,6 +236,32 @@ impl Conn {
             host: host_header,
             spki_sha256: Some(spki_sha256_of_cert(&cert)?),
         })
+    }
+
+    /// One request, returned as is: status, content type and body.
+    async fn raw(
+        &mut self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Bytes,
+    ) -> Result<(u16, Option<String>, Bytes)> {
+        let mut req = hyper::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", &self.host);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        self.sender.ready().await?;
+        let resp = self.sender.send_request(req.body(Full::new(body))?).await?;
+        let status = resp.status().as_u16();
+        let ctype = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        Ok((status, ctype, resp.into_body().collect().await?.to_bytes()))
     }
 
     async fn call(
@@ -420,6 +466,14 @@ async fn main() -> Result<()> {
                 ),
             }
         }
+
+        Cmd::Open {
+            link,
+            port,
+            no_browser,
+            measurements_repo,
+            policy,
+        } => local::open(&link, port, no_browser, &measurements_repo, &policy).await?,
 
         Cmd::Verify {
             certificate,

@@ -191,6 +191,7 @@ dependencies = [
  "tokio-rustls",
  "url",
  "walkdir",
+ "webpki-roots",
 ]
 
 [[package]]

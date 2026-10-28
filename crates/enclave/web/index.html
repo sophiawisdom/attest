@@ -175,6 +175,11 @@ async function busy(btn, fn) {
   const html = btn.innerHTML; btn.disabled = true; btn.innerHTML = `<i class="spin"></i>${html}`;
   try { return await fn(); } catch (e) { toast(e.message, true); } finally { btn.disabled = false; btn.innerHTML = html; }
 }
+// Set by `attest open`, the local client that checked the attestation and
+// relays this page's API calls over TLS sessions ending inside the enclave.
+const LOCAL = window.ATTEST_LOCAL || null;
+const ORIGIN = LOCAL ? LOCAL.origin : location.origin;
+const openCmd = () => `attest open '${ORIGIN}${location.pathname}${location.hash}'`;
 const S = { sid: null, token: null, view: null, info: null, traces: {}, last: {}, polling: false };
 async function api(path, { method = "GET", body, raw, timeout } = {}) {
   const headers = {};
@@ -208,15 +213,20 @@ async function loadInfo() {
   const i = S.info, chip = $("#encChip");
   if (!i) { chip.innerHTML = `<i class="dot bad"></i><span class="t">Enclave unreachable</span>`; return; }
   const dev = i.mode === "dev";
-  chip.innerHTML = `<i class="dot ${dev ? "warn" : "ok"}"></i><span class="t">${dev ? "Dev mode · not attested" : `Nitro enclave · ${esc(i.source_commit.slice(0, 7))}`}</span>`;
+  if (LOCAL && !dev) { chip.innerHTML = `<i class="dot ok"></i><span class="t">Checked by attest open · PCR0 ${esc((LOCAL.pcr0 || "").slice(0, 8))}</span>`; return; }
+  chip.innerHTML = `<i class="dot warn"></i><span class="t">${dev ? "Dev mode · not attested" : `Nitro enclave · ${esc(i.source_commit.slice(0, 7))} · not checked by this browser`}</span>`;
 }
 function verifyPanel() {
   const i = S.info; if (!i) return "";
-  const host = location.host;
+  const host = new URL(ORIGIN).host;
+  const how = LOCAL && i.mode !== "dev"
+    ? `<div class="callout info"><span class="ic">✓</span><span>You opened this through <code>attest open</code>. It checked the attestation (measurements ${esc(LOCAL.measurements || "as given")}), and every API call goes over a TLS session it checked ends inside this enclave.</span></div>`
+    : `<p class="small muted">A browser can't check which server it's really talking to: whoever controls this address could get their own TLS certificate and serve a different page that copies your link, code or keys. Before uploading code or entering a key, open the session through the local client, which checks the enclave first:</p>
+    <div class="linkbox"><input type="text" readonly value="${esc(openCmd())}"><button class="btn" data-copy="${esc(openCmd())}">Copy</button></div>`;
   return `<div class="panel pad stack" id="verify">
     <h3>Verify this service</h3>
     ${i.mode === "dev" ? `<div class="callout warn"><span class="ic">!</span><span>Dev mode: nothing is attested. For testing only.</span></div>` : ""}
-    <p class="small muted">This page and the API come from inside the enclave. A browser can't check that on its own, so have an agent or the CLI verify it before you upload code or trust a result.</p>
+    ${how}
     <dl class="kv">
       <dt>source</dt><dd><a href="${esc(i.source_repo)}/tree/${esc(i.source_commit)}" target="_blank" rel="noopener">${esc(i.source_commit.slice(0, 12))}</a></dd>
       <dt>boot</dt><dd>${hash(i.boot_id, 8)} · ${esc(ago(i.booted_at_ms))}</dd>
@@ -253,7 +263,7 @@ async function createSession(btn) {
       <div class="callout warn"><span class="ic">!</span><span>Save both links now. They can't be shown again, and anyone with a link acts as that party.</span></div>
       <label class="f">Your link (auditee, keep private)<div class="linkbox"><input type="text" readonly value="${esc(r.auditee_link)}"><button class="btn" data-copy="${esc(r.auditee_link)}">Copy</button></div></label>
       <label class="f">Auditor's link (send this to them)<div class="linkbox"><input type="text" readonly value="${esc(r.auditor_link)}"><button class="btn" data-copy="${esc(r.auditor_link)}">Copy</button></div></label>
-      <div class="row"><a class="btn primary" href="${esc(r.auditee_link)}">Open my session</a></div>
+      <div class="row"><a class="btn primary" href="${esc(LOCAL ? location.origin + new URL(r.auditee_link).pathname + new URL(r.auditee_link).hash : r.auditee_link)}">Open my session</a></div>
     </div>`;
   });
 }
@@ -345,7 +355,7 @@ function renderCode(v) {
   if (c && isAuditee()) body += `<div class="pills"><span class="pill"><b>${num(c.file_count)}</b> files</span><span class="pill"><b>${bytes(c.total_bytes)}</b></span><span class="pill">tree ${hash(c.tree_sha256)}</span><span class="pill">${esc(ago(c.uploaded_at_ms))}</span></div>`;
   else if (c) body += `<div class="pills"><span class="pill">commitment ${hash(c.commitment_sha256)}</span><span class="pill">${esc(ago(c.uploaded_at_ms))}</span></div><p class="small muted">Size and tree hash stay hidden until a result is released; the certificate opens the commitment.</p>`;
   if (isAuditee()) {
-    const link = `${location.origin}/s/${S.sid}#${S.token}`;
+    const link = `${ORIGIN}/s/${S.sid}#${S.token}`;
     const cmd = `attest upload '${link}' ~/path/to/repo`;
     body += `<details data-keep="upload-${c ? c.tree_sha256 : "none"}" ${c ? "" : "open"}><summary>${c ? "Replace the code" : "Upload your code"}</summary><div class="stack" style="margin-top:10px">
       <p class="small muted">Recommended: the CLI sends exactly your git-tracked files and checks the enclave's attestation first.</p>

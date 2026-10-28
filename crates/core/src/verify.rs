@@ -230,12 +230,11 @@ pub fn manifest_warnings(m: &Manifest) -> Vec<String> {
     }
     if m.model.provider == Provider::Azure {
         w.push(format!(
-            "Azure deployment \"{}\": a deployment name can stand for a fine-tuned model, which this doesn't check; the model Azure reported was {}",
+            "Azure deployment \"{}\" may be a fine-tuned model (Azure doesn't show which to the key); the question allowed fine-tunes. The model Azure reported was {}",
             m.model.requested_model,
             if m.model.response_models.is_empty() { "not given".into() } else { m.model.response_models.join(", ") }
         ));
-    }
-    if m.model.fine_tuned {
+    } else if m.model.fine_tuned {
         w.push(format!(
             "model {} is a fine-tune (the question allowed it)",
             m.model.requested_model

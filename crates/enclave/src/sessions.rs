@@ -2379,7 +2379,7 @@ fn status_line(st: &State, role: Role) -> String {
     if missing.is_empty() {
         if let (Some(q), Some(m)) = (q, st.models.iter().rev().find(|m| m.status == "approved")) {
             if llm::is_fine_tuned(m.provider, &m.model) && !q.allow_fine_tuned {
-                return "The approved model is a fine-tune, which the question does not allow. Choose another model.".into();
+                return "The approved model is, or may be, a fine-tune (every Azure deployment counts), which the question does not allow. Choose another model or allow fine-tunes.".into();
             }
         }
         if st.runs.is_empty() {

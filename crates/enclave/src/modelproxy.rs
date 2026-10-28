@@ -59,7 +59,7 @@ struct Upstream {
     /// Input items each conversation's previous request had, to record
     /// only what's new. Subagents run their own conversations through the
     /// same proxy, interleaved, so this is per conversation.
-    seen_items: Mutex<std::collections::HashMap<String, usize>>,
+    seen_items: Mutex<std::collections::HashMap<String, (usize, String)>>,
     /// One upstream request at a time.
     inflight: tokio::sync::Semaphore,
 }
@@ -641,11 +641,12 @@ async fn handle(up: Arc<Upstream>, req: Request<hyper::body::Incoming>) -> Respo
 /// What a request adds to its conversation, in full: the input items after
 /// those the conversation's previous request had (each request resends the
 /// whole history), plus the instructions and tools the first time. A
-/// conversation is identified by its instructions and first item; if its
-/// history got shorter (the harness compacted it), everything is recorded
-/// again. Together the exchanges are the complete record of what the model
-/// saw.
-fn new_input(body: &[u8], seen: &mut std::collections::HashMap<String, usize>) -> Value {
+/// conversation is identified by its instructions and first item. Only an
+/// exact continuation is shortened: if anything already recorded changed
+/// (the instructions, the tools, or any earlier item, as when a harness
+/// compacts or edits its history), the whole request is recorded again.
+/// Together the exchanges are the complete record of what the model saw.
+fn new_input(body: &[u8], seen: &mut std::collections::HashMap<String, (usize, String)>) -> Value {
     let Ok(v) = serde_json::from_slice::<Value>(body) else {
         return json!({"bytes": body.len()});
     };
@@ -655,6 +656,11 @@ fn new_input(body: &[u8], seen: &mut std::collections::HashMap<String, usize>) -
         .and_then(|x| x.as_array())
         .map(|a| a.as_slice())
         .unwrap_or(&[]);
+    let header = format!(
+        "{}\n{}",
+        v.get("system").or(v.get("instructions")).unwrap_or(&Value::Null),
+        v.get("tools").unwrap_or(&Value::Null)
+    );
     let conversation = attest_core::sha256_hex(
         format!(
             "{}\n{}",
@@ -663,13 +669,25 @@ fn new_input(body: &[u8], seen: &mut std::collections::HashMap<String, usize>) -
         )
         .as_bytes(),
     );
+    let digest = |n: usize| {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(header.as_bytes());
+        for it in &items[..n] {
+            h.update(b"\n");
+            h.update(it.to_string().as_bytes());
+        }
+        hex::encode(h.finalize())
+    };
     if seen.len() > 1000 {
         seen.clear();
     }
-    let prev = seen.get(&conversation).copied().unwrap_or(0);
-    let restart = items.len() < prev || prev == 0;
-    let from = if restart { 0 } else { prev };
-    seen.insert(conversation.clone(), items.len());
+    let from = match seen.get(&conversation) {
+        Some((prev, d)) if *prev > 0 && *prev <= items.len() && digest(*prev) == *d => *prev,
+        _ => 0,
+    };
+    let restart = from == 0;
+    seen.insert(conversation.clone(), (items.len(), digest(items.len())));
     let mut out = json!({
         "conversation": &conversation[..12],
         "model": v.get("model"),
@@ -733,6 +751,22 @@ mod tests {
     fn upstream_path(p: Provider, path: &str) -> Option<String> {
         let t = Target::resolve(p, "m", &json!({}), Some("localhost:1")).ok()?;
         t.path(Api::from_path(path)?, "m", false)
+    }
+
+    #[test]
+    fn transcript_records_edits_to_history() {
+        let mut seen = Default::default();
+        let req = |msgs: Value| serde_json::to_vec(&json!({"system": "s", "messages": msgs})).unwrap();
+        let a = new_input(&req(json!(["q", "a1"])), &mut seen);
+        assert_eq!(a["new_from"], 0);
+        let b = new_input(&req(json!(["q", "a1", "t1"])), &mut seen);
+        assert_eq!(b["new_from"], 2);
+        assert_eq!(b["new"], json!(["t1"]));
+        // An earlier item rewritten in place, same length plus one.
+        let c = new_input(&req(json!(["q", "EDITED", "t1", "t2"])), &mut seen);
+        assert_eq!(c["new_from"], 0);
+        assert_eq!(c["new"], json!(["q", "EDITED", "t1", "t2"]));
+        assert_eq!(c["system"], "s");
     }
 
     #[test]

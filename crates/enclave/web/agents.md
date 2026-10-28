@@ -75,7 +75,9 @@ is written for an agent to follow, and takes one script.
    - `"provider": "azure"`, `"resource": "NAME"` (from NAME.openai.azure.com),
      `"api": "openai"` or `"anthropic"`, the resource's key, and your
      deployment name as `model`. The certificate records the model Azure
-     reports.
+     reports. A deployment can be a fine-tune and the key can't show which,
+     so Azure counts as a fine-tune: it runs only if the question allows
+     fine-tuned models.
    The region, project or resource decides whose account the requests reach,
    so whoever supplies the key supplies it too: when the auditee approves an
    auditor's cloud proposal with their own key, they give their own region,
@@ -97,8 +99,8 @@ is written for an agent to follow, and takes one script.
    served by someone other than its maker (Claude on Vertex or Bedrock, GPT
    on Azure) takes the maker out of serving it, but whoever owns the account
    still chooses what runs there: an Azure deployment name, in particular,
-   can stand for that account's own fine-tune, which the certificate warns
-   about but can't check.
+   can stand for that account's own fine-tune, so Azure runs only when the
+   question allows fine-tunes.
    To use a real coding agent instead of the built-in tools, add `"agent"`:
    `"codex"` (OpenAI's Codex CLI; any OpenAI-API model: openai, openrouter,
    GPT on bedrock or azure), `"claude-code"` (Claude Code; any Anthropic-API
@@ -229,6 +231,17 @@ Do this before uploading code or trusting a result.
    `measurements/` in the repository.
 
 The CLI does all of this: `attest verify-service https://HOST --pcrs pcrs.json`.
+
+**If a person will use the web app,** checking the service yourself doesn't
+protect them: their browser makes its own TLS connection, and whoever
+controls this address could get another certificate and serve their browser
+a different page. Have them open their link through the local client
+instead: `attest open 'https://HOST/s/ID#TOKEN'`. It does the checks above
+on every connection it opens, serves the app on `http://127.0.0.1`, and
+relays the API calls itself. Without `--pcrs` it fetches the measurements
+published in github.com/sophiawisdom/attest for the commit the server
+reports. To build it: `cargo build --release -p attest-cli` in the
+repository; reading `crates/cli/src/local.rs` first is a reasonable check.
 
 A certificate (`GET .../runs/RUN_ID/certificate`) is checkable offline. It
 embeds the enclave's boot attestation document and an ed25519 signature by

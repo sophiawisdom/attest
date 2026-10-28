@@ -482,6 +482,7 @@ pub struct ModelInfo {
     pub provider: Provider,
     pub endpoint: String,
     pub requested_model: String,
+    /// A fine-tune, or possibly one (always true for Azure deployments).
     pub fine_tuned: bool,
     /// Who proposed this model and key.
     pub proposed_by: Role,

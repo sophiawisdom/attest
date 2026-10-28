@@ -146,9 +146,14 @@ pub fn check_reported_model(approved: &str, reported: Option<&str>) -> Result<()
     }
 }
 
+/// True when the model is a fine-tune, or might be one: an Azure deployment
+/// name can stand for a fine-tuned model, and nothing a deployment's API key
+/// can reach shows which. Unknown counts as fine-tuned, so a question that
+/// doesn't allow fine-tunes can't run on Azure.
 pub fn is_fine_tuned(p: Provider, model: &str) -> bool {
     match p {
         Provider::Openai | Provider::Mock => model.starts_with("ft:"),
+        Provider::Azure => true,
         // OpenRouter does not serve customer fine-tunes; Anthropic has no
         // public fine-tune ids.
         _ => false,
