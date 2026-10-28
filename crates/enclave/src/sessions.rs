@@ -89,6 +89,8 @@ struct State {
     notify: HashMap<Role, NotifyPrefs>,
     event_counts: [u64; 2],
     disclosures: Vec<DisclosureState>,
+    /// Drafts being prepared right now (counted against the limits).
+    disclosures_in_flight: usize,
 }
 
 /// A disclosure starts as a draft only the auditee sees; publishing signs
@@ -104,6 +106,34 @@ struct DisclosureState {
 }
 
 const MAX_DISCLOSURES: usize = 100;
+/// Drafts one session may prepare at once.
+const MAX_DISCLOSURES_IN_FLIGHT: usize = 2;
+/// Content a session's drafts and published disclosures may hold in total.
+const MAX_DISCLOSURE_BYTES: usize = 16 << 20;
+
+fn disclosure_bytes(c: &DisclosureContent) -> usize {
+    match c {
+        DisclosureContent::File { text, base64, .. } => {
+            text.as_ref().map_or(0, |t| t.len()) + base64.as_ref().map_or(0, |b| b.len())
+        }
+        DisclosureContent::Python { code, stdout, stderr, files_opened, .. } => {
+            code.len()
+                + stdout.len()
+                + stderr.len()
+                + files_opened.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>()
+        }
+    }
+}
+
+/// Undoes a disclosure reservation however the request ends.
+struct DisclosureReservation(Arc<Session>);
+
+impl Drop for DisclosureReservation {
+    fn drop(&mut self) {
+        let mut st = lock(&self.0.st);
+        st.disclosures_in_flight = st.disclosures_in_flight.saturating_sub(1);
+    }
+}
 const MAX_DISCLOSED_FILE: u64 = 1 << 20;
 const MAX_SCRIPT_BYTES: usize = 100_000;
 
@@ -169,6 +199,9 @@ struct RunState {
     status: &'static str,
     steps: u32,
     trace: Vec<Value>,
+    /// Bytes in `trace` (counted in TRACE_BYTES), and whether it hit its cap.
+    trace_bytes: usize,
+    trace_full: bool,
     turns: Option<Vec<Turn>>,
     /// Everything about the finished run, for the auditee. Nothing from it
     /// reaches the auditor except through `certificate`.
@@ -220,6 +253,26 @@ fn random_hex(n: usize) -> String {
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut b);
     hex::encode(b)
 }
+
+/// A trimmed, non-empty string field of at most `max` bytes.
+fn field(v: &Value, key: &str, max: usize) -> Result<Option<String>> {
+    let s = clean(v[key].as_str());
+    if let Some(s) = &s {
+        ensure!(s.len() <= max, "{key} is over {max} bytes");
+    }
+    Ok(s)
+}
+
+const MAX_NOTE_BYTES: usize = 4000;
+const MAX_NAME_BYTES: usize = 500;
+/// Per session, so its retained state stays bounded.
+const MAX_QUESTION_VERSIONS: usize = 100;
+const MAX_MODEL_PROPOSALS: usize = 50;
+const MAX_RUNS: usize = 50;
+/// Trace kept for one run, and for all runs on the server.
+const MAX_TRACE_BYTES_PER_RUN: usize = 8 << 20;
+const MAX_TRACE_BYTES_TOTAL: usize = 2 << 30;
+static TRACE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn clean(s: Option<&str>) -> Option<String> {
     s.map(|x| x.trim().to_string()).filter(|x| !x.is_empty())
@@ -301,6 +354,11 @@ impl Store {
                 tokio::spawn(async move { b.discard().await });
             }
             st.expired = true;
+            let freed: usize = st.runs.iter().map(|r| r.trace_bytes).sum();
+            TRACE_BYTES.fetch_sub(freed.min(TRACE_BYTES.load(std::sync::atomic::Ordering::Relaxed)), std::sync::atomic::Ordering::Relaxed);
+            // The session is gone from the map; drop what it held.
+            st.runs.clear();
+            st.disclosures.clear();
         }
     }
 
@@ -518,6 +576,10 @@ impl Session {
             .validate()
             .map_err(|e| anyhow!("answer_format: {e}"))?;
         let mut st = lock(&self.st);
+        ensure!(
+            st.questions.len() < MAX_QUESTION_VERSIONS,
+            "this session has {MAX_QUESTION_VERSIONS} question versions already; start a new session"
+        );
         for q in st.questions.iter_mut().filter(|q| q.status == "proposed") {
             q.status = "superseded";
         }
@@ -566,7 +628,7 @@ impl Session {
         let version = v["version"]
             .as_u64()
             .ok_or_else(|| anyhow!("version is required"))? as u32;
-        let note = clean(v["note"].as_str());
+        let note = field(v, "note", MAX_NOTE_BYTES)?;
         let mut st = lock(&self.st);
         let q = st
             .questions
@@ -642,9 +704,9 @@ impl Session {
             "only the auditee confirms the affidavit"
         );
         let organization =
-            clean(v["organization"].as_str()).ok_or_else(|| anyhow!("organization is required"))?;
-        let repo_url = clean(v["repo_url"].as_str());
-        let git_commit = clean(v["git_commit"].as_str());
+            field(v, "organization", MAX_NAME_BYTES)?.ok_or_else(|| anyhow!("organization is required"))?;
+        let repo_url = field(v, "repo_url", MAX_NAME_BYTES)?;
+        let git_commit = field(v, "git_commit", MAX_NAME_BYTES)?;
         let tree = clean(v["tree_sha256"].as_str())
             .ok_or_else(|| anyhow!("tree_sha256 of the uploaded code is required"))?;
         let mut st = lock(&self.st);
@@ -701,7 +763,7 @@ impl Session {
             role == Role::Auditor || !api_key.is_empty(),
             "api_key is required"
         );
-        let mock_endpoint = clean(v["mock_endpoint"].as_str());
+        let mock_endpoint = field(v, "mock_endpoint", MAX_NAME_BYTES)?;
         let target = llm::Target::resolve(provider, &model, v, mock_endpoint.as_deref())?;
         if !api_key.is_empty() {
             llm::Creds::check(&target, &api_key)?;
@@ -731,6 +793,10 @@ impl Session {
         );
         let api_key_given = !api_key.is_empty();
         let mut st = lock(&self.st);
+        ensure!(
+            st.models.len() < MAX_MODEL_PROPOSALS,
+            "this session has {MAX_MODEL_PROPOSALS} model proposals already; start a new session"
+        );
         let id = st.models.len() as u32 + 1;
         // The auditee's own proposal needs no approval.
         let approved = role == Role::Auditee;
@@ -808,7 +874,7 @@ impl Session {
         let approve = v["approve"]
             .as_bool()
             .ok_or_else(|| anyhow!("approve (true/false) is required"))?;
-        let note = clean(v["note"].as_str());
+        let note = field(v, "note", MAX_NOTE_BYTES)?;
         let own_key = clean(v["api_key"].as_str());
         let mut st = lock(&self.st);
         ensure!(
@@ -886,7 +952,7 @@ impl Session {
         let release = v["release"]
             .as_bool()
             .ok_or_else(|| anyhow!("release (true/false) is required"))?;
-        let note = clean(v["note"].as_str());
+        let note = field(v, "note", MAX_NOTE_BYTES)?;
         let details = v["details"].as_bool().unwrap_or(false);
         let mut st = lock(&self.st);
         let strict = st.questions.last().map(|q| q.answer_format.is_strict());
@@ -1071,6 +1137,10 @@ impl Session {
         st: &mut State,
         spec: RunSpec,
     ) -> Result<String> {
+        ensure!(
+            st.runs.len() < MAX_RUNS,
+            "this session has had {MAX_RUNS} runs; start a new session"
+        );
         let q = st
             .questions
             .iter()
@@ -1185,6 +1255,8 @@ impl Session {
             status: "running",
             steps: 0,
             trace,
+            trace_bytes: 0,
+            trace_full: false,
             turns: None,
             full: None,
             certificate: None,
@@ -1335,17 +1407,26 @@ impl Session {
     ) -> Result<Value> {
         use base64::Engine as _;
         ensure!(role == Role::Auditee, "only the auditee discloses");
-        let bundle = {
-            let st = lock(&self.st);
+        // Reserve a place before any slow work, so concurrent requests can't
+        // all pass the limit check.
+        let (bundle, _reservation) = {
+            let mut st = lock(&self.st);
             ensure!(
-                st.disclosures.len() < MAX_DISCLOSURES,
+                st.disclosures.len() + st.disclosures_in_flight < MAX_DISCLOSURES,
                 "this session has {MAX_DISCLOSURES} disclosures already"
             );
-            st.code
+            ensure!(
+                st.disclosures_in_flight < MAX_DISCLOSURES_IN_FLIGHT,
+                "wait for the disclosures being prepared to finish"
+            );
+            let bundle = st
+                .code
                 .clone()
-                .ok_or_else(|| anyhow!("upload code first"))?
+                .ok_or_else(|| anyhow!("upload code first"))?;
+            st.disclosures_in_flight += 1;
+            (bundle, DisclosureReservation(self.clone()))
         };
-        let note = clean(v["note"].as_str());
+        let note = field(v, "note", MAX_NOTE_BYTES)?;
         ensure!(
             note.as_ref().map_or(0, |n| n.len()) <= 4000,
             "the note is over 4000 bytes"
@@ -1425,6 +1506,16 @@ impl Session {
             st.code.as_ref().is_some_and(|c| Arc::ptr_eq(c, &bundle)),
             "the code was replaced while the disclosure was being prepared; try again"
         );
+        let held: usize = st
+            .disclosures
+            .iter()
+            .map(|d| disclosure_bytes(&d.body.content))
+            .sum();
+        ensure!(
+            held + disclosure_bytes(&content) <= MAX_DISCLOSURE_BYTES,
+            "this session's disclosures would hold more than {} MiB; discard some drafts first",
+            MAX_DISCLOSURE_BYTES >> 20
+        );
         let body = DisclosureBody {
             schema: "attest/disclosure-body/v1".into(),
             session_id: self.id.clone(),
@@ -1479,6 +1570,19 @@ impl Session {
         );
         if !publish {
             d.status = "discarded";
+            // Nothing will be done with a discarded draft's content.
+            match &mut d.body.content {
+                DisclosureContent::File { text, base64, .. } => {
+                    *text = None;
+                    *base64 = None;
+                }
+                DisclosureContent::Python { code, stdout, stderr, files_opened, .. } => {
+                    code.clear();
+                    stdout.clear();
+                    stderr.clear();
+                    files_opened.clear();
+                }
+            }
             self.changed_for(&mut st, Role::Auditee);
             return Ok(json!({"number": number, "status": "discarded"}));
         }
@@ -1617,6 +1721,21 @@ impl RunJob {
                         .iter()
                         .filter(|e| e["type"] == "assistant" || e["type"] == "model_exchange")
                         .count() as u32;
+                    if r.trace_full {
+                        return;
+                    }
+                    let size: usize = entries.iter().map(|e| e.to_string().len()).sum();
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let total = TRACE_BYTES.load(Relaxed);
+                    if r.trace_bytes + size > MAX_TRACE_BYTES_PER_RUN
+                        || total + size > MAX_TRACE_BYTES_TOTAL
+                    {
+                        r.trace_full = true;
+                        r.trace.push(json!({"type": "error", "content": "the trace reached its size limit; later steps aren't recorded (the run continues)"}));
+                        return;
+                    }
+                    r.trace_bytes += size;
+                    TRACE_BYTES.fetch_add(size, Relaxed);
                     r.trace.extend(entries);
                 }
                 // No wake-up here: the ticker below wakes the auditee on a
