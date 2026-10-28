@@ -988,7 +988,13 @@ fn create_session(app: &App, req: &Request<hyper::body::Incoming>) -> Result<Res
             ));
         }
     }
-    let (s, auditee, auditor) = app.ctx.store.create()?;
+    // ?role=auditor: the starter is the auditor (the default is the auditee).
+    let creator = match req.uri().query().unwrap_or("").split('&').find_map(|kv| kv.strip_prefix("role=")) {
+        None | Some("auditee") => attest_core::Role::Auditee,
+        Some("auditor") => attest_core::Role::Auditor,
+        Some(_) => return Err(anyhow!("role must be auditee or auditor").into()),
+    };
+    let (s, auditee, auditor) = app.ctx.store.create(creator)?;
     let base = base_url(app, req);
     log(&format!("session {} created", &s.id[..8]));
     Ok(json_resp(
@@ -999,7 +1005,8 @@ fn create_session(app: &App, req: &Request<hyper::body::Incoming>) -> Result<Res
             "auditor_token": auditor,
             "auditee_link": format!("{base}/s/{}#{auditee}", s.id),
             "auditor_link": format!("{base}/s/{}#{auditor}", s.id),
-            "note": "Keep the auditee link. Send the auditor link to the auditor over a channel you trust. Anyone with a link acts as that party.",
+            "creator": creator,
+            "note": "Keep your own link. Send the other party theirs over a channel you trust; your session page keeps showing it. Anyone with a link acts as that party.",
         }),
     ))
 }
@@ -1154,6 +1161,9 @@ async fn session_route(
             if role != attest_core::Role::Auditee {
                 return Err(anyhow!("only the auditee uploads code").into());
             }
+            // Where the auditee says the code comes from (recorded as their claim).
+            let header = |k: &str| req.headers().get(k).and_then(|h| h.to_str().ok()).map(str::trim).filter(|v| !v.is_empty() && v.len() <= 300).map(String::from);
+            let source = sessions::CodeSource::Upload { repo_url: header("x-attest-repo-url"), git_commit: header("x-attest-git-commit") };
             crate::budget::ensure_room(sessions::UPLOAD_ALLOWANCE).map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
             // The upload runs in its own task, which holds the upload slot
             // until the parser has exited, even if this client disconnects.
@@ -1169,7 +1179,7 @@ async fn session_route(
             })
             .await
             .map_err(|_| anyhow!("upload failed"))??;
-            ok(s.set_code(ctx, role, bundle)?)
+            ok(s.set_code(ctx, role, bundle, source)?)
         }
         ("POST", ["code", "github"]) => {
             if role != attest_core::Role::Auditee {
@@ -1202,12 +1212,10 @@ async fn session_route(
             })
             .await
             .map_err(|_| anyhow!("import failed"))??;
-            let mut out = s.set_code(ctx, role, bundle)?;
-            s.note_source(ctx, &format!("Code imported from GitHub: {repo} at commit {commit} ({r})."));
+            let mut out = s.set_code(ctx, role, bundle, sessions::CodeSource::Github { repo: repo.clone(), commit: commit.clone() })?;
             out["github"] = json!({"repo": repo, "ref": r, "commit": commit});
             ok(out)
         }
-        ("POST", ["affidavit"]) => ok(s.confirm_affidavit(ctx, role, &body_json(req).await?)?),
         ("POST", ["models"]) => ok(s.propose_model(ctx, role, &body_json(req).await?)?),
         ("POST", ["models", mid, "decision"]) => {
             let mid: u32 = mid.parse().map_err(|_| anyhow!("bad model id"))?;

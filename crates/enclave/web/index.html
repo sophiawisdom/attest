@@ -245,37 +245,60 @@ function landing() {
     <h1>Answer questions about your code without showing it.</h1>
     <p class="lead">An auditor asks a question. A model reads your code inside an attested AWS Nitro enclave and answers. You watch everything it does and decide whether the auditor sees the answer. Neither side sees the other's API key. Apart from you, only the model provider you approve receives the code.</p>
     <div class="steps3">
-      <div class="panel s"><b>1. Start a session</b><span class="muted small">You get two private links. Send the auditor theirs over a channel you already trust, such as Signal.</span></div>
-      <div class="panel s"><b>2. Agree on the question</b><span class="muted small">The auditor asks; you accept, connect your code, confirm an affidavit, and approve the model.</span></div>
+      <div class="panel s"><b>1. Start a session</b><span class="muted small">Either side can start. Your session page shows a link to send the other party over a channel you already trust, such as Signal.</span></div>
+      <div class="panel s"><b>2. Agree on the question</b><span class="muted small">The auditor asks; the auditee accepts, connects their code, and approves the model.</span></div>
       <div class="panel s"><b>3. Release or decline</b><span class="muted small">You read the result and the full transcript first. The auditor gets a signed certificate if you release it.</span></div>
     </div>
     <div id="created">${S.info && S.info.open === false
       ? `<div class="stack"><p class="small muted">This server is private: only its operator starts sessions. Anyone the operator sends a session link to can take part.</p>
-        <div class="row"><input type="password" id="opKey" placeholder="Operator key" autocomplete="off" style="max-width:320px"><button class="btn primary big" data-act="create">Start a session</button></div></div>`
-      : `<div class="row"><button class="btn primary big" data-act="create">Start a session</button><span class="faint small">You'll be the auditee (the party whose code is examined).</span></div>`}</div>
+        <input type="password" id="opKey" placeholder="Operator key" autocomplete="off" style="max-width:320px">${startButtons()}</div>`
+      : startButtons()}</div>
     ${S.info?.operator ? `<p class="small muted" id="notice">Operated by <b>${esc(S.info.operator)}</b>.</p>` : ""}
     <div class="foot"><a href="/agents.md">Guide for agents</a><a href="https://github.com/sophiawisdom/attest" target="_blank" rel="noopener">Source on GitHub</a><a href="#" data-act="show-verify">Verify this service</a></div>
     <div id="landingVerify"></div>
   </div>`;
 }
+function startButtons() {
+  return `<div class="stack" style="gap:8px"><b>Start a session as</b>
+    <div class="row"><button class="btn primary big" data-act="create" data-role="auditor">The auditor</button><button class="btn primary big" data-act="create" data-role="auditee">The auditee</button></div>
+    <span class="faint small">The auditor asks the question. The auditee owns the code and decides what the auditor sees.</span></div>`;
+}
 async function createSession(btn) {
   await busy(btn, async () => {
-    const key = val("opKey").trim();
-    const r = await api("/api/sessions", { method: "POST", body: {}, extra: key ? { "x-operator-key": key } : undefined });
-    $("#created").innerHTML = `<div class="panel pad stack">
-      <h2>Session created</h2>
-      <div class="callout warn"><span class="ic">!</span><span>Save both links now. They can't be shown again, and anyone with a link acts as that party.</span></div>
-      <label class="f">Your link (auditee, keep private)<div class="linkbox"><input type="text" readonly value="${esc(r.auditee_link)}"><button class="btn" data-copy="${esc(r.auditee_link)}">Copy</button></div></label>
-      <label class="f">Auditor's link (send this to them)<div class="linkbox"><input type="text" readonly value="${esc(r.auditor_link)}"><button class="btn" data-copy="${esc(r.auditor_link)}">Copy</button></div></label>
-      <div class="row"><a class="btn primary" href="${esc(LOCAL ? location.origin + new URL(r.auditee_link).pathname + new URL(r.auditee_link).hash : r.auditee_link)}">Open my session</a></div>
-    </div>`;
+    const key = val("opKey").trim(), role = btn.dataset.role;
+    const r = await api(`/api/sessions?role=${role}`, { method: "POST", body: {}, extra: key ? { "x-operator-key": key } : undefined });
+    // Your own session page (same origin), which shows the other party's link.
+    location.href = `/s/${r.session_id}#${role === "auditor" ? r.auditor_token : r.auditee_token}`;
   });
+}
+
+// The other party's token, derived from the creator's (sessions.rs invite_token).
+async function inviteToken(token) {
+  if (!crypto.subtle) return null;
+  const k = await crypto.subtle.importKey("raw", new TextEncoder().encode(token), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", k, new TextEncoder().encode("attest-invite/1"));
+  return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+async function renderInvite(v) {
+  const box = document.getElementById("invite");
+  box.hidden = !v.creator || v.creator !== v.role;
+  if (box.hidden) return;
+  S.invite ??= await inviteToken(S.token);
+  const other = v.role === "auditee" ? "auditor" : "auditee";
+  const joined = other === "auditor" && v.auditor_joined;
+  if (!S.invite) return patch("invite", `<div class="pad small muted">This browser can't compute the ${other}'s link here; open the session over https or with <code>attest open</code>.</div>`);
+  const link = `${ORIGIN}/s/${S.sid}#${S.invite}`;
+  patch("invite", `<div class="pad stack" style="gap:8px">
+    <div class="row"><b>Link for the ${other}</b>${joined ? `<span class="pill ok">opened</span>` : ""}</div>
+    <span class="small muted">Send it to them over a channel you already trust, such as Signal. Anyone with this link acts as the ${other}. Keep your own link (this page's address) private.</span>
+    <div class="linkbox"><input type="text" readonly value="${esc(link)}"><button class="btn" data-copy="${esc(link)}">Copy</button></div></div>`);
 }
 
 // ---------------------------------------------------------------- session shell
 function sessionShell() {
   $("#app").innerHTML = `<div class="grid">
     <div class="col">
+      <div class="panel" id="invite"></div>
       <div class="panel" id="banner"></div>
       <section class="panel" id="cQuestion"></section>
       <section class="panel" id="cCode"></section>
@@ -306,7 +329,7 @@ function render() {
   $("#who").innerHTML = `<span class="pill"><b>${isAuditee() ? "Auditee" : "Auditor"}</b> · session ${esc(v.session_id.slice(0, 8))}</span>`;
   const running = v.runs.some(r => r.status === "running");
   patch("banner", `<div class="banner"><i class="dot ${running ? "run" : v.next_actions.length ? "warn" : "ok"}"></i><div class="say">${esc(v.status)}</div></div>`);
-  renderQuestion(v); renderCode(v); renderModel(v); renderRuns(v); renderDisclosures(v); renderActivity(v); renderNotify(v);
+  renderInvite(v); renderQuestion(v); renderCode(v); renderModel(v); renderRuns(v); renderDisclosures(v); renderActivity(v); renderNotify(v);
   patch("cVerify", verifyPanel());
 }
 
@@ -352,48 +375,34 @@ function renderQuestion(v) {
   patch("cQuestion", head(1, "Question", q?.status === "accepted") + `<div class="pad stack">${body}</div>`);
 }
 
-// ---------------------------------------------------------------- code & affidavit
+// ---------------------------------------------------------------- tools
 function renderCode(v) {
   const c = v.code, a = v.affidavit, cur = a?.current;
   let body = "";
   if (c && isAuditee()) body += `<div class="pills"><span class="pill"><b>${num(c.file_count)}</b> files</span><span class="pill"><b>${bytes(c.total_bytes)}</b></span><span class="pill">tree ${hash(c.tree_sha256)}</span><span class="pill">${esc(ago(c.uploaded_at_ms))}</span></div>`;
   else if (c) body += `<div class="pills"><span class="pill">commitment ${hash(c.commitment_sha256)}</span><span class="pill">${esc(ago(c.uploaded_at_ms))}</span></div><p class="small muted">Size and tree hash stay hidden until a result is released; the certificate opens the commitment.</p>`;
+  if (c && cur) body += `<p class="small">${esc(a.record.statement)}</p>`;
   if (isAuditee()) {
     const link = `${ORIGIN}/s/${S.sid}#${S.token}`;
     const cmd = `attest upload '${link}' ~/path/to/repo`;
-    const tokenOk = LOCAL || S.info?.mode === "dev";
-    body += `<details data-keep="gh-${c ? c.tree_sha256 : "none"}" ${c ? "" : "open"}><summary>${c ? "Replace the code from GitHub" : "Connect a GitHub repository"}</summary><div class="stack" style="margin-top:10px">
-      <p class="small muted">The enclave fetches the repository from GitHub itself, over its own encrypted connection. The token is used for that one download and never stored; the auditor, the operator and the model never see it. Use a fine-grained token with read-only access to contents of this one repository. Public repositories need no token.</p>
+    const checked = LOCAL || S.info?.mode === "dev";
+    body += `<details data-keep="gh-${c ? c.tree_sha256 : "none"}" ${c ? "" : "open"}><summary>${c ? "Replace the code from GitHub" : "GitHub repository"}</summary><div class="stack" style="margin-top:10px">
+      <p class="small muted">The enclave fetches the repository from GitHub itself, and the certificate records the repository and commit it got. The token is used for that one download and never stored; the auditor and the model never see it.</p>
       <div class="grid2"><label class="f">Repository<input type="text" id="ghRepo" placeholder="owner/name"></label><label class="f">Branch, tag or commit<input type="text" id="ghRef" placeholder="main"></label></div>
-      ${tokenOk
-        ? `<label class="f">Read-only token (private repositories)<input type="password" id="ghToken" autocomplete="off" placeholder="github_pat_…"></label>`
-        : `<p class="small muted">Private repository? Enter tokens only where your computer has checked the enclave: open this session with <code>attest open</code> first (or have your agent do it):</p>
-           <div class="linkbox"><input type="text" readonly value="${esc(openCmd())}"><button class="btn" data-copy="${esc(openCmd())}">Copy</button></div>`}
+      <label class="f">Token (private repositories only)<input type="password" id="ghToken" autocomplete="off" placeholder="github_pat_…">
+        <span class="hint">Make one at <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">github.com/settings/personal-access-tokens/new</a>: under Repository access pick only this repository; under Permissions set Contents to read-only. Give it a short expiry.</span></label>
+      ${checked ? "" : `<details><summary class="small">This browser hasn't checked the enclave</summary><div class="stack" style="margin-top:8px">
+        <p class="small muted">A browser can't confirm it's talking to the attested enclave rather than to whoever controls this address. To have your computer check before you paste a token, open the session with <code>attest open</code>:</p>
+        <div class="linkbox"><input type="text" readonly value="${esc(openCmd())}"><button class="btn" data-copy="${esc(openCmd())}">Copy</button></div></div></details>`}
       <div class="row"><button class="btn primary" data-act="github">Import from GitHub</button></div></div></details>`;
     body += `<details data-keep="upload-${c ? c.tree_sha256 : "none"}"><summary>Or upload files</summary><div class="stack" style="margin-top:10px">
-      <p class="small muted">Recommended: the CLI sends exactly your git-tracked files and checks the enclave's attestation first.</p>
+      <p class="small muted">An upload can't be checked against a repository, so the certificate says the auditee uploaded it. The CLI sends exactly your git-tracked files, records the repository and commit you say they are, and checks the enclave first.</p>
       <div class="linkbox"><input type="text" readonly value="${esc(cmd)}"><button class="btn" data-copy="${esc(cmd)}">Copy</button></div>
       <p class="small muted">Or choose a folder here. Everything in it is sent except <code>.git</code>, including untracked files.</p>
       <label class="drop"><input type="file" id="folder" webkitdirectory multiple hidden><b>Choose a folder</b></label>
       <div id="upStatus"></div></div></details>`;
-    if (c) {
-      if (cur) body += `<div class="stack" style="gap:6px"><h3>Affidavit (confirmed)</h3><p class="quote serif">${esc(a.record.statement)}</p></div>`;
-      else body += `<div class="stack" data-keep="aff-${c.tree_sha256}"><h3>Affidavit</h3>
-        <div class="grid2"><label class="f">Organization<input type="text" id="aOrg" placeholder="Example Lab"></label><label class="f">Repository URL<input type="text" id="aRepo" placeholder="https://github.com/example/monorepo"></label></div>
-        <label class="f">Commit<input type="text" id="aCommit" placeholder="git rev-parse HEAD"></label>
-        <p class="quote serif" id="aStmt">${esc(statement("", c.commitment_sha256, "", ""))}</p>
-        <label class="check"><input type="checkbox" id="aSign"><span>I confirm this statement.</span></label>
-        <div class="row"><button class="btn primary" data-act="affidavit" data-tree="${c.tree_sha256}" data-commit="${c.commitment_sha256}">Confirm affidavit</button><span class="faint small">The auditor sees it, and it goes in every certificate.</span></div></div>`;
-    }
-  } else {
-    if (!c) body += `<p class="muted">Waiting for the auditee to upload code. You'll see a commitment to it; its size and hash come with a released certificate, its contents never.</p>`;
-    else if (cur) body += `<div class="stack" style="gap:6px"><h3>Auditee's affidavit</h3><p class="quote serif">${esc(a.record.statement)}</p></div>`;
-    else body += `<p class="muted">Waiting for the auditee to confirm the affidavit.</p>`;
-  }
-  patch("cCode", head(2, "Code and affidavit", !!(c && cur)) + `<div class="pad stack">${body}</div>`);
-}
-function statement(org, commitment, repo, commit) {
-  return `On behalf of ${org || "(organization)"}, I affirm that the code uploaded to this session (code commitment ${commitment}, opened in each released certificate) is a complete and unmodified copy of ${repo || "(repository not named)"} at commit ${commit || "(commit not named)"}, which is the source currently used in production for the systems the question concerns, and that no content in it was added, modified, or arranged with the intent of influencing the outcome of this or any automated audit.`;
+  } else if (!c) body += `<p class="muted">Waiting for the auditee to connect their code. You'll see a commitment to it; its size and hash come with a released certificate, its contents never.</p>`;
+  patch("cCode", head(2, "Connect tools", !!(c && cur)) + `<div class="pad stack">${body}</div>`);
 }
 
 // ---------------------------------------------------------------- model
@@ -517,7 +526,7 @@ function traceHtml(entries) {
 function renderRuns(v) {
   const runs = [...v.runs].reverse();
   let body;
-  if (!runs.length) body = `<div class="pad"><p class="muted">The agent starts automatically once the question is accepted, the code and affidavit are in, and a model is approved.</p></div>`;
+  if (!runs.length) body = `<div class="pad"><p class="muted">The agent starts automatically once the question is accepted, the code is connected, and a model is approved.</p></div>`;
   else body = runs.map(r => runHtml(v, r)).join("");
   patch("cRuns", head(4, "Agent runs", runs.some(r => r.status === "released"), `<span class="faint small">${runs.length || ""}</span>`) + body);
   for (const r of runs) if (isAuditee()) patch("tx-" + r.id, traceHtml(S.traces[r.id]?.entries || []));
@@ -658,10 +667,6 @@ document.addEventListener("click", async (e) => {
     "q-accept": () => sapi("/question/decision", { method: "POST", body: { version: Number(b.dataset.v), accept: true, note: val("qNote") } }),
     "q-reject": () => sapi("/question/decision", { method: "POST", body: { version: Number(b.dataset.v), accept: false, note: val("qNote") } }),
     "github": () => sapi("/code/github", { method: "POST", timeout: 15 * 60 * 1000, body: { repo: val("ghRepo").trim(), ref: val("ghRef").trim() || undefined, token: val("ghToken").trim() || undefined } }),
-    "affidavit": () => {
-      if (!$("#aSign").checked) throw new Error("Tick the box to confirm the statement.");
-      return sapi("/affidavit", { method: "POST", body: { organization: val("aOrg"), repo_url: val("aRepo"), git_commit: val("aCommit"), tree_sha256: b.dataset.tree } });
-    },
     "propose-model": () => sapi("/models", { method: "POST", body: { provider: $("#mProv [aria-pressed=true]").dataset.p, model: val("mModel"), api_key: val("mKey"), openrouter_zdr: $("#mZdr")?.checked, openrouter_only: (val("mOnly") || "").split(",").map(s => s.trim()).filter(Boolean), mock_endpoint: val("mMock"), agent: val("mAgent") || "builtin", ...cloudValues("m") } }),
     "m-approve": () => sapi(`/models/${b.dataset.id}/decision`, { method: "POST", body: { approve: true, api_key: val("ak-" + b.dataset.id) || undefined, accept_auditor_account: $("#acc-" + b.dataset.id)?.checked || false, ...cloudValues("a" + b.dataset.id) } }),
     "m-reject": () => sapi(`/models/${b.dataset.id}/decision`, { method: "POST", body: { approve: false } }),
@@ -688,12 +693,6 @@ document.addEventListener("change", (e) => {
   if (e.target.id === "dKind") $$("[data-dfor]").forEach(el => el.hidden = el.dataset.dfor !== e.target.value);
 });
 new MutationObserver(() => { if ($("#qFormat")) syncFormatFields(); }).observe(document.documentElement, { childList: true, subtree: true });
-document.addEventListener("input", (e) => {
-  if (["aOrg", "aRepo", "aCommit"].includes(e.target.id)) {
-    const cm = $("[data-act=affidavit]")?.dataset.commit || "";
-    $("#aStmt").textContent = statement(val("aOrg"), cm, val("aRepo"), val("aCommit"));
-  }
-});
 document.addEventListener("change", async (e) => {
   if (e.target.id !== "folder") return;
   const all = [...e.target.files].filter(f => !f.webkitRelativePath.split("/").includes(".git"));

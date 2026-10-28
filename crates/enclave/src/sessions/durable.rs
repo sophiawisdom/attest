@@ -69,6 +69,7 @@ struct SnapshotRef<'a> {
     id: &'a str,
     created_at_ms: u64,
     token_hashes: &'a [String; 2],
+    creator: Option<Role>,
     versions: [u64; 2],
     auditor_joined: bool,
     questions: &'a Vec<Question>,
@@ -88,6 +89,8 @@ struct Snapshot {
     id: String,
     created_at_ms: u64,
     token_hashes: [String; 2],
+    #[serde(default)]
+    creator: Option<Role>,
     versions: [u64; 2],
     auditor_joined: bool,
     questions: Vec<Question>,
@@ -215,6 +218,7 @@ impl Session {
                 id: &self.id,
                 created_at_ms: self.created_at_ms,
                 token_hashes: &self.token_hashes,
+                creator: self.creator,
                 versions: st.versions,
                 auditor_joined: st.auditor_joined,
                 questions: &st.questions,
@@ -576,6 +580,7 @@ async fn restore_session(ctx: &Arc<Ctx>, sid: &str, head_ref: &str) -> Result<Ar
         id: snap.id,
         created_at_ms: snap.created_at_ms,
         token_hashes: snap.token_hashes,
+        creator: snap.creator,
         tx: [
             watch::channel(st.versions[0]).0,
             watch::channel(st.versions[1]).0,

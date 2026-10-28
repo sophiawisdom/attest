@@ -45,7 +45,10 @@ def main():
         events = [e["text"] for e in view.get("events", [])]
         check(any("sophiawisdom/attest" in t for t in events), "the auditee is told where it came from")
         aud = ok(PORT, "GET", f"/api/sessions/{sid}", ao)
-        check(not any("sophiawisdom/attest" in e["text"] for e in aud.get("events", [])), "the auditor isn't told the repository")
+        rec = aud["affidavit"]["record"]
+        check(rec["fetched_by_enclave"] and rec["repo_url"] == "https://github.com/sophiawisdom/attest" and rec["git_commit"] == v["github"]["commit"],
+              "both sides see the repository and commit the enclave fetched")
+        check(aud["status"] != "" and not any(a["action"] == "confirm_affidavit" for a in view["next_actions"]), "no affidavit step")
         print("ALL GITHUB CHECKS PASSED")
     except SystemExit:
         print(open(log).read()[-2000:])

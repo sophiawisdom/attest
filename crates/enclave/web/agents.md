@@ -18,10 +18,12 @@ is written for an agent to follow, and takes one script.
 
 ## Roles and links
 
-- `POST /api/sessions` creates a session and returns two links:
-  `https://HOST/s/SESSION_ID#TOKEN`. The auditee keeps one link and sends the
-  other to the auditor over a channel they already trust (for example
-  Signal). There are no accounts or long-term keys. Whoever holds a link acts
+- `POST /api/sessions?role=auditor` (or `role=auditee`, the default) creates
+  a session started by that party and returns two links,
+  `https://HOST/s/SESSION_ID#TOKEN`. The starter keeps theirs and sends the
+  other over a channel they already trust (for example Signal). The other
+  link's token is HMAC-SHA256(starter's token, "attest-invite/1") in hex, so
+  the starter can always rebuild it; the view's `creator` names the starter. There are no accounts or long-term keys. Whoever holds a link acts
   as that party. If `GET /api/info` shows `"open": false`, the server is
   private: only its operator starts sessions, sending the operator key as
   the header `x-operator-key`. Anyone given a link takes part.
@@ -59,20 +61,22 @@ is written for an agent to follow, and takes one script.
    repository) is used for those requests and never stored. Send a token
    only over a connection you checked ends in the enclave (`attest open`, or
    your own attestation check; see "Verifying this service"). The response
-   adds `github.commit`, and only the auditee is told the repository. Or
-   upload: `PUT /api/sessions/ID/code` with a tar archive
-   body (regular files only; no links). `attest upload LINK DIR` from the
-   repository's CLI sends git-tracked files and checks the enclave first. The
+   adds `github.commit`. The session's source record (`affidavit` in views
+   and certificates) states the repository and commit as fetched by the
+   enclave, with `fetched_by_enclave: true`. Or upload:
+   `PUT /api/sessions/ID/code` with a tar archive body (regular files only;
+   no links), optionally with headers `x-attest-repo-url` and
+   `x-attest-git-commit`, recorded as the auditee's unchecked claim.
+   `attest upload LINK DIR` from the repository's CLI sends git-tracked
+   files, sets those headers from git, and checks the enclave first. The
    response includes `tree_sha256`, a hash of every (path, content) pair, and
    `commitment_sha256`, a salted hash of the tree. Before a result is
    released the auditor sees only the commitment, not the tree hash, file
    count or size. A certificate opens it only if the auditee releases the
-   run details (step 8).
-4. The auditee confirms the affidavit: `POST /api/sessions/ID/affidavit`
-   `{"organization": "...", "repo_url": "...", "git_commit": "...", "tree_sha256": "..."}`.
-   The statement says the upload is the production code at that commit, and
-   that nothing in it was arranged to influence the audit.
-5. Either party proposes a model: `POST /api/sessions/ID/models`
+   run details (step 7).
+   Who the auditee is, and anything they vouch for, is settled between the
+   parties outside the session.
+4. Either party proposes a model: `POST /api/sessions/ID/models`
    `{"provider": "anthropic"|"openai"|"openrouter"|"bedrock"|"vertex"|"azure", "model": "...", "api_key": "...", "openrouter_zdr": true}`.
    The clouds that serve Anthropic's and OpenAI's models work directly too,
    so the model's maker needn't run the servers:
@@ -127,19 +131,19 @@ is written for an agent to follow, and takes one script.
    from the auditee. Keys are never shown to anyone. The code is sent to the
    chosen provider under the key owner's terms (for example zero data
    retention).
-6. A run starts automatically once the latest question is accepted, the code
-   and affidavit are in place, and a model is approved. The built-in agent
+5. A run starts automatically once the latest question is accepted, the code
+   is in place, and a model is approved. The built-in agent
    has read-only tools: `list_dir`, `find_files`, `read_file`, `grep`,
    `python` (a sandbox with the code read-only at `/repo`), and
    `submit_verdict`. It has no shell and no network access. Its system prompt
-   is fixed in the image (hash in `/api/info`). The jailed agents (step 5)
+   is fixed in the image (hash in `/api/info`). The jailed agents (step 4)
    get a shell instead.
-7. The run ends with a verdict: `yes`, `no`, `inconclusive`, or
+6. The run ends with a verdict: `yes`, `no`, `inconclusive`, or
    `needs_clarification` (with a `clarification_request` for the auditor).
-8. The auditee decides: `POST /api/sessions/ID/runs/RUN_ID/release`
+7. The auditee decides: `POST /api/sessions/ID/runs/RUN_ID/release`
    `{"release": true|false, "details": false, "note": "optional"}`. On release
    the auditor sees the verdict and can fetch the signed certificate. By
-   default it is verdict-only: the question, the affidavit, the agreed model
+   default it is verdict-only: the question, the code's source record, the agreed model
    and harness, run and question counts, whether the code changed between
    runs, and the verdict. Nothing else the code or the model could have
    shaped: no run times, no tree hash or code size (the commitment stays
@@ -148,18 +152,18 @@ is written for an agent to follow, and takes one script.
    auditor sees that it was declined, and the note. A new run doesn't start
    while one awaits this decision. The auditee can fetch a certificate of
    the full record at any time from the same `certificate` route.
-9. After that decision, the auditor can send a follow-up message that
+8. After that decision, the auditor can send a follow-up message that
    continues the same conversation: `POST /api/sessions/ID/runs/RUN_ID/followup`
    `{"text": "...", "blinded": false}`. A blinded message is hidden from the
    auditee, who sees only that one was sent. The auditee still sees
    everything the agent does in response, and still decides on release. The
    certificate records each message's hash, and its text if not blinded.
-10. Notifications. Agents poll (below). People can get email:
+9. Notifications. Agents poll (below). People can get email:
     `POST /api/sessions/ID/notify` `{"email": "..."}`, if `email_available`.
     A new address first gets one confirmation email from Amazon SES, and
     nothing else is sent to it until it is confirmed (`notify.email_status`).
     Emails say only that something happened in the session.
-11. Disclosures (auditee, any time after uploading code). The auditee can show
+10. Disclosures (auditee, any time after uploading code). The auditee can show
     the auditor a file, or what a Python script prints when run over the code
     in the enclave's sandbox (code read-only at `/repo`, no network, 60 s):
     `POST /api/sessions/ID/disclosures` with
@@ -199,7 +203,7 @@ over, and `response` the provider's reply), and the agent's own log.
 |---|---|---|
 | question and its versions, decisions, notes | yes | yes |
 | code | metadata only (it's theirs) | a salted commitment only, opened only if the auditee releases run details |
-| affidavit | yes | yes |
+| code source record (repository and commit) | yes | yes |
 | model proposals (provider, model, who proposed) | yes | yes |
 | API keys | never | never |
 | live agent trace | yes | no |
@@ -275,6 +279,7 @@ Everything else is disclosed rather than enforced, and the certificate records i
   repository and over the files the agent read.
 
 The auditee controls every byte the agent reads. A verdict means "a model
-reading auditee-supplied code concluded X", backed by the affidavit. If the
+reading auditee-supplied code concluded X". When the enclave fetched the
+code from GitHub, the certificate names the repository and commit it got. If the
 auditee's own company runs the model endpoint, it also controls which model
 answered. The certificate says so.

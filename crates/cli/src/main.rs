@@ -76,9 +76,8 @@ enum Cmd {
         /// Your auditee session link (https://HOST/s/ID#TOKEN).
         link: String,
         dir: PathBuf,
-        /// Also confirm the affidavit, on behalf of this organization.
-        #[arg(long)]
-        org: Option<String>,
+        /// Recorded as where you say the code comes from (the enclave can't
+        /// check an upload; import from GitHub for a checked record).
         /// Defaults to `git remote get-url origin`.
         #[arg(long)]
         repo_url: Option<String>,
@@ -271,10 +270,24 @@ impl Conn {
         token: Option<&str>,
         body: Option<(Vec<u8>, &str)>,
     ) -> Result<Value> {
+        self.call_with(method, path, token, body, &[]).await
+    }
+
+    async fn call_with(
+        &mut self,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: Option<(Vec<u8>, &str)>,
+        headers: &[(&str, String)],
+    ) -> Result<Value> {
         let mut req = hyper::Request::builder()
             .method(method)
             .uri(path)
             .header("host", &self.host);
+        for (k, v) in headers {
+            req = req.header(*k, v);
+        }
         if let Some(t) = token {
             req = req.header("authorization", format!("Bearer {t}"));
         }
@@ -386,7 +399,6 @@ async fn main() -> Result<()> {
         Cmd::Upload {
             link,
             dir,
-            org,
             repo_url,
             git_commit,
             allow_dirty,
@@ -425,12 +437,20 @@ async fn main() -> Result<()> {
                 files.len(),
                 total
             );
+            let mut claims = Vec::new();
+            if let Some(u) = repo_url.or(git.remote) {
+                claims.push(("x-attest-repo-url", u));
+            }
+            if let Some(h) = git_commit.or(git.head) {
+                claims.push(("x-attest-git-commit", h));
+            }
             let r = c
-                .call(
+                .call_with(
                     "PUT",
                     &format!("/api/sessions/{sid}/code"),
                     Some(&token),
                     Some((tar, "application/x-tar")),
+                    &claims,
                 )
                 .await?;
             if r["tree_sha256"] != json!(tree) {
@@ -440,31 +460,6 @@ async fn main() -> Result<()> {
                 );
             }
             println!("uploaded: tree {tree} ({} files)", files.len());
-            match org {
-                Some(org) => {
-                    let body = json!({
-                        "organization": org,
-                        "repo_url": repo_url.or(git.remote),
-                        "git_commit": git_commit.or(git.head),
-                        "tree_sha256": tree,
-                    });
-                    let a = c
-                        .call(
-                            "POST",
-                            &format!("/api/sessions/{sid}/affidavit"),
-                            Some(&token),
-                            Some((serde_json::to_vec(&body)?, "application/json")),
-                        )
-                        .await?;
-                    println!(
-                        "affidavit confirmed:\n  {}",
-                        a["statement"].as_str().unwrap_or("")
-                    );
-                }
-                None => println!(
-                    "next: confirm the affidavit in the web page, or rerun with --org \"Your Org\""
-                ),
-            }
         }
 
         Cmd::Open {
@@ -555,12 +550,7 @@ async fn main() -> Result<()> {
                 m.session_id, m.run_id, m.run_number
             );
             println!("question  v{}: {}", m.question.version, m.question.text);
-            println!(
-                "auditee   {} — {} @ {}",
-                m.affidavit.organization,
-                m.affidavit.repo_url.as_deref().unwrap_or("-"),
-                m.affidavit.git_commit.as_deref().unwrap_or("-")
-            );
+            println!("source    {}", m.affidavit.statement);
             if m.verdict_only() {
                 println!("code      commitment {} (not opened: verdict-only release)", m.code.commitment_sha256);
             } else {

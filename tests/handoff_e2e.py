@@ -140,7 +140,7 @@ def run(work, enclave):
     sid, ae, ao = s["session_id"], s["auditee_token"], s["auditor_token"]
     ok(A, "POST", f"/api/sessions/{sid}/question", ao, {"text": "Does trainer/train.py compute loss on chain-of-thought tokens?"})
     ok(A, "POST", f"/api/sessions/{sid}/question/decision", ae, {"version": 1, "accept": True})
-    up = subprocess.run([os.path.join(BIN, "attest"), "upload", f"http://127.0.0.1:{A}/s/{sid}#{ae}", repo, "--org", "Example Lab", "--allow-dev"],
+    up = subprocess.run([os.path.join(BIN, "attest"), "upload", f"http://127.0.0.1:{A}/s/{sid}#{ae}", repo, "--allow-dev"],
                         capture_output=True, text=True)
     check(up.returncode == 0, "code uploaded to A")
     ok(A, "POST", f"/api/sessions/{sid}/models", ae, {"provider": "mock", "model": "gpt-mock", "api_key": "test-key", "mock_endpoint": f"127.0.0.1:{MOCK}"})
@@ -213,7 +213,7 @@ def run(work, enclave):
     sid2, ae2, ao2 = s2["session_id"], s2["auditee_token"], s2["auditor_token"]
     ok(B, "POST", f"/api/sessions/{sid2}/question", ao2, {"text": "SLOW: does trainer/train.py compute loss on chain-of-thought tokens?"})
     ok(B, "POST", f"/api/sessions/{sid2}/question/decision", ae2, {"version": 1, "accept": True})
-    up = subprocess.run([os.path.join(BIN, "attest"), "upload", f"http://127.0.0.1:{B}/s/{sid2}#{ae2}", repo, "--org", "Example Lab", "--allow-dev"],
+    up = subprocess.run([os.path.join(BIN, "attest"), "upload", f"http://127.0.0.1:{B}/s/{sid2}#{ae2}", repo, "--allow-dev"],
                         capture_output=True, text=True)
     check(up.returncode == 0, "code uploaded to B")
     ok(B, "POST", f"/api/sessions/{sid2}/models", ae2, {"provider": "mock", "model": "gpt-mock", "api_key": "test-key", "mock_endpoint": f"127.0.0.1:{MOCK}"})

@@ -99,6 +99,9 @@ pub struct Session {
     pub id: String,
     pub created_at_ms: u64,
     token_hashes: [String; 2],
+    /// The role of whoever started the session. Their page shows the other
+    /// party's link, derived from their own token (`invite_token`).
+    pub creator: Option<Role>,
     st: Mutex<State>,
     /// Bumped on every change, so long-polls can wait for one.
     /// Change counters, one per role: [auditee, auditor]. Private changes
@@ -338,6 +341,14 @@ fn ri(role: Role) -> usize {
     }
 }
 
+/// The other party's token, derived from the creator's: the creator's page
+/// can always show the link to send, and no plaintext token is stored. The
+/// invitee's token reveals nothing about the creator's.
+pub fn invite_token(creator_token: &str) -> String {
+    let k = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, creator_token.as_bytes());
+    hex::encode(ring::hmac::sign(&k, b"attest-invite/1").as_ref())
+}
+
 fn random_hex(n: usize) -> String {
     let mut b = vec![0u8; n];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut b);
@@ -509,7 +520,9 @@ impl Store {
         }
     }
 
-    pub fn create(&self) -> Result<(Arc<Session>, String, String)> {
+    /// A new session started by `creator`; returns the auditee's and the
+    /// auditor's tokens.
+    pub fn create(&self, creator: Role) -> Result<(Arc<Session>, String, String)> {
         self.sweep();
         let now = now_ms();
         let max = crate::budget::max_sessions();
@@ -531,8 +544,12 @@ impl Store {
             "this server is at its session limit; try again later"
         );
         crate::budget::ensure_room(SESSION_ALLOWANCE)?;
-        let auditee = random_hex(32);
-        let auditor = random_hex(32);
+        let mine = random_hex(32);
+        let theirs = invite_token(&mine);
+        let (auditee, auditor) = match creator {
+            Role::Auditee => (mine, theirs),
+            Role::Auditor => (theirs, mine),
+        };
         let tx = [watch::channel(0).0, watch::channel(0).0];
         let s = Arc::new(Session {
             id: random_hex(16),
@@ -541,6 +558,7 @@ impl Store {
                 sha256_hex(auditee.as_bytes()),
                 sha256_hex(auditor.as_bytes()),
             ],
+            creator: Some(creator),
             st: Mutex::new(State::default()),
             tx,
             dirty: AtomicBool::new(true),
@@ -833,92 +851,31 @@ impl Session {
 
     /// Tell the auditee where the code came from (only them: the auditor
     /// sees the commitment).
-    pub fn note_source(self: &Arc<Self>, ctx: &Arc<Ctx>, text: &str) {
-        let mut st = lock(&self.st);
-        self.event(ctx, &mut st, "code_source", text.to_string(), Some(Role::Auditee), None, false);
-    }
-
     /// Install a freshly ingested bundle, replacing (and discarding) any earlier one.
-    pub fn set_code(self: &Arc<Self>, ctx: &Arc<Ctx>, role: Role, bundle: Bundle) -> Result<Value> {
-        ensure!(role == Role::Auditee, "only the auditee uploads code");
+    pub fn set_code(self: &Arc<Self>, ctx: &Arc<Ctx>, role: Role, bundle: Bundle, source: CodeSource) -> Result<Value> {
+        ensure!(role == Role::Auditee, "only the auditee provides code");
         // The new index is already counted; the one it replaces isn't freed
         // yet if runs still hold it.
         crate::budget::ensure_room(0)?;
         let bundle = Arc::new(bundle);
         let info = bundle.info.clone();
+        let rec = source.record();
         let mut st = lock(&self.st);
         // Runs still holding the old code keep working; its stored files go
         // once nothing does (Bundle's Drop).
-        drop(st.code.replace(bundle));
-        let had_affidavit = st.affidavit.take().is_some();
-        // Shown to both sides, so only the commitment: size and tree hash
-        // stay with the auditee until a release.
+        let replaced = st.code.replace(bundle).is_some();
+        // Shown to both sides, so only the commitment and where it came
+        // from: size and tree hash stay with the auditee until a release.
         let msg = format!(
-            "The auditee uploaded code (commitment {}){}.",
+            "{} (commitment {}){}.",
+            rec.statement.trim_end_matches('.'),
             &info.commitment_sha256[..12],
-            if had_affidavit {
-                " (replacing earlier code; the affidavit must be confirmed again)"
-            } else {
-                ""
-            }
+            if replaced { ", replacing the earlier code" } else { "" }
         );
+        st.affidavit = Some((info.tree_sha256.clone(), rec));
         self.event(ctx, &mut st, "code_uploaded", msg, None, Some(role), false);
-        Ok(serde_json::to_value(&info)?)
-    }
-
-    pub fn confirm_affidavit(
-        self: &Arc<Self>,
-        ctx: &Arc<Ctx>,
-        role: Role,
-        v: &Value,
-    ) -> Result<Value> {
-        ensure!(
-            role == Role::Auditee,
-            "only the auditee confirms the affidavit"
-        );
-        let organization =
-            field(v, "organization", MAX_NAME_BYTES)?.ok_or_else(|| anyhow!("organization is required"))?;
-        let repo_url = field(v, "repo_url", MAX_NAME_BYTES)?;
-        let git_commit = field(v, "git_commit", MAX_NAME_BYTES)?;
-        let tree = clean(v["tree_sha256"].as_str())
-            .ok_or_else(|| anyhow!("tree_sha256 of the uploaded code is required"))?;
-        let mut st = lock(&self.st);
-        let code = st
-            .code
-            .as_ref()
-            .ok_or_else(|| anyhow!("upload code first"))?;
-        ensure!(
-            code.info.tree_sha256 == tree,
-            "the uploaded code has tree {}, not {tree}",
-            code.info.tree_sha256
-        );
-        let rec = AffidavitRecord {
-            statement: affidavit_statement(
-                &organization,
-                &code.info.commitment_sha256,
-                repo_url.as_deref(),
-                git_commit.as_deref(),
-            ),
-            organization,
-            repo_url,
-            git_commit,
-            confirmed_at_ms: now_ms(),
-        };
-        st.affidavit = Some((tree, rec.clone()));
-        self.event(
-            ctx,
-            &mut st,
-            "affidavit_confirmed",
-            format!(
-                "The auditee confirmed the affidavit for {}.",
-                rec.organization
-            ),
-            None,
-            Some(role),
-            false,
-        );
         self.maybe_start(ctx, &mut st);
-        Ok(serde_json::to_value(&rec)?)
+        Ok(serde_json::to_value(&info)?)
     }
 
     pub fn propose_model(self: &Arc<Self>, ctx: &Arc<Ctx>, role: Role, v: &Value) -> Result<Value> {
@@ -1568,6 +1525,7 @@ impl Session {
         json!({
             "session_id": self.id,
             "role": role,
+            "creator": self.creator,
             "created_at_ms": self.created_at_ms,
             "version": st.versions[ri(role)],
             "boot_id": ctx.info.boot_id,
@@ -2356,19 +2314,39 @@ fn run_view(r: &RunState, role: Role, st: &State) -> Value {
     v
 }
 
-pub fn affidavit_statement(
-    org: &str,
-    commitment: &str,
-    repo_url: Option<&str>,
-    git_commit: Option<&str>,
-) -> String {
-    format!(
-        "On behalf of {org}, I affirm that the code uploaded to this session (code commitment {commitment}, opened in each released certificate) is a complete and unmodified copy of {} at commit {}, \
-         which is the source currently used in production for the systems the question concerns, and that no content in it was added, \
-         modified, or arranged with the intent of influencing the outcome of this or any automated audit.",
-        repo_url.unwrap_or("(repository not named)"),
-        git_commit.unwrap_or("(commit not named)"),
-    )
+/// Where the session's code came from. Who the auditee is, and what they
+/// vouch for, is settled between the parties outside the session; the
+/// record states only what this enclave knows.
+pub enum CodeSource {
+    /// Fetched by the enclave itself, so the repository and commit are facts.
+    Github { repo: String, commit: String },
+    /// Uploaded by the auditee, with the origin they say it has (unchecked).
+    Upload { repo_url: Option<String>, git_commit: Option<String> },
+}
+
+impl CodeSource {
+    pub fn record(&self) -> AffidavitRecord {
+        let fetched_by_enclave = matches!(self, CodeSource::Github { .. });
+        let (repo_url, git_commit, statement) = match self {
+            CodeSource::Github { repo, commit } => {
+                let url = format!("https://github.com/{repo}");
+                let st = format!("The enclave fetched this code from {url} at commit {commit}.");
+                (Some(url), Some(commit.clone()), st)
+            }
+            CodeSource::Upload { repo_url, git_commit } => {
+                let st = match (repo_url, git_commit) {
+                    (None, None) => "The auditee uploaded this code; its origin is not recorded.".to_string(),
+                    _ => format!(
+                        "The auditee uploaded this code and says it is {} at commit {} (not checked by the enclave).",
+                        repo_url.as_deref().unwrap_or("(repository not named)"),
+                        git_commit.as_deref().unwrap_or("(commit not named)"),
+                    ),
+                };
+                (repo_url.clone(), git_commit.clone(), st)
+            }
+        };
+        AffidavitRecord { organization: String::new(), repo_url, git_commit, statement, confirmed_at_ms: now_ms(), fetched_by_enclave }
+    }
 }
 
 fn status_line(st: &State, role: Role) -> String {
@@ -2400,9 +2378,9 @@ fn status_line(st: &State, role: Role) -> String {
     }
     let mut missing = Vec::new();
     match (&st.code, &st.affidavit) {
-        (None, _) => missing.push("the auditee to upload code"),
+        (None, _) => missing.push("the auditee to connect code"),
         (Some(c), Some((t, _))) if t == &c.info.tree_sha256 => {}
-        _ => missing.push("the auditee to confirm the affidavit"),
+        _ => missing.push("the auditee to provide code"),
     }
     if !st.models.iter().any(|m| m.status == "approved") {
         missing.push(if st.models.iter().any(|m| m.status == "pending") {
@@ -2495,16 +2473,11 @@ fn next_actions(st: &State, role: Role, sid: &str) -> Vec<Value> {
                     format!("{base}/code"),
                     "Upload your code as a tar archive.",
                 ));
-            } else if !st
-                .affidavit
-                .as_ref()
-                .is_some_and(|(t, _)| Some(t) == st.code.as_ref().map(|c| &c.info.tree_sha256))
-            {
                 out.push(a(
-                    "confirm_affidavit",
+                    "import_github",
                     "POST",
-                    format!("{base}/affidavit"),
-                    "Confirm the affidavit for the uploaded code.",
+                    format!("{base}/code/github"),
+                    "Or have the enclave fetch it from GitHub: {repo: \"owner/name\", ref, token (omit for a public repository)}.",
                 ));
             }
             for m in st.models.iter().filter(|m| m.status == "pending") {

@@ -104,7 +104,7 @@ def run(work, enclave, enclaves):
     print("work on A")
     ok(A, "POST", f"/api/sessions/{sid}/question", ao, {"text": "Does trainer/train.py compute loss on chain-of-thought tokens?"})
     ok(A, "POST", f"/api/sessions/{sid}/question/decision", ae, {"version": 1, "accept": True})
-    up = subprocess.run([os.path.join(BIN, "attest"), "upload", f"http://127.0.0.1:{A}/s/{sid}#{ae}", repo, "--org", "Example Lab", "--allow-dev"],
+    up = subprocess.run([os.path.join(BIN, "attest"), "upload", f"http://127.0.0.1:{A}/s/{sid}#{ae}", repo, "--allow-dev"],
                         capture_output=True, text=True)
     check(up.returncode == 0, "code uploaded to A")
     ok(A, "POST", f"/api/sessions/{sid}/models", ae, {"provider": "mock", "model": "gpt-mock", "api_key": "test-key", "mock_endpoint": f"127.0.0.1:{MOCK}"})

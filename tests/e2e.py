@@ -3,6 +3,8 @@ dev-mode enclave with a scripted mock model.
 
     python3 tests/e2e.py            (builds and starts everything itself)
 """
+import hashlib
+import hmac
 import json
 import os
 import subprocess
@@ -139,6 +141,13 @@ def run(work):
     s = ok("POST", "/api/sessions", body={})
     check(s["auditor_link"].endswith("#" + s["auditor_token"]), "links carry the token after #")
     auditee, auditor = Party(s["session_id"], s["auditee_token"]), Party(s["session_id"], s["auditor_token"])
+    check(hmac.new(s["auditee_token"].encode(), b"attest-invite/1", hashlib.sha256).hexdigest() == s["auditor_token"]
+          and auditee.view()["creator"] == "auditee", "the starter's token derives the other party's link")
+    sa = ok("POST", "/api/sessions?role=auditor", body={})
+    check(hmac.new(sa["auditor_token"].encode(), b"attest-invite/1", hashlib.sha256).hexdigest() == sa["auditee_token"]
+          and Party(sa["session_id"], sa["auditee_token"]).view()["role"] == "auditee"
+          and Party(sa["session_id"], sa["auditor_token"]).view()["creator"] == "auditor", "an auditor can start a session")
+    check(call("POST", "/api/sessions?role=boss", body={})[0] == 400, "an unknown starting role is refused")
     check(call("GET", f"/api/sessions/{s['session_id']}", "wrong")[0] == 404, "wrong token is rejected")
     check(auditee.view()["role"] == "auditee" and auditor.view()["role"] == "auditor", "tokens decide roles")
     check(any(a["action"] == "propose_question" for a in auditor.view()["next_actions"]), "auditor is told to ask")
@@ -150,13 +159,14 @@ def run(work):
 
     print("code upload through the CLI")
     link = f"{BASE}/s/{s['session_id']}#{s['auditee_token']}"
-    out = subprocess.run([os.path.join(BIN, "attest"), "upload", link, repo, "--org", "Example Lab", "--allow-dev"], capture_output=True, text=True)
+    out = subprocess.run([os.path.join(BIN, "attest"), "upload", link, repo, "--allow-dev"], capture_output=True, text=True)
     if out.returncode != 0:
         print(out.stdout[-2000:], out.stderr[-2000:])
-    check(out.returncode == 0 and "affidavit confirmed" in out.stdout, "attest upload sends code and confirms the affidavit")
+    check(out.returncode == 0 , "attest upload sends code")
     v = auditor.view()
-    check(set(v["code"]) == {"commitment_sha256", "uploaded_at_ms"} and v["affidavit"]["current"] and "tree_sha256" not in v["affidavit"], "auditor sees only the code commitment and the affidavit")
-    check(v["code"]["commitment_sha256"] in v["affidavit"]["record"]["statement"], "affidavit names the commitment")
+    check(set(v["code"]) == {"commitment_sha256", "uploaded_at_ms"} and v["affidavit"]["current"] and "tree_sha256" not in v["affidavit"], "auditor sees only the code commitment and the source record")
+    rec = v["affidavit"]["record"]
+    check(not rec["fetched_by_enclave"] and "uploaded" in rec["statement"] and rec["git_commit"], "the source record says the auditee uploaded it, with the commit they named")
     check(auditee.view()["code"]["file_count"] == 2, "auditee sees code metadata")
     blobs = blob_files(work)
     raw = b"".join(open(b, "rb").read() for b in blobs)
@@ -245,7 +255,7 @@ def run(work):
     a3, o3 = Party(s3["session_id"], s3["auditee_token"]), Party(s3["session_id"], s3["auditor_token"])
     o3.post("/question", {"text": "PYTHON: does trainer/train.py compute loss on CoT tokens?"})
     a3.post("/question/decision", {"version": 1, "accept": True})
-    up = subprocess.run([os.path.join(BIN, "attest"), "upload", f"{BASE}/s/{s3["session_id"]}#{s3["auditee_token"]}", repo, "--org", "X", "--allow-dev"], capture_output=True, text=True)
+    up = subprocess.run([os.path.join(BIN, "attest"), "upload", f"{BASE}/s/{s3["session_id"]}#{s3["auditee_token"]}", repo, "--allow-dev"], capture_output=True, text=True)
     assert up.returncode == 0, up.stdout[-2000:] + up.stderr[-2000:]
     for _ in range(600):  # the sandbox compiles python.wasm at boot
         if "python sandbox ready" in open(os.path.join(work, "enclave.log")).read():
@@ -295,7 +305,7 @@ def run(work):
         a, o = Party(s["session_id"], s["auditee_token"]), Party(s["session_id"], s["auditor_token"])
         o.post("/question", {"text": text, "answer_format": fmt})
         a.post("/question/decision", {"version": 1, "accept": True})
-        up = subprocess.run([os.path.join(BIN, "attest"), "upload", f"{BASE}/s/{s['session_id']}#{s['auditee_token']}", repo, "--org", "X", "--allow-dev"], capture_output=True, text=True)
+        up = subprocess.run([os.path.join(BIN, "attest"), "upload", f"{BASE}/s/{s['session_id']}#{s['auditee_token']}", repo, "--allow-dev"], capture_output=True, text=True)
         assert up.returncode == 0, up.stdout[-2000:] + up.stderr[-2000:]
         a.post("/models", {"provider": "mock", "model": "gpt-mock", "api_key": "test-key", "mock_endpoint": "127.0.0.1:19999"})
         v = a.wait_until(lambda v: v["runs"] and v["runs"][-1]["status"] != "running", text)
@@ -340,7 +350,7 @@ def run(work):
     a2, o2 = Party(s2["session_id"], s2["auditee_token"]), Party(s2["session_id"], s2["auditor_token"])
     o2.post("/question", {"text": "Does trainer/train.py compute loss on chain-of-thought tokens?"})
     a2.post("/question/decision", {"version": 1, "accept": True})
-    subprocess.run([os.path.join(BIN, "attest"), "upload", f"{BASE}/s/{s2['session_id']}#{s2['auditee_token']}", repo, "--org", "X", "--allow-dev"], check=True, capture_output=True)
+    subprocess.run([os.path.join(BIN, "attest"), "upload", f"{BASE}/s/{s2['session_id']}#{s2['auditee_token']}", repo, "--allow-dev"], check=True, capture_output=True)
     for p in blob_files(work):
         if os.path.getmtime(p) > time.time() - 5:
             data = bytearray(open(p, "rb").read()); data[-1] ^= 1; open(p, "wb").write(bytes(data))

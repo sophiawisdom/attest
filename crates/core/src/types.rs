@@ -452,12 +452,19 @@ pub struct MessageRecord {
 
 /// Confirmed by the holder of the auditee link.
 #[derive(Serialize, Deserialize, Clone, Debug)]
+/// Where the code came from. (Named for the typed affidavit it replaced;
+/// sessions no longer ask the auditee to vouch for anything in the app.)
 pub struct AffidavitRecord {
+    /// Empty: who the auditee is gets settled outside the session.
     pub organization: String,
     pub repo_url: Option<String>,
     pub git_commit: Option<String>,
     pub statement: String,
     pub confirmed_at_ms: u64,
+    /// The enclave fetched the code from `repo_url` at `git_commit` itself;
+    /// otherwise they're what the auditee said about an upload.
+    #[serde(default)]
+    pub fetched_by_enclave: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

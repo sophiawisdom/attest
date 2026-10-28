@@ -2,9 +2,10 @@
 
 Ask a question about code you can't see, and get a signed answer.
 
-An **auditee** starts a session and sends the **auditor** a private link
-(over Signal or whatever they already use). The auditor asks a question. The
-auditee accepts it, uploads code, confirms an affidavit, and approves a model
+Either party starts a session and sends the other a private link (over
+Signal or whatever they already use). The **auditor** asks a question. The
+**auditee** accepts it, connects their code (the enclave fetches it from
+GitHub itself, or the auditee uploads it), and approves a model
 and API key (either side can propose one). A model with read-only tools
 (list, find, read, grep) reads the code inside an AWS Nitro Enclave and
 answers. The auditee watches everything and decides whether the auditor sees
@@ -21,7 +22,8 @@ reproducible build of this repository.
 
 Enforced: the harness (fixed prompt, read-only tools, fixed provider
 endpoints), the visibility rules above, and that the analysed code matches the
-tree hash in the affidavit.
+committed tree hash, and, for code fetched from GitHub, the repository and
+commit the certificate names.
 
 Disclosed in the signed certificate: who chose the model and key, the key's
 organization as the provider reports it, which model answered and which

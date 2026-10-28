@@ -317,7 +317,9 @@ pub fn manifest_warnings(m: &Manifest) -> Vec<String> {
         w.push("the agent read no files".into());
     }
     if m.affidavit.git_commit.is_none() {
-        w.push("the affidavit names no git commit".into());
+        w.push("the code's repository and commit are not recorded".into());
+    } else if !m.affidavit.fetched_by_enclave {
+        w.push("the code was uploaded: its repository and commit are the auditee's word, not checked by the enclave".into());
     }
     let blinded = m.auditor_messages.iter().filter(|x| x.blinded).count();
     if blinded > 0 {
