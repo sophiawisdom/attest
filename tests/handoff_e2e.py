@@ -23,6 +23,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.path.join(ROOT, "target", "debug")
 MOCK, TUNNEL, BLOBS = 39999, 35101, 35105
 PORTS = {"A": 38101, "B": 38102, "C": 38103}
+TOKEN = "test-handoff-token-0123456789"
 
 
 def call(port, method, path, token=None, body=None):
@@ -102,7 +103,10 @@ def main():
     def enclave(name, peer=None):
         cfg = os.path.join(work, f"{name}.json")
         with open(cfg, "w") as f:
-            json.dump({"peer": f"127.0.0.1:{PORTS[peer]}"} if peer else {}, f)
+            c = {"handoff_token": TOKEN}
+            if peer:
+                c["peer"] = f"127.0.0.1:{PORTS[peer]}"
+            json.dump(c, f)
         log = os.path.join(work, f"{name}.log")
         procs.append(subprocess.Popen([os.path.join(BIN, "attest-enclave"), "--dev", "--dev-listen", f"127.0.0.1:{PORTS[name]}",
                                        "--dev-tunnel", f"127.0.0.1:{TUNNEL}", "--dev-blobs", f"127.0.0.1:{BLOBS}",
@@ -151,6 +155,12 @@ def run(work, enclave):
     r2 = v["runs"][-1]["id"]
     before_auditee = ok(A, "GET", f"/api/sessions/{sid}", ae)
     before_auditor = ok(A, "GET", f"/api/sessions/{sid}", ao)
+
+    print("handoffs need the operator's token")
+    n = ok(A, "GET", "/api/internal/handoff/challenge")["nonce"]
+    st, err = call(A, "POST", "/api/internal/handoff", body={"challenge": n, "public_key": "00" * 32, "nonce": "00" * 32, "token": "wrong-token-wrong-token"})
+    check(st == 403 and "token" in err.get("error", ""), "a handoff request with the wrong token is refused")
+    check(call(A, "GET", f"/api/sessions/{sid}", ae)[0] == 200, "A keeps serving after a refused handoff")
 
     print("enclave B takes over from A")
     B = enclave("B", peer="A")

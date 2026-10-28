@@ -145,9 +145,19 @@ fn session_key(shared: &[u8], n_r: &[u8], r_pub: &[u8], g_pub: &[u8]) -> [u8; 32
 pub struct Giver {
     challenges: Mutex<Vec<([u8; 32], Instant)>>,
     done: AtomicBool,
+    /// The operator's handoff token, from the parent's config. Anyone can
+    /// run this image in their own enclave and pass the attestation check;
+    /// that gains them nothing secret (it's this code), but a handoff stops
+    /// this enclave serving, so only a request carrying the operator's
+    /// token may trigger one. None: handoffs are off.
+    token: Option<String>,
 }
 
 impl Giver {
+    pub fn new(token: Option<String>) -> Self {
+        Self { token: token.filter(|t| t.len() >= 16), ..Default::default() }
+    }
+
     pub fn challenge(&self) -> Value {
         let n = random32();
         let mut c = self.challenges.lock().unwrap_or_else(|e| e.into_inner());
@@ -176,6 +186,14 @@ impl Giver {
         att: &Attester,
         body: &Value,
     ) -> Result<Value> {
+        let Some(want) = &self.token else {
+            anyhow::bail!("handoffs are not enabled on this enclave");
+        };
+        let got = body["token"].as_str().unwrap_or("");
+        ensure!(
+            got.len() == want.len() && ring::constant_time::verify_slices_are_equal(got.as_bytes(), want.as_bytes()).is_ok(),
+            "wrong handoff token"
+        );
         let n_g = hex32(&body["challenge"], "challenge")?;
         let r_pub = hex32(&body["public_key"], "public_key")?;
         let n_r = hex32(&body["nonce"], "nonce")?;
@@ -251,7 +269,7 @@ fn split_peer(peer: &str) -> Result<(String, u16)> {
 }
 
 /// The receiving side: obtain the lineage from the enclave at `peer`.
-pub async fn receive(net: &Net, att: &Attester, dev: bool, peer: &str) -> Result<Payload> {
+pub async fn receive(net: &Net, att: &Attester, dev: bool, peer: &str, token: &str) -> Result<Payload> {
     let (host, port) = split_peer(peer)?;
     let https = !dev;
     let t = Duration::from_secs(60);
@@ -277,6 +295,7 @@ pub async fn receive(net: &Net, att: &Attester, dev: bool, peer: &str) -> Result
         "public_key": hex::encode(r_pub),
         "nonce": hex::encode(n_r),
         "document_b64": doc.map(|d| b64().encode(d)),
+        "token": token,
     });
     let resp = net
         .request_peer("POST", https, &host, port, "/api/internal/handoff", serde_json::to_vec(&req)?, t)

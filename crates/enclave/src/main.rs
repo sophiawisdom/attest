@@ -94,6 +94,10 @@ struct HostConfig {
     /// (`host[:port]`, see handoff.rs). It must prove the same image, so
     /// the parent naming it grants nothing.
     peer: Option<String>,
+    /// Operator secret that gates handoffs, the same on every instance of a
+    /// deployment: an enclave gives its sessions only to a request carrying
+    /// it, and sends it when taking over. Unset: this enclave won't hand off.
+    handoff_token: Option<String>,
 }
 
 const LOG_VSOCK_PORT: u32 = 5004;
@@ -211,13 +215,14 @@ async fn take_over(
     attester: &nsm::Attester,
     dev: bool,
     peer: &str,
+    token: &str,
 ) -> Result<handoff::Payload> {
     if let Some(host) = peer.rsplit_once(':').map(|(h, _)| h).or(Some(peer)) {
         net.allow(host.trim_matches(['[', ']']));
     }
     let mut last = String::new();
     for attempt in 0..30 {
-        match handoff::receive(net, attester, dev, peer).await {
+        match handoff::receive(net, attester, dev, peer, token).await {
             Ok(p) => {
                 log(&format!(
                     "handoff: took over {} sessions from boot {}",
@@ -296,7 +301,7 @@ async fn service() -> Result<()> {
     // RNG.
     let (signing, keys, lineage, heads) = match cfg.peer.clone().filter(|p| !p.is_empty()) {
         Some(peer) => {
-            let p = take_over(&net, &attester, args.dev, &peer).await?;
+            let p = take_over(&net, &attester, args.dev, &peer, cfg.handoff_token.as_deref().unwrap_or("")).await?;
             // The stored state is the lineage's: never clear it.
             blobs.skip_reset();
             let key = |h: &str| -> Result<[u8; 32]> {
@@ -435,7 +440,7 @@ async fn service() -> Result<()> {
     tokio::spawn(sessions::write_loop(ctx.clone()));
     let app = Arc::new(App {
         ctx: ctx.clone(),
-        giver: handoff::Giver::default(),
+        giver: handoff::Giver::new(cfg.handoff_token.clone()),
         attester,
         conns: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
         concurrency: args.concurrency,
