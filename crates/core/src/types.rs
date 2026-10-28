@@ -119,6 +119,22 @@ pub struct EnclaveInfo {
     #[serde(default)]
     pub operator: Option<String>,
     pub harness: HarnessInfo,
+    /// The lineage of enclaves (same image, handing sessions to each other)
+    /// this boot belongs to. Absent on enclaves from before lineages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<LineageInfo>,
+}
+
+/// Enclaves of one lineage share sessions and the signing key: each took
+/// them over from the previous one, which proved it runs the same image.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct LineageInfo {
+    /// Random, fixed for the lineage's life.
+    pub id: String,
+    /// 0 for the enclave that started the lineage, +1 per handoff.
+    pub generation: u32,
+    /// The boot this enclave took over from, if it did.
+    pub restored_from_boot: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -270,6 +286,10 @@ pub struct Manifest {
     /// error details. Those fields are then zero or empty.
     #[serde(default = "full_detail")]
     pub detail: String,
+    /// Set when the run happened on an earlier boot of this enclave's
+    /// lineage than the one that signed the certificate (`boot_id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ran_on_boot_id: Option<String>,
 }
 
 fn full_detail() -> String {

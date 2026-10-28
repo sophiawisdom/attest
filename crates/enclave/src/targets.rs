@@ -32,7 +32,7 @@ pub const EGRESS: &[&str] = &[
 ];
 
 /// The request shape a target speaks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Wire {
     Anthropic,
     Openai,
@@ -64,7 +64,7 @@ impl Api {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Target {
     pub provider: Provider,
     pub host: String,

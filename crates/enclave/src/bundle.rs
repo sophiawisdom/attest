@@ -20,7 +20,7 @@ pub struct Entry {
     pub digest: [u8; 32],
     pub text: bool,
     /// Instruction-like text found in this file, by category.
-    scan: Vec<(&'static str, u64)>,
+    scan: Vec<(String, u64)>,
 }
 
 pub struct Bundle {
@@ -38,6 +38,31 @@ pub struct Bundle {
         Option<Arc<std::collections::HashMap<String, Arc<Vec<u8>>>>>,
     )>,
     pin_load: tokio::sync::Mutex<()>,
+    /// Hashes of this bundle's manifest record parts once stored (it never
+    /// changes, so it's written once; see sessions.rs).
+    pub persisted: std::sync::Mutex<Option<Vec<String>>>,
+}
+
+/// Everything needed to rebuild a Bundle in a successor enclave: the index,
+/// and the sealing key of its stored files.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct CodeManifest {
+    files: Vec<(String, ManifestEntry)>,
+    dirs: Vec<String>,
+    info: CodeInfo,
+    scan_total: ScanCounts,
+    key: String,
+    tag: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ManifestEntry {
+    blob: String,
+    size: u64,
+    digest: String,
+    text: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    scan: Vec<(String, u64)>,
 }
 
 /// Keeps a bundle's files in enclave memory until dropped.
@@ -252,6 +277,9 @@ impl Bundle {
             let text = is_text(&bytes);
             let scan = if text {
                 scan::scan_text(&String::from_utf8_lossy(&bytes))
+                    .into_iter()
+                    .map(|(k, n)| (k.to_string(), n))
+                    .collect()
             } else {
                 vec![]
             };
@@ -321,7 +349,69 @@ impl Bundle {
             cache,
             pinned: Default::default(),
             pin_load: Default::default(),
+            persisted: Default::default(),
         }
+    }
+
+    /// The record a successor rebuilds this bundle from.
+    pub fn manifest(&self) -> CodeManifest {
+        CodeManifest {
+            files: self
+                .files
+                .iter()
+                .map(|(p, e)| {
+                    (
+                        p.clone(),
+                        ManifestEntry {
+                            blob: hex::encode(e.blob),
+                            size: e.size,
+                            digest: hex::encode(e.digest),
+                            text: e.text,
+                            scan: e.scan.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            dirs: self.dirs.iter().cloned().collect(),
+            info: self.info.clone(),
+            scan_total: self.scan_total.clone(),
+            key: hex::encode(self.sealer.key()),
+            tag: hex::encode(self.sealer.tag),
+        }
+    }
+
+    /// Rebuild a bundle from its manifest; its files stay where they are.
+    pub fn restore(session_id: &str, m: CodeManifest, store: BlobClient, cache: Arc<Cache>) -> Result<Self> {
+        fn arr<const N: usize>(h: &str) -> Result<[u8; N]> {
+            hex::decode(h)?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("bad length in a code manifest"))
+        }
+        let mut files = BTreeMap::new();
+        for (p, e) in m.files {
+            files.insert(
+                p,
+                Entry {
+                    blob: arr(&e.blob)?,
+                    size: e.size,
+                    digest: arr(&e.digest)?,
+                    text: e.text,
+                    scan: e.scan,
+                },
+            );
+        }
+        Ok(Self {
+            files,
+            dirs: m.dirs.into_iter().collect(),
+            info: m.info,
+            scan_total: m.scan_total,
+            sealer: Sealer::from_parts(session_id, arr(&m.key)?, arr(&m.tag)?),
+            store,
+            cache,
+            pinned: Default::default(),
+            pin_load: Default::default(),
+            persisted: Default::default(),
+        })
     }
 
     /// Load every file into enclave memory, in path order and without the
@@ -401,7 +491,7 @@ impl Bundle {
             if let Some(e) = self.files.get(p).filter(|e| !e.scan.is_empty()) {
                 c.files_with_matches += 1;
                 for (k, n) in &e.scan {
-                    *c.matches_by_category.entry(k.to_string()).or_default() += n;
+                    *c.matches_by_category.entry(k.clone()).or_default() += n;
                 }
             }
         }

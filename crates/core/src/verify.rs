@@ -215,6 +215,11 @@ pub fn manifest_warnings(m: &Manifest) -> Vec<String> {
     if m.verdict_only() {
         w.push("the auditee released the verdict only: no run times, code size or tree hash, activity, or instruction-scan counts".into());
     }
+    if let Some(b) = &m.ran_on_boot_id {
+        w.push(format!(
+            "the run happened on boot {b}; a successor enclave of the same image took its sessions over and signed this"
+        ));
+    }
     match &m.outcome {
         Outcome::Completed => {}
         Outcome::StepLimit => w.push("the agent hit its step limit before answering".into()),

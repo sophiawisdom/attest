@@ -190,7 +190,30 @@ impl Net {
     ) -> Result<HttpResponse> {
         tokio::time::timeout(
             timeout,
-            self.request_inner(method, https, host, port, path, headers, body),
+            self.request_inner(method, https, true, host, port, path, headers, body),
+        )
+        .await
+        .map_err(|_| anyhow!("request to {host} timed out"))?
+    }
+
+    /// A JSON request to another attest enclave (handoff.rs). Its TLS
+    /// certificate isn't checked: both ends rely on Nitro attestations
+    /// carried in the messages, not on the connection.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_peer(
+        &self,
+        method: &str,
+        https: bool,
+        host: &str,
+        port: u16,
+        path: &str,
+        body: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<HttpResponse> {
+        let h = [("content-type", "application/json")];
+        tokio::time::timeout(
+            timeout,
+            self.request_inner(method, https, false, host, port, path, &h, body),
         )
         .await
         .map_err(|_| anyhow!("request to {host} timed out"))?
@@ -201,6 +224,7 @@ impl Net {
         &self,
         method: &str,
         https: bool,
+        verify: bool,
         host: &str,
         port: u16,
         path: &str,
@@ -210,7 +234,22 @@ impl Net {
         let raw = self.tunnel(host, port).await?;
         let io: Stream = if https {
             let name = rustls::pki_types::ServerName::try_from(host.to_string())?;
-            let tls = tokio_rustls::TlsConnector::from(self.tls.clone())
+            let cfg = if verify {
+                self.tls.clone()
+            } else {
+                let provider = Arc::new(rustls::crypto::ring::default_provider());
+                let mut cfg = rustls::ClientConfig::builder_with_provider(provider.clone())
+                    .with_safe_default_protocol_versions()?
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(Capture {
+                        provider,
+                        cert: std::sync::Mutex::new(None),
+                    }))
+                    .with_no_client_auth();
+                cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+                Arc::new(cfg)
+            };
+            let tls = tokio_rustls::TlsConnector::from(cfg)
                 .connect(name, raw)
                 .await
                 .with_context(|| format!("TLS to {host}"))?;
