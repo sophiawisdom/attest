@@ -127,15 +127,24 @@ const INTERRUPTED: &str = "the run was interrupted: the enclave serving this ses
 impl Session {
     /// Write this session's state (it changed since the last write).
     async fn write_state(&self, p: &crate::persist::Persist) -> Result<()> {
+        self.write_state_with(p, false).await
+    }
+
+    /// Also running runs' traces so far: for the write before a handoff.
+    async fn write_state_full(&self, p: &crate::persist::Persist) -> Result<()> {
+        self.write_state_with(p, true).await
+    }
+
+    async fn write_state_with(&self, p: &crate::persist::Persist, include_running: bool) -> Result<()> {
         self.dirty.store(false, Ordering::Relaxed);
-        let r = self.write_state_inner(p).await;
+        let r = self.write_state_inner(p, include_running).await;
         if r.is_err() {
             self.dirty.store(true, Ordering::Relaxed);
         }
         r
     }
 
-    async fn write_state_inner(&self, p: &crate::persist::Persist) -> Result<()> {
+    async fn write_state_inner(&self, p: &crate::persist::Persist, include_running: bool) -> Result<()> {
         // What to write before the snapshot: an upload's index (once) and
         // trace entries added since the last write.
         let (code, traces) = {
@@ -147,6 +156,10 @@ impl Session {
             let traces: Vec<(String, usize, Vec<Vec<u8>>)> = st
                 .runs
                 .iter()
+                // A running run's trace waits until it ends (or a handoff):
+                // writing it as it grows would show the parent, through the
+                // sizes and timing of the writes, what the agent is doing.
+                .filter(|r| include_running || r.status != "running")
                 .filter_map(|r| {
                     let done: usize = r.trace_chunks.iter().map(|c| c.entries).sum();
                     (r.trace.len() > done).then(|| {
@@ -261,22 +274,32 @@ impl Store {
         let all: Vec<Arc<Session>> = lock(&self.sessions).values().cloned().collect();
         let mut heads = Vec::new();
         for s in all {
-            if s.dirty.load(Ordering::Relaxed) || lock(&s.written).1.is_none() {
-                s.write_state(p).await?;
-            }
+            // Everything, running runs' traces included: this is the last
+            // write before the successor takes over.
+            s.write_state_full(p).await?;
             if let Some(h) = lock(&s.written).1.clone() {
                 heads.push((s.id.clone(), h));
             }
         }
+        heads.extend(lock(&self.pending).iter().cloned());
         Ok(heads)
     }
 
     /// Take over sessions from a predecessor, each from the head it named.
-    /// A session that can't be read back is logged and left out.
+    /// A session that can't be read back after a few tries waits in
+    /// `pending` (retried later), rather than being dropped.
     pub async fn restore(&self, ctx: &Arc<Ctx>, heads: Vec<(String, String)>) -> usize {
         let mut n = 0;
         for (sid, head) in heads {
-            match restore_session(ctx, &sid, &head).await {
+            let mut r = restore_session(ctx, &sid, &head).await;
+            for _ in 0..2 {
+                if r.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                r = restore_session(ctx, &sid, &head).await;
+            }
+            match r {
                 Ok(s) => {
                     {
                         let st = lock(&s.st);
@@ -294,22 +317,43 @@ impl Store {
                     lock(&self.sessions).insert(sid, s);
                     n += 1;
                 }
-                Err(e) => crate::log(&format!("state: couldn't restore a session: {e:#}")),
+                Err(e) => {
+                    crate::log(&format!("state: couldn't restore a session yet: {e:#}"));
+                    lock(&self.pending).push((sid, head));
+                }
             }
         }
         n
+    }
+
+    /// Try the pending sessions again.
+    async fn retry_pending(&self, ctx: &Arc<Ctx>) {
+        let pending = std::mem::take(&mut *lock(&self.pending));
+        if !pending.is_empty() {
+            let n = self.restore(ctx, pending).await;
+            if n > 0 {
+                crate::log(&format!("state: restored {n} session(s) that were pending"));
+            }
+        }
     }
 }
 
 /// Write changed sessions every couple of seconds, until this enclave
 /// hands its sessions over.
 pub async fn write_loop(ctx: Arc<Ctx>) {
+    let mut tick: u64 = 0;
     loop {
         tokio::time::sleep(WRITE_INTERVAL).await;
+        tick += 1;
+        // Paused while a handoff is under way (it writes everything
+        // itself), and for good once it succeeded; resumes if it failed.
         if ctx.moved.load(Ordering::SeqCst) {
-            return;
+            continue;
         }
         ctx.store.write_changed(&ctx.persist).await;
+        if tick % 30 == 0 {
+            ctx.store.retry_pending(&ctx).await;
+        }
     }
 }
 
@@ -390,6 +434,9 @@ async fn restore_session(ctx: &Arc<Ctx>, sid: &str, head_hash: &str) -> Result<A
     // record them as failed. The auditee decides on them as usual.
     let now = now_ms();
     let mut interrupted = Vec::new();
+    for r in st.runs.iter_mut() {
+        r.before_move = true;
+    }
     for r in st.runs.iter_mut().filter(|r| r.status == "running") {
         let outcome = Outcome::Error {
             message: INTERRUPTED.into(),

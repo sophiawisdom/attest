@@ -157,9 +157,10 @@ def run(work, enclave):
     before_auditor = ok(A, "GET", f"/api/sessions/{sid}", ao)
 
     print("handoffs need the operator's token")
-    n = ok(A, "GET", "/api/internal/handoff/challenge")["nonce"]
-    st, err = call(A, "POST", "/api/internal/handoff", body={"challenge": n, "public_key": "00" * 32, "nonce": "00" * 32, "token": "wrong-token-wrong-token"})
-    check(st == 403 and "token" in err.get("error", ""), "a handoff request with the wrong token is refused")
+    st, err = call(A, "POST", "/api/internal/handoff/challenge", body={"public_key": "00" * 32, "mac": "00" * 32})
+    check(st == 403 and "token" in err.get("error", ""), "a challenge without the token's MAC is refused")
+    st, err = call(A, "POST", "/api/internal/handoff", body={"challenge": "00" * 32, "public_key": "00" * 32, "nonce": "00" * 32, "mac": "00" * 32})
+    check(st == 403 and "token" in err.get("error", ""), "a handoff request without the token's MAC is refused")
     check(call(A, "GET", f"/api/sessions/{sid}", ae)[0] == 200, "A keeps serving after a refused handoff")
 
     print("enclave B takes over from A")
@@ -199,7 +200,10 @@ def run(work, enclave):
           "it names the boot it ran on (A) and the one that signed it (B)")
 
     print("a new run on B reads the code A stored")
-    ok(B, "POST", f"/api/sessions/{sid}/runs/{r2}/followup", ao, {"text": "And once more."})
+    st, err = call(B, "POST", f"/api/sessions/{sid}/runs/{r2}/followup", ao, {"text": "And once more."})
+    check(st == 400 and "before this service moved" in err.get("error", ""), "runs from before the move can't be continued")
+    q = ok(B, "POST", f"/api/sessions/{sid}/question", ao, {"text": "Does trainer/train.py really compute loss on chain-of-thought tokens?"})
+    ok(B, "POST", f"/api/sessions/{sid}/question/decision", ae, {"version": q.get("version", 2), "accept": True})
     v = wait_run(B, sid, ae, lambda rs: len(rs) == 3 and rs[-1]["status"] != "running", "run 3")
     r3 = v["runs"][-1]
     check(r3["outcome"] == {"kind": "completed"} and r3["verdict"]["answer"] == "yes", "run 3 completed on B with the stored code")

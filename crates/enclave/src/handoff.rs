@@ -8,12 +8,15 @@
 //! neither the operator nor a different build can obtain it.
 //!
 //!   R (receiver, new)                         G (giver, running)
-//!   GET  /api/internal/handoff/challenge  ->  nG (fresh, single use)
+//!   POST /api/internal/handoff/challenge  ->  nG (fresh, single use, bound
+//!        {public_key, mac}                       to R's key; only with a MAC
+//!                                                under the operator's token)
 //!   attestation over (user_data = H(req | nR), public_key = R's one-time
 //!   X25519 key, nonce = nG)
 //!   POST /api/internal/handoff            ->  G checks it: genuine Nitro,
 //!        {challenge, public_key, nonce: nR,       same PCR0-2 as G, nonce nG,
-//!         document}                              key and nR bound in it.
+//!         document, mac}                         key and nR bound in it, and
+//!                                                the MAC (token never sent).
 //!                                             G stops serving sessions,
 //!                                             writes all state, fences its
 //!                                             store, and encrypts the
@@ -28,8 +31,11 @@
 //!   key or state of its own, then decrypts.
 //!
 //! The transport (TLS through the parents) carries no trust: both ends rely
-//! on the attestations alone. A giver hands over once; after that it only
-//! answers that its sessions moved, so there is one writer.
+//! on the attestations, and the operator's token only ever appears inside
+//! MACs. A giver hands over once; after that it only answers that its
+//! sessions moved, so there is one writer. R keeps one key and nR for all
+//! its attempts, and G answers a repeat of the request that succeeded with
+//! the same response, so a lost response doesn't strand the move.
 
 use crate::net::Net;
 use crate::nsm::Attester;
@@ -47,6 +53,21 @@ use std::time::{Duration, Instant};
 const REQUEST: &[u8] = b"attest-handoff-request/1";
 const RESPONSE: &[u8] = b"attest-handoff-response/1";
 const KEY: &[u8] = b"attest-handoff-key/1";
+const CHALLENGE: &[u8] = b"attest-handoff-challenge/1";
+
+/// A MAC under the operator's handoff token.
+fn mac(token: &str, parts: &[&[u8]]) -> String {
+    let k = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, token.as_bytes());
+    hex::encode(ring::hmac::sign(&k, &hash(parts)).as_ref())
+}
+
+fn mac_ok(token: &str, parts: &[&[u8]], got: &Value) -> bool {
+    let Some(tag) = got.as_str().and_then(|g| hex::decode(g).ok()) else {
+        return false;
+    };
+    let k = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, token.as_bytes());
+    ring::hmac::verify(&k, &hash(parts), &tag).is_ok()
+}
 
 /// What the giver hands over, encrypted to the receiver.
 #[derive(Serialize, Deserialize)]
@@ -143,8 +164,12 @@ fn session_key(shared: &[u8], n_r: &[u8], r_pub: &[u8], g_pub: &[u8]) -> [u8; 32
 /// The giving side: challenges, and the one handoff.
 #[derive(Default)]
 pub struct Giver {
-    challenges: Mutex<Vec<([u8; 32], Instant)>>,
+    /// Outstanding challenges and the receiver key each was issued for.
+    challenges: Mutex<Vec<([u8; 32], [u8; 32], Instant)>>,
     done: AtomicBool,
+    /// The handoff that succeeded: receiver key, its nR, and the response,
+    /// sent again if that receiver asks again (its first copy was lost).
+    committed: Mutex<Option<([u8; 32], [u8; 32], Value)>>,
     /// The operator's handoff token, from the parent's config. Anyone can
     /// run this image in their own enclave and pass the attestation check;
     /// that gains them nothing secret (it's this code), but a handoff stops
@@ -158,22 +183,30 @@ impl Giver {
         Self { token: token.filter(|t| t.len() >= 16), ..Default::default() }
     }
 
-    pub fn challenge(&self) -> Value {
+    /// A fresh challenge, only for a request MACed under the token (so
+    /// strangers can't flush legitimate challenges), bound to the
+    /// receiver's key.
+    pub fn challenge(&self, body: &Value) -> Result<Value> {
+        let Some(token) = &self.token else {
+            anyhow::bail!("handoffs are not enabled on this enclave");
+        };
+        let r_pub = hex32(&body["public_key"], "public_key")?;
+        ensure!(mac_ok(token, &[CHALLENGE, &r_pub], &body["mac"]), "wrong handoff token");
         let n = random32();
         let mut c = self.challenges.lock().unwrap_or_else(|e| e.into_inner());
-        c.retain(|(_, t)| t.elapsed() < Duration::from_secs(120));
+        c.retain(|(_, _, t)| t.elapsed() < Duration::from_secs(120));
         if c.len() >= 16 {
             c.remove(0);
         }
-        c.push((n, Instant::now()));
-        json!({"nonce": hex::encode(n)})
+        c.push((n, r_pub, Instant::now()));
+        Ok(json!({"nonce": hex::encode(n)}))
     }
 
-    fn take_challenge(&self, n: &[u8; 32]) -> Result<()> {
+    fn take_challenge(&self, n: &[u8; 32], r_pub: &[u8; 32]) -> Result<()> {
         let mut c = self.challenges.lock().unwrap_or_else(|e| e.into_inner());
         let i = c
             .iter()
-            .position(|(x, t)| x == n && t.elapsed() < Duration::from_secs(120))
+            .position(|(x, k, t)| x == n && k == r_pub && t.elapsed() < Duration::from_secs(120))
             .context("unknown or expired challenge")?;
         c.remove(i);
         Ok(())
@@ -186,18 +219,23 @@ impl Giver {
         att: &Attester,
         body: &Value,
     ) -> Result<Value> {
-        let Some(want) = &self.token else {
+        let Some(token) = &self.token else {
             anyhow::bail!("handoffs are not enabled on this enclave");
         };
-        let got = body["token"].as_str().unwrap_or("");
-        ensure!(
-            got.len() == want.len() && ring::constant_time::verify_slices_are_equal(got.as_bytes(), want.as_bytes()).is_ok(),
-            "wrong handoff token"
-        );
         let n_g = hex32(&body["challenge"], "challenge")?;
         let r_pub = hex32(&body["public_key"], "public_key")?;
         let n_r = hex32(&body["nonce"], "nonce")?;
-        self.take_challenge(&n_g)?;
+        let doc_hash = attest_core::sha256(body["document_b64"].as_str().unwrap_or("").as_bytes());
+        ensure!(
+            mac_ok(token, &[REQUEST, &n_g, &r_pub, &n_r, &doc_hash], &body["mac"]),
+            "wrong handoff token"
+        );
+        // The receiver that already succeeded, asking again: same answer.
+        if let Some((k, n, resp)) = &*self.committed.lock().unwrap_or_else(|e| e.into_inner()) {
+            ensure!(k == &r_pub && n == &n_r, "this enclave already handed its sessions over");
+            return Ok(resp.clone());
+        }
+        self.take_challenge(&n_g, &r_pub)?;
         check_peer(
             body["document_b64"].as_str(),
             &own_pcrs(att)?,
@@ -207,11 +245,20 @@ impl Giver {
         )?;
         ensure!(
             !self.done.swap(true, Ordering::SeqCst),
-            "this enclave already handed its sessions over"
+            "a handoff is already under way"
         );
-        // From here this enclave serves no session requests; everything it
-        // has goes to the store, which then refuses its writes.
+        // From here this enclave takes no new session changes, waits for
+        // those under way, writes everything to the store, which then
+        // refuses its writes, and keeps the ownership lock for good.
         ctx.moved.store(true, Ordering::SeqCst);
+        let owner = match tokio::time::timeout(Duration::from_secs(120), ctx.owner.write()).await {
+            Ok(g) => g,
+            Err(_) => {
+                ctx.moved.store(false, Ordering::SeqCst);
+                self.done.store(false, Ordering::SeqCst);
+                anyhow::bail!("requests that change sessions are still under way; try again shortly");
+            }
+        };
         let sessions = match ctx.store.write_all(&ctx.persist).await {
             Ok(s) => s,
             Err(e) => {
@@ -221,6 +268,7 @@ impl Giver {
             }
         };
         ctx.blobs.fence();
+        std::mem::forget(owner);
         let payload = serde_json::to_vec(&Payload {
             master_key: hex::encode(ctx.persist.keys.master()),
             signing_key: hex::encode(ctx.signing.to_bytes()),
@@ -252,11 +300,13 @@ impl Giver {
             "handoff: sessions handed to a successor ({} sessions); this enclave now only answers that they moved",
             ctx.store.len()
         ));
-        Ok(json!({
+        let resp = json!({
             "public_key": hex::encode(&g_pub),
             "ciphertext": b64().encode(&ct),
             "document_b64": doc.map(|d| b64().encode(d)),
-        }))
+        });
+        *self.committed.lock().unwrap_or_else(|e| e.into_inner()) = Some((r_pub, n_r, resp.clone()));
+        Ok(resp)
     }
 }
 
@@ -268,18 +318,9 @@ fn split_peer(peer: &str) -> Result<(String, u16)> {
     }
 }
 
-/// The receiving side: obtain the lineage from the enclave at `peer`.
+/// The receiving side: obtain the lineage from the enclave at `peer`,
+/// retrying for a few minutes with the same key and nR throughout.
 pub async fn receive(net: &Net, att: &Attester, dev: bool, peer: &str, token: &str) -> Result<Payload> {
-    let (host, port) = split_peer(peer)?;
-    let https = !dev;
-    let t = Duration::from_secs(60);
-    let resp = net
-        .request_peer("GET", https, &host, port, "/api/internal/handoff/challenge", vec![], t)
-        .await?;
-    ensure!(resp.status == 200, "the other enclave refused a challenge (HTTP {})", resp.status);
-    let v: Value = serde_json::from_slice(&resp.body)?;
-    let n_g = hex32(&v["nonce"], "nonce")?;
-
     let rng = ring::rand::SystemRandom::new();
     let mine = agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng)
         .map_err(|_| anyhow!("key generation failed"))?;
@@ -289,13 +330,65 @@ pub async fn receive(net: &Net, att: &Attester, dev: bool, peer: &str, token: &s
         .as_ref()
         .try_into()?;
     let n_r = random32();
-    let doc = att.attest(&hash(&[REQUEST, &n_r]), &r_pub, Some(&n_g))?;
+    let mut last = String::new();
+    for attempt in 0..30 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+        match attempt_once(net, att, dev, peer, token, &r_pub, &n_r).await {
+            Ok((g_pub, ct)) => {
+                let key = agreement::agree_ephemeral(
+                    mine,
+                    &agreement::UnparsedPublicKey::new(&agreement::X25519, g_pub),
+                    |shared| session_key(shared, &n_r, &r_pub, &g_pub),
+                )
+                .map_err(|_| anyhow!("key agreement failed"))?;
+                let plain = ChaCha20Poly1305::new(Key::from_slice(&key))
+                    .decrypt(Nonce::from_slice(&[0u8; 12]), AeadPayload { msg: &ct, aad: RESPONSE })
+                    .map_err(|_| anyhow!("the handoff payload failed authentication"))?;
+                return Ok(serde_json::from_slice(&plain)?);
+            }
+            Err(e) => {
+                last = format!("{e:#}");
+                if attempt % 5 == 0 {
+                    crate::log(&format!("handoff: not yet ({last}); retrying"));
+                }
+            }
+        }
+    }
+    anyhow::bail!("couldn't take the sessions over from {peer}: {last}")
+}
+
+/// One try: a challenge, the request, and a checked response (G's key and
+/// the ciphertext). R's key isn't used up until a response checks out.
+async fn attempt_once(
+    net: &Net,
+    att: &Attester,
+    dev: bool,
+    peer: &str,
+    token: &str,
+    r_pub: &[u8; 32],
+    n_r: &[u8; 32],
+) -> Result<([u8; 32], Vec<u8>)> {
+    let (host, port) = split_peer(peer)?;
+    let https = !dev;
+    let t = Duration::from_secs(300);
+    let req = json!({"public_key": hex::encode(r_pub), "mac": mac(token, &[CHALLENGE, r_pub])});
+    let resp = net
+        .request_peer("POST", https, &host, port, "/api/internal/handoff/challenge", serde_json::to_vec(&req)?, t)
+        .await?;
+    ensure!(resp.status == 200, "the other enclave refused a challenge (HTTP {})", resp.status);
+    let v: Value = serde_json::from_slice(&resp.body)?;
+    let n_g = hex32(&v["nonce"], "nonce")?;
+    let doc = att.attest(&hash(&[REQUEST, n_r]), r_pub, Some(&n_g))?;
+    let doc_b64 = doc.map(|d| b64().encode(d));
+    let doc_hash = attest_core::sha256(doc_b64.as_deref().unwrap_or("").as_bytes());
     let req = json!({
         "challenge": hex::encode(n_g),
         "public_key": hex::encode(r_pub),
         "nonce": hex::encode(n_r),
-        "document_b64": doc.map(|d| b64().encode(d)),
-        "token": token,
+        "document_b64": doc_b64,
+        "mac": mac(token, &[REQUEST, &n_g, r_pub, n_r, &doc_hash]),
     });
     let resp = net
         .request_peer("POST", https, &host, port, "/api/internal/handoff", serde_json::to_vec(&req)?, t)
@@ -312,20 +405,11 @@ pub async fn receive(net: &Net, att: &Attester, dev: bool, peer: &str, token: &s
     check_peer(
         v["document_b64"].as_str(),
         &own_pcrs(att)?,
-        &n_r,
+        n_r,
         &g_pub,
-        &hash(&[RESPONSE, &n_r, &r_pub, &g_pub, &attest_core::sha256(&ct)]),
+        &hash(&[RESPONSE, n_r, r_pub, &g_pub, &attest_core::sha256(&ct)]),
     )?;
-    let key = agreement::agree_ephemeral(
-        mine,
-        &agreement::UnparsedPublicKey::new(&agreement::X25519, g_pub),
-        |shared| session_key(shared, &n_r, &r_pub, &g_pub),
-    )
-    .map_err(|_| anyhow!("key agreement failed"))?;
-    let plain = ChaCha20Poly1305::new(Key::from_slice(&key))
-        .decrypt(Nonce::from_slice(&[0u8; 12]), AeadPayload { msg: &ct, aad: RESPONSE })
-        .map_err(|_| anyhow!("the handoff payload failed authentication"))?;
-    Ok(serde_json::from_slice(&plain)?)
+    Ok((g_pub, ct))
 }
 
 #[cfg(test)]

@@ -64,6 +64,10 @@ pub struct Ctx {
     /// Set once this enclave handed its sessions to a successor: it serves
     /// no session requests after that.
     pub moved: AtomicBool,
+    /// Held (shared) by every request that changes session state, and
+    /// exclusively by a handoff: so a handoff waits for changes already
+    /// under way, and none happen during or after it.
+    pub owner: tokio::sync::RwLock<()>,
 }
 
 #[derive(Default)]
@@ -76,6 +80,11 @@ pub struct Store {
     pub persist: std::sync::OnceLock<Arc<crate::persist::Persist>>,
     /// One round of state writes at a time.
     persisting: tokio::sync::Mutex<()>,
+    /// Sessions a predecessor handed over that couldn't be read back yet
+    /// (the parent withheld or damaged a record), with the head hash they
+    /// must match. Retried in the background, and passed on in any later
+    /// handoff, so the set of sessions never quietly shrinks.
+    pub(crate) pending: Mutex<Vec<(String, String)>>,
 }
 
 pub struct Session {
@@ -236,6 +245,9 @@ impl ModelProposal {
 
 #[derive(Serialize, Deserialize)]
 struct RunState {
+    /// Restored from a predecessor enclave (see follow-ups).
+    #[serde(default)]
+    before_move: bool,
     id: String,
     number: u32,
     parent: Option<String>,
@@ -528,6 +540,9 @@ impl Store {
     /// token are indistinguishable.
     pub fn auth(&self, id: &str, token: &str) -> Result<(Arc<Session>, Role)> {
         self.sweep();
+        if lock(&self.pending).iter().any(|(sid, _)| sid == id) {
+            bail!("this session is temporarily unavailable (its stored state couldn't be read back yet); try again later");
+        }
         let s = lock(&self.sessions)
             .get(id)
             .cloned()
@@ -1145,6 +1160,13 @@ impl Session {
             "follow-ups are possible after the auditee decides on run {}",
             parent.number
         );
+        // The same answer for every run from before a move, whether or not
+        // it had finished: which ones had says when they ended.
+        ensure!(
+            !parent.before_move,
+            "run {} ran before this service moved to a new enclave and can't be continued; revise the question to run it again",
+            parent.number
+        );
         let model = st.models.iter().find(|m| m.id == parent.model_id).unwrap();
         ensure!(model.status != "rejected", "that run's model was rejected");
         let rec = MessageRecord {
@@ -1408,6 +1430,7 @@ impl Session {
             ran_on_boot_id: None,
         };
         st.runs.push(RunState {
+            before_move: false,
             id: id.clone(),
             number,
             parent: spec.parent.clone(),

@@ -220,27 +220,13 @@ async fn take_over(
     if let Some(host) = peer.rsplit_once(':').map(|(h, _)| h).or(Some(peer)) {
         net.allow(host.trim_matches(['[', ']']));
     }
-    let mut last = String::new();
-    for attempt in 0..30 {
-        match handoff::receive(net, attester, dev, peer, token).await {
-            Ok(p) => {
-                log(&format!(
-                    "handoff: took over {} sessions from boot {}",
-                    p.sessions.len(),
-                    p.giver_boot
-                ));
-                return Ok(p);
-            }
-            Err(e) => {
-                last = format!("{e:#}");
-                if attempt % 5 == 0 {
-                    log(&format!("handoff: not yet ({last}); retrying"));
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(10)).await;
-    }
-    bail!("couldn't take the sessions over from {peer}: {last}")
+    let p = handoff::receive(net, attester, dev, peer, token).await?;
+    log(&format!(
+        "handoff: took over {} sessions from boot {}",
+        p.sessions.len(),
+        p.giver_boot
+    ));
+    Ok(p)
 }
 
 fn main() -> Result<()> {
@@ -421,6 +407,7 @@ async fn service() -> Result<()> {
         }),
         lineage,
         moved: std::sync::atomic::AtomicBool::new(false),
+        owner: tokio::sync::RwLock::new(()),
         blobs,
         // Fixed in the image: a host-chosen size would let the host shape
         // which reads miss and reach it.
@@ -726,11 +713,18 @@ async fn handle(app: Arc<App>, req: Request<hyper::body::Incoming>) -> Resp {
     let path = req.uri().path().to_string();
     let method = req.method().as_str().to_string();
     let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+    // A request that may change session state holds the ownership lock
+    // (shared) to the end, so a handoff waits for it, and checks `moved`
+    // only once it holds it.
+    let is_session = matches!(parts.as_slice(), ["api", "sessions", ..]);
+    let _owner = if is_session && method != "GET" {
+        Some(app.ctx.owner.read().await)
+    } else {
+        None
+    };
     // After a handoff the successor owns the sessions: answer nothing about
     // them here (the parent moves traffic to the successor).
-    if app.ctx.moved.load(std::sync::atomic::Ordering::SeqCst)
-        && matches!(parts.as_slice(), ["api", "sessions", ..])
-    {
+    if app.ctx.moved.load(std::sync::atomic::Ordering::SeqCst) && is_session {
         return json_resp(
             StatusCode::SERVICE_UNAVAILABLE,
             &json!({"error": "this server's sessions moved to its successor; try again shortly", "moved": true}),
@@ -754,9 +748,7 @@ async fn handle(app: Arc<App>, req: Request<hyper::body::Incoming>) -> Resp {
             StatusCode::OK,
             &serde_json::to_value(&app.ctx.info).unwrap_or_default(),
         )),
-        ("GET", ["api", "internal", "handoff", "challenge"]) => {
-            Ok(json_resp(StatusCode::OK, &app.giver.challenge()))
-        }
+        ("POST", ["api", "internal", "handoff", "challenge"]) => handoff_challenge(&app, req).await,
         ("POST", ["api", "internal", "handoff"]) => give_handoff(&app, req).await,
         ("POST", ["api", "sessions"]) => create_session(&app, &req),
         (_, ["api", "sessions", id, rest @ ..]) => session_route(&app, id, rest, req).await,
@@ -766,6 +758,14 @@ async fn handle(app: Arc<App>, req: Request<hyper::body::Incoming>) -> Resp {
         )),
     };
     r.unwrap_or_else(|ApiError(s, m)| json_resp(s, &json!({"error": m})))
+}
+
+async fn handoff_challenge(app: &App, req: Request<hyper::body::Incoming>) -> Result<Resp, ApiError> {
+    let body = body_json(req).await?;
+    match app.giver.challenge(&body) {
+        Ok(v) => Ok(json_resp(StatusCode::OK, &v)),
+        Err(e) => Err(ApiError(StatusCode::FORBIDDEN, format!("{e:#}"))),
+    }
 }
 
 async fn give_handoff(app: &App, req: Request<hyper::body::Incoming>) -> Result<Resp, ApiError> {
