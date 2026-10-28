@@ -82,8 +82,7 @@ impl Net {
         }
         #[cfg(target_os = "linux")]
         {
-            let addr = tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_HOST, TUNNEL_VSOCK_PORT);
-            let s = tokio_vsock::VsockStream::connect(addr)
+            let s = vsock_connect(TUNNEL_VSOCK_PORT)
                 .await
                 .context("connecting to parent tunnel")?;
             Ok(Box::new(s))
@@ -314,5 +313,29 @@ impl rustls::client::danger::ServerCertVerifier for Capture {
         self.provider
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+/// Connect to the parent over vsock with the socket marked close-on-exec.
+/// tokio-vsock 0.7 tries to set that with F_SETFL, which ignores it, so a
+/// jailed agent started while the connection is open would inherit it and
+/// could write straight to the parent. (The jail also marks everything it
+/// inherits close-on-exec before starting the agent; this is the first line.)
+#[cfg(target_os = "linux")]
+pub async fn vsock_connect(port: u32) -> std::io::Result<tokio_vsock::VsockStream> {
+    let s = tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(
+        tokio_vsock::VMADDR_CID_HOST,
+        port,
+    ))
+    .await?;
+    cloexec(std::os::fd::AsRawFd::as_raw_fd(&s));
+    Ok(s)
+}
+
+/// Mark a descriptor close-on-exec.
+#[cfg(target_os = "linux")]
+pub fn cloexec(fd: std::os::fd::RawFd) {
+    unsafe {
+        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
     }
 }

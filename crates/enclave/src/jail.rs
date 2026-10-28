@@ -539,6 +539,7 @@ unsafe fn child(spec: &Spec, root: &str) -> anyhow::Result<std::convert::Infalli
         "",
     )?;
     std::env::set_current_dir(&spec.cwd)?;
+    cloexec_inherited();
     let lim = |r, v: u64| {
         let l = libc::rlimit {
             rlim_cur: v,
@@ -575,6 +576,28 @@ unsafe fn child(spec: &Spec, root: &str) -> anyhow::Result<std::convert::Infalli
     env_p.push(std::ptr::null());
     libc::execve(argv_p[0], argv_p.as_ptr(), env_p.as_ptr());
     anyhow::bail!("exec {}: {}", spec.argv[0], std::io::Error::last_os_error())
+}
+
+/// Mark every descriptor above stdio close-on-exec, so the agent starts
+/// with stdin, stdout and stderr only. The service's own connections (vsock
+/// links to the parent for logs, blobs and the network tunnel, and accepted
+/// client connections) would otherwise reach the agent: tokio-vsock and the
+/// vsock crate don't create them close-on-exec, and an inherited socket
+/// works regardless of the jail's namespaces and seccomp filter.
+#[cfg(target_os = "linux")]
+unsafe fn cloexec_inherited() {
+    // close_range(3, ~0, CLOSE_RANGE_CLOEXEC) on Linux 5.11+; the enclave's
+    // 4.14 kernel lacks it, so fall back to every descriptor under the limit.
+    const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+    if libc::syscall(libc::SYS_close_range, 3 as libc::c_uint, libc::c_uint::MAX, CLOSE_RANGE_CLOEXEC) == 0 {
+        return;
+    }
+    let mut l = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    libc::getrlimit(libc::RLIMIT_NOFILE, &mut l);
+    let max = l.rlim_cur.max(l.rlim_max).min(1 << 20) as libc::c_int;
+    for fd in 3..max {
+        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+    }
 }
 
 /// Allow everything except: sockets other than Unix and IP (so no vsock to

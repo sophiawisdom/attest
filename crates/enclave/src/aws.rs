@@ -43,11 +43,9 @@ pub async fn credentials(dev: bool) -> Result<Credentials> {
     #[cfg(target_os = "linux")]
     {
         use tokio::io::AsyncReadExt;
-        let addr =
-            tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_HOST, CREDENTIALS_VSOCK_PORT);
         let stream = tokio::time::timeout(
             Duration::from_secs(10),
-            tokio_vsock::VsockStream::connect(addr),
+            crate::net::vsock_connect(CREDENTIALS_VSOCK_PORT),
         )
         .await
         .map_err(|_| anyhow!("timeout reaching the credential bridge"))??;

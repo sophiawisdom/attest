@@ -113,11 +113,10 @@ fn start_log_forwarding(dev: bool) {
         #[cfg(target_os = "linux")]
         {
             use tokio::io::AsyncWriteExt;
-            let addr = tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_HOST, LOG_VSOCK_PORT);
             let mut conn: Option<tokio_vsock::VsockStream> = None;
             while let Some(line) = rx.recv().await {
                 if conn.is_none() {
-                    conn = tokio_vsock::VsockStream::connect(addr).await.ok();
+                    conn = crate::net::vsock_connect(LOG_VSOCK_PORT).await.ok();
                 }
                 if let Some(c) = conn.as_mut() {
                     if c.write_all(format!("{line}\n").as_bytes()).await.is_err() {
@@ -142,7 +141,6 @@ async fn read_host_config(args: &Args) -> Result<HostConfig> {
     #[cfg(target_os = "linux")]
     {
         use tokio::io::AsyncReadExt;
-        let addr = tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_HOST, CONFIG_VSOCK_PORT);
         // The parent's config service may start after us, or drop a
         // connection; retry the whole exchange for a minute.
         let mut last = String::new();
@@ -150,7 +148,7 @@ async fn read_host_config(args: &Args) -> Result<HostConfig> {
             let attempt = async {
                 let mut s = tokio::time::timeout(
                     Duration::from_secs(5),
-                    tokio_vsock::VsockStream::connect(addr),
+                    crate::net::vsock_connect(CONFIG_VSOCK_PORT),
                 )
                 .await
                 .map_err(|_| anyhow!("timeout"))??;
@@ -418,6 +416,8 @@ async fn serve(args: Args, app: Arc<App>, tls: Option<Arc<tls::ServerIdentity>>)
         ));
         loop {
             let (s, _) = l.accept().await?;
+            // The vsock crate accepts without SOCK_CLOEXEC; see net::vsock_connect.
+            crate::net::cloexec(std::os::fd::AsRawFd::as_raw_fd(&s));
             let (app, acceptor) = (app.clone(), acceptor.clone());
             tokio::spawn(async move {
                 let Ok(Ok(stream)) =

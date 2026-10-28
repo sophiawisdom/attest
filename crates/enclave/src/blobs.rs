@@ -66,9 +66,8 @@ impl BlobClient {
         }
         #[cfg(target_os = "linux")]
         {
-            let addr = tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_HOST, BLOB_VSOCK_PORT);
             Ok(Box::new(
-                tokio_vsock::VsockStream::connect(addr)
+                crate::net::vsock_connect(BLOB_VSOCK_PORT)
                     .await
                     .context("parent blob store")?,
             ))
