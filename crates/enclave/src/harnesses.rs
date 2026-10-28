@@ -142,8 +142,9 @@ pub fn agent_prompt(
 fn parse_verdict(text: &str, format: &AnswerFormat) -> Result<Verdict, String> {
     let start = text.find('{').ok_or("no JSON verdict")?;
     let end = text.rfind('}').ok_or("no JSON verdict")?;
-    let v: Value = serde_json::from_str(&text[start..=end])
-        .map_err(|_| "verdict is not valid JSON".to_string())?;
+    let json = text.get(start..=end).ok_or("no JSON verdict")?;
+    let v: Value =
+        serde_json::from_str(json).map_err(|_| "verdict is not valid JSON".to_string())?;
     crate::run::parse_verdict(&v, format).map_err(|e| e.to_string())
 }
 
@@ -597,6 +598,9 @@ mod tests {
     #[test]
     fn verdict_parsing() {
         let text = AnswerFormat::default();
+        // Braces in the wrong order are an error, not a panic.
+        assert!(parse_verdict("}xx{", &text).is_err());
+        assert!(parse_verdict("}", &text).is_err());
         let v = parse_verdict(
             "done.\n{\"answer\": \"no\", \"confidence\": 0.7, \"summary\": \"s\"}\n",
             &text,

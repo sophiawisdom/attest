@@ -60,8 +60,8 @@ pub async fn agent_loop(
             }
         };
         activity.llm_calls += 1;
-        activity.input_tokens += reply.input_tokens;
-        activity.output_tokens += reply.output_tokens;
+        activity.input_tokens = activity.input_tokens.saturating_add(reply.input_tokens);
+        activity.output_tokens = activity.output_tokens.saturating_add(reply.output_tokens);
         if let Some(m) = &reply.model {
             response_models.insert(m.clone());
         }

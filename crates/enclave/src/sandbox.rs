@@ -486,13 +486,13 @@ impl WasiFile for RepoFile {
         let mut pos = self.pos.lock().unwrap();
         let len = self.data.len() as i64;
         let new = match to {
-            SeekFrom::Start(n) => n as i64,
-            SeekFrom::End(d) => len + d,
-            SeekFrom::Current(d) => *pos as i64 + d,
+            SeekFrom::Start(n) => i64::try_from(n).ok(),
+            SeekFrom::End(d) => len.checked_add(d),
+            SeekFrom::Current(d) => i64::try_from(*pos).ok().and_then(|p| p.checked_add(d)),
         };
-        if new < 0 {
+        let Some(new) = new.filter(|n| *n >= 0) else {
             return Err(Error::invalid_argument());
-        }
+        };
         *pos = new as u64;
         Ok(*pos)
     }

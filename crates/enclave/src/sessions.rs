@@ -59,6 +59,7 @@ pub struct Store {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     /// question text sha256 -> sessions that ran it
     text_index: Mutex<HashMap<String, HashSet<String>>>,
+    last_sweep: std::sync::atomic::AtomicU64,
 }
 
 pub struct Session {
@@ -75,6 +76,8 @@ pub struct Session {
 
 #[derive(Default)]
 struct State {
+    /// Set when the session is swept away; nothing new starts after that.
+    expired: bool,
     versions: [u64; 2],
     auditor_joined: bool,
     questions: Vec<Question>,
@@ -222,22 +225,101 @@ fn clean(s: Option<&str>) -> Option<String> {
     s.map(|x| x.trim().to_string()).filter(|x| !x.is_empty())
 }
 
+/// Lock a mutex even if a thread panicked while holding it. A panic is a bug
+/// to fix, but it shouldn't make every later request in that session (or,
+/// for the global map, on the server) fail too.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A session nobody has used (no question, no code) is dropped after this,
+/// and is the first to go when the server is full, so creating empty
+/// sessions can't lock others out.
+const IDLE_SESSION_TTL_MS: u64 = 24 * 3600 * 1000;
+
+impl Session {
+    fn expired(&self, now: u64) -> bool {
+        now.saturating_sub(self.created_at_ms) >= SESSION_TTL_MS
+    }
+
+    fn idle(&self) -> bool {
+        let st = lock(&self.st);
+        st.questions.is_empty() && st.code.is_none()
+    }
+}
+
 impl Store {
-    pub fn create(&self) -> Result<(Arc<Session>, String, String)> {
-        let mut map = self.sessions.lock().unwrap();
+    /// Drop expired sessions (and idle ones past their shorter limit), at
+    /// most once a minute; called on every request. Sessions are taken out
+    /// of the map first and cleaned up after its lock is released.
+    pub fn sweep(&self) {
         let now = now_ms();
-        let expired: Vec<String> = map
-            .iter()
-            .filter(|(_, s)| now.saturating_sub(s.created_at_ms) >= SESSION_TTL_MS)
-            .map(|(k, _)| k.clone())
+        let last = self.last_sweep.load(std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(last) < 60_000
+            || self
+                .last_sweep
+                .compare_exchange(last, now, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        let snapshot: Vec<Arc<Session>> = lock(&self.sessions).values().cloned().collect();
+        let gone: Vec<Arc<Session>> = snapshot
+            .into_iter()
+            .filter(|s| {
+                s.expired(now)
+                    || (now.saturating_sub(s.created_at_ms) >= IDLE_SESSION_TTL_MS && s.idle())
+            })
             .collect();
-        for id in expired {
-            if let Some(s) = map.remove(&id) {
-                if let Some(b) = s.st.lock().unwrap().code.take() {
-                    tokio::spawn(async move { b.discard().await });
-                }
+        self.remove(&gone);
+    }
+
+    fn remove(&self, gone: &[Arc<Session>]) {
+        if gone.is_empty() {
+            return;
+        }
+        {
+            let mut map = lock(&self.sessions);
+            for s in gone {
+                map.remove(&s.id);
             }
         }
+        {
+            let mut idx = lock(&self.text_index);
+            for set in idx.values_mut() {
+                for s in gone {
+                    set.remove(&s.id);
+                }
+            }
+            idx.retain(|_, set| !set.is_empty());
+        }
+        for s in gone {
+            let mut st = lock(&s.st);
+            // Runs still going hold their own reference to the code; it's
+            // discarded once they end (see RunJob).
+            if let Some(b) = st.code.take() {
+                tokio::spawn(async move { b.discard().await });
+            }
+            st.expired = true;
+        }
+    }
+
+    pub fn create(&self) -> Result<(Arc<Session>, String, String)> {
+        self.sweep();
+        let now = now_ms();
+        let full = lock(&self.sessions).len() >= MAX_SESSIONS;
+        if full {
+            // Make room by dropping the oldest session nobody has used.
+            let snapshot: Vec<Arc<Session>> = lock(&self.sessions).values().cloned().collect();
+            let oldest_idle = snapshot
+                .into_iter()
+                .filter(|s| s.idle())
+                .min_by_key(|s| s.created_at_ms);
+            if let Some(s) = oldest_idle {
+                self.remove(&[s]);
+            }
+        }
+        let mut map = lock(&self.sessions);
         ensure!(
             map.len() < MAX_SESSIONS,
             "this server is at its session limit; try again later"
@@ -262,7 +344,11 @@ impl Store {
     /// Find the session and the role a token grants. Unknown session and bad
     /// token are indistinguishable.
     pub fn auth(&self, id: &str, token: &str) -> Result<(Arc<Session>, Role)> {
-        let s = self.sessions.lock().unwrap().get(id).cloned();
+        self.sweep();
+        let s = lock(&self.sessions)
+            .get(id)
+            .cloned()
+            .filter(|s| !s.expired(now_ms()));
         let h = sha256_hex(token.as_bytes());
         if let Some(s) = s {
             if h == s.token_hashes[0] {
@@ -276,11 +362,11 @@ impl Store {
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<Session>> {
-        self.sessions.lock().unwrap().get(id).cloned()
+        lock(&self.sessions).get(id).cloned()
     }
 
     fn note_text_run(&self, text_sha: &str, session: &str) -> u32 {
-        let mut idx = self.text_index.lock().unwrap();
+        let mut idx = lock(&self.text_index);
         let set = idx.entry(text_sha.to_string()).or_default();
         let others = set.iter().filter(|s| *s != session).count() as u32;
         set.insert(session.to_string());
@@ -303,12 +389,14 @@ impl Session {
     fn changed_for(&self, st: &mut State, role: Role) {
         let i = ri(role);
         st.versions[i] += 1;
-        let _ = self.tx[i].send(st.versions[i]);
+        // send_replace stores the value even when nobody is waiting, so a
+        // long-poll that subscribes later sees it at once.
+        self.tx[i].send_replace(st.versions[i]);
     }
 
     /// Email `role` now, if they asked for email.
     fn email(&self, ctx: &Arc<Ctx>, role: Role, text: String) {
-        let prefs = self.st.lock().unwrap().notify.get(&role).cloned();
+        let prefs = lock(&self.st).notify.get(&role).cloned();
         if let Some(NotifyPrefs {
             email: Some(email),
             email_status,
@@ -388,7 +476,7 @@ impl Session {
     // ------------------------------------------------------------ actions
 
     pub fn touch(&self, ctx: &Arc<Ctx>, role: Role) {
-        let mut st = self.st.lock().unwrap();
+        let mut st = lock(&self.st);
         if role == Role::Auditor && !st.auditor_joined {
             st.auditor_joined = true;
             self.event(
@@ -429,7 +517,7 @@ impl Session {
         answer_format
             .validate()
             .map_err(|e| anyhow!("answer_format: {e}"))?;
-        let mut st = self.st.lock().unwrap();
+        let mut st = lock(&self.st);
         for q in st.questions.iter_mut().filter(|q| q.status == "proposed") {
             q.status = "superseded";
         }
@@ -479,7 +567,7 @@ impl Session {
             .as_u64()
             .ok_or_else(|| anyhow!("version is required"))? as u32;
         let note = clean(v["note"].as_str());
-        let mut st = self.st.lock().unwrap();
+        let mut st = lock(&self.st);
         let q = st
             .questions
             .last_mut()
@@ -520,7 +608,7 @@ impl Session {
         ensure!(role == Role::Auditee, "only the auditee uploads code");
         let bundle = Arc::new(bundle);
         let info = bundle.info.clone();
-        let mut st = self.st.lock().unwrap();
+        let mut st = lock(&self.st);
         if let Some(old) = st.code.replace(bundle) {
             // Runs still holding it keep working; blobs go once nothing does.
             if Arc::strong_count(&old) == 1 {
@@ -559,7 +647,7 @@ impl Session {
         let git_commit = clean(v["git_commit"].as_str());
         let tree = clean(v["tree_sha256"].as_str())
             .ok_or_else(|| anyhow!("tree_sha256 of the uploaded code is required"))?;
-        let mut st = self.st.lock().unwrap();
+        let mut st = lock(&self.st);
         let code = st
             .code
             .as_ref()
@@ -642,7 +730,7 @@ impl Session {
             "mock_endpoint is required for the mock provider"
         );
         let api_key_given = !api_key.is_empty();
-        let mut st = self.st.lock().unwrap();
+        let mut st = lock(&self.st);
         let id = st.models.len() as u32 + 1;
         // The auditee's own proposal needs no approval.
         let approved = role == Role::Auditee;
@@ -722,7 +810,7 @@ impl Session {
             .ok_or_else(|| anyhow!("approve (true/false) is required"))?;
         let note = clean(v["note"].as_str());
         let own_key = clean(v["api_key"].as_str());
-        let mut st = self.st.lock().unwrap();
+        let mut st = lock(&self.st);
         ensure!(
             st.models
                 .iter()
@@ -800,7 +888,7 @@ impl Session {
             .ok_or_else(|| anyhow!("release (true/false) is required"))?;
         let note = clean(v["note"].as_str());
         let details = v["details"].as_bool().unwrap_or(false);
-        let mut st = self.st.lock().unwrap();
+        let mut st = lock(&self.st);
         let strict = st.questions.last().map(|q| q.answer_format.is_strict());
         let r = st
             .runs
@@ -849,7 +937,7 @@ impl Session {
             "message is too long"
         );
         let blinded = v["blinded"].as_bool().unwrap_or(false);
-        let mut st = self.st.lock().unwrap();
+        let mut st = lock(&self.st);
         ensure!(
             !busy_for(&st, role),
             "wait until the current run is released or declined"
@@ -898,7 +986,7 @@ impl Session {
                 && !e.contains(|c: char| c.is_whitespace() || c == ',' || c == '<' || c == '>');
             ensure!(valid, "that does not look like an email address");
         }
-        let mut st = self.st.lock().unwrap();
+        let mut st = lock(&self.st);
         let prefs = st.notify.entry(role).or_default();
         if prefs.email == email {
             return Ok(serde_json::to_value(prefs.clone())?);
@@ -919,7 +1007,7 @@ impl Session {
     }
 
     pub fn set_email_status(&self, role: Role, email: &str, status: &str) {
-        let mut st = self.st.lock().unwrap();
+        let mut st = lock(&self.st);
         if let Some(p) = st.notify.get_mut(&role) {
             if p.email.as_deref() == Some(email) {
                 p.email_status = status.into();
@@ -933,6 +1021,9 @@ impl Session {
     /// Start a run when the question is accepted, the code and affidavit are
     /// in place, and a model is approved, unless that combination already ran.
     fn maybe_start(self: &Arc<Self>, ctx: &Arc<Ctx>, st: &mut State) {
+        if st.expired {
+            return;
+        }
         let Some(q) = st.questions.last() else { return };
         // Not while a run awaits the auditee's decision either: a new run
         // starting would tell the auditor when the earlier one finished.
@@ -1169,7 +1260,7 @@ impl Session {
     // ------------------------------------------------------------ views
 
     pub fn view(&self, ctx: &Ctx, role: Role, since: u64) -> Value {
-        let st = self.st.lock().unwrap();
+        let st = lock(&self.st);
         let events: Vec<Event> = st
             .events
             .iter()
@@ -1223,7 +1314,7 @@ impl Session {
             role == Role::Auditee,
             "only the auditee can see the agent's trace"
         );
-        let st = self.st.lock().unwrap();
+        let st = lock(&self.st);
         let r = st
             .runs
             .iter()
@@ -1245,7 +1336,7 @@ impl Session {
         use base64::Engine as _;
         ensure!(role == Role::Auditee, "only the auditee discloses");
         let bundle = {
-            let st = self.st.lock().unwrap();
+            let st = lock(&self.st);
             ensure!(
                 st.disclosures.len() < MAX_DISCLOSURES,
                 "this session has {MAX_DISCLOSURES} disclosures already"
@@ -1329,7 +1420,7 @@ impl Session {
             }
             _ => bail!("kind must be \"file\" or \"python\""),
         };
-        let mut st = self.st.lock().unwrap();
+        let mut st = lock(&self.st);
         ensure!(
             st.code.as_ref().is_some_and(|c| Arc::ptr_eq(c, &bundle)),
             "the code was replaced while the disclosure was being prepared; try again"
@@ -1374,7 +1465,7 @@ impl Session {
         let publish = v["publish"]
             .as_bool()
             .ok_or_else(|| anyhow!("publish (true or false) is required"))?;
-        let mut st = self.st.lock().unwrap();
+        let mut st = lock(&self.st);
         let current = st.code.as_ref().map(|c| c.info.commitment_sha256.clone());
         let d = st
             .disclosures
@@ -1435,7 +1526,7 @@ impl Session {
     }
 
     pub fn disclosure(&self, role: Role, number: u32) -> Result<Disclosure> {
-        let st = self.st.lock().unwrap();
+        let st = lock(&self.st);
         let d = st
             .disclosures
             .iter()
@@ -1450,7 +1541,7 @@ impl Session {
     }
 
     pub fn certificate(&self, ctx: &Ctx, role: Role, run_id: &str) -> Result<Certificate> {
-        let st = self.st.lock().unwrap();
+        let st = lock(&self.st);
         let r = st
             .runs
             .iter()
@@ -1513,13 +1604,14 @@ struct RunJob {
 
 impl RunJob {
     async fn execute(self) {
-        let _permit = self.ctx.slots.acquire().await;
+        let ctx = self.ctx.clone();
+        let _permit = ctx.slots.acquire().await;
         let started_at_ms = now_ms();
         let session = self.session.clone();
         let run_id = self.run_id.clone();
         let progress: Arc<dyn Fn(Vec<Value>) + Send + Sync> =
             Arc::new(move |entries: Vec<Value>| {
-                let mut st = session.st.lock().unwrap();
+                let mut st = lock(&session.st);
                 if let Some(r) = st.runs.iter_mut().find(|r| r.id == run_id) {
                     r.steps += entries
                         .iter()
@@ -1531,17 +1623,19 @@ impl RunJob {
                 // fixed schedule, so the timing of their trace fetches (which
                 // the parent sees) doesn't follow what the agent does.
             });
-        let ticker = {
+        // Aborted however this function ends, so it can't keep the session
+        // alive after a failed run.
+        let ticker = AbortOnDrop({
             let session = self.session.clone();
             tokio::spawn(async move {
                 let mut t = tokio::time::interval(Duration::from_secs(5));
                 loop {
                     t.tick().await;
-                    let mut st = session.st.lock().unwrap();
+                    let mut st = lock(&session.st);
                     session.changed_for(&mut st, Role::Auditee);
                 }
             })
-        };
+        });
         // Email the auditee at the run's time limit, whether or not it has
         // finished: a completion-triggered email would carry its timing.
         {
@@ -1550,7 +1644,7 @@ impl RunJob {
             tokio::spawn(async move {
                 tokio::time::sleep(limit).await;
                 let decided =
-                    session.st.lock().unwrap().runs.iter().any(|r| {
+                    lock(&session.st).runs.iter().any(|r| {
                         r.number == n && (r.status == "released" || r.status == "declined")
                     });
                 if decided {
@@ -1559,10 +1653,28 @@ impl RunJob {
                 session.email(&ctx, Role::Auditee, format!("Run {n} has had its full time ({} min). Once it has finished, review it and decide whether to release it.", limit.as_secs() / 60));
             });
         }
+        // Loading and the agent together get the run's time limit (plus a
+        // margin for the jail's own shutdown), and a panic anywhere in them
+        // ends the run as failed instead of leaving it "running" forever.
+        let deadline = run_time_limit(self.question.max_steps) + Duration::from_secs(120);
+        let work = std::panic::AssertUnwindSafe(self.agent(progress.clone()));
+        let out = match tokio::time::timeout(deadline, futures_util::FutureExt::catch_unwind(work)).await {
+            Ok(Ok(out)) => out,
+            Ok(Err(_)) => failed_output("the run failed inside the enclave (an internal error)"),
+            Err(_) => failed_output(&format!(
+                "the run did not finish within its {} minutes",
+                deadline.as_secs() / 60
+            )),
+        };
+        self.finish(out, started_at_ms, ticker);
+    }
+
+    /// Load the code and run the agent.
+    async fn agent(&self, progress: Arc<dyn Fn(Vec<Value>) + Send + Sync>) -> run::AgentOutput {
         // Load all the code into enclave memory first; from here on the
         // host sees no reads that depend on what the agent does.
         let pin = self.bundle.pin().await;
-        let out = match (&pin, &self.harness_job) {
+        match (&pin, &self.harness_job) {
             (Err(e), _) => run::AgentOutput {
                 turns: vec![],
                 verdict: None,
@@ -1606,8 +1718,11 @@ impl RunJob {
                 )
                 .await
             }
-        };
+        }
+    }
 
+    /// Record the run's result and start whatever is queued next.
+    fn finish(self, out: run::AgentOutput, started_at_ms: u64, ticker: AbortOnDrop) {
         let mut model = self.model_info.clone();
         model.response_models = out.response_models.clone();
         model.upstream_providers = out.upstream_providers.clone();
@@ -1642,7 +1757,7 @@ impl RunJob {
             verdict: out.verdict.clone(),
         };
 
-        let mut st = self.session.st.lock().unwrap();
+        let mut st = lock(&self.session.st);
         let Some(r) = st.runs.iter_mut().find(|r| r.id == self.run_id) else {
             return;
         };
@@ -1664,16 +1779,40 @@ impl RunJob {
             None,
             false,
         );
-        ticker.abort();
+        drop(ticker);
 
         let s = self.session.clone();
         drop(st);
-        let mut st = s.st.lock().unwrap();
+        let mut st = lock(&s.st);
         s.maybe_start(&self.ctx, &mut st);
     }
 }
 
 /// How long a run may take; also when the auditee is emailed about it.
+/// Aborts a background task when dropped.
+pub struct AbortOnDrop(pub tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn failed_output(message: &str) -> run::AgentOutput {
+    run::AgentOutput {
+        turns: vec![],
+        verdict: None,
+        outcome: Outcome::Error {
+            message: message.into(),
+        },
+        activity: Default::default(),
+        files_read: Default::default(),
+        response_models: vec![],
+        upstream_providers: vec![],
+        key_owner: None,
+    }
+}
+
 fn run_time_limit(max_steps: u32) -> Duration {
     Duration::from_secs((max_steps as u64 * 20).clamp(300, 1800))
 }
@@ -1682,7 +1821,7 @@ fn run_time_limit(max_steps: u32) -> Duration {
 /// answer. Activity numbers are steered by the model, so they are rounded up
 /// to powers of two; per-file detail is dropped; times are rounded to the hour.
 fn minimize_for_strict_format(m: &mut Manifest) {
-    let p2 = |n: u64| if n == 0 { 0 } else { n.next_power_of_two() };
+    let p2 = |n: u64| if n == 0 { 0 } else { n.checked_next_power_of_two().unwrap_or(u64::MAX) };
     let a = &mut m.activity;
     *a = Activity {
         llm_calls: p2(a.llm_calls as u64) as u32,
