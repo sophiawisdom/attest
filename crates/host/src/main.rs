@@ -774,6 +774,30 @@ impl Blobs {
         Ok(())
     }
 
+    /// A standby taking over: forget the local cache, which may hold records
+    /// the primary has since overwritten in S3, and pick up S3's current
+    /// generation. Without S3 the directory is the store itself: kept.
+    async fn drop_cache(self: &std::sync::Arc<Self>) -> Result<()> {
+        let Some(r) = &self.remote else {
+            return Ok(());
+        };
+        let g = match r.s3.get(&r.current_key()).await? {
+            Some(g) if g.len() == 32 && g.iter().all(|c| c.is_ascii_hexdigit()) => String::from_utf8(g).unwrap_or_default(),
+            _ => anyhow::bail!("S3 has no current generation"),
+        };
+        *r.generation.write().unwrap_or_else(|p| p.into_inner()) = g.clone();
+        let dir = self.dir.clone();
+        let freed = blocking(move || {
+            let n = remove_all_under(&dir);
+            let _ = std::fs::write(dir.join(GENERATION_FILE), &g);
+            n
+        })
+        .await?;
+        self.add(-(freed as i64));
+        log(&format!("blob store: standby taking over; cleared {} MiB of cache", freed >> 20));
+        Ok(())
+    }
+
     /// A new enclave lineage: everything stored is unreadable now.
     async fn reset(self: &std::sync::Arc<Self>) -> Result<()> {
         let dir = self.dir.clone();
@@ -801,7 +825,9 @@ impl Blobs {
 
 /// op u8 | id [24] | len u64le | data  ->  status u8 | len u64le | data
 ///   1 put, 2 get, 3 delete everything with this id's 8-byte session tag,
-///   4 reset: a new enclave booted, so everything stored is unreadable now.
+///   4 reset: a new enclave booted, so everything stored is unreadable now,
+///   5 drop the local cache (a standby taking over: another instance may
+///     have overwritten records since they were cached here).
 /// Status: 0 ok, 1 not found, 2 error (message in data).
 async fn handle_blob<S: Io>(b: std::sync::Arc<Blobs>, mut s: S) -> Result<()> {
     use tokio::io::AsyncReadExt;
@@ -835,6 +861,10 @@ async fn handle_blob<S: Io>(b: std::sync::Arc<Blobs>, mut s: S) -> Result<()> {
             Err(e) => reply(2, format!("{e:#}").as_bytes()),
         },
         4 => match b.reset().await {
+            Ok(()) => reply(0, b""),
+            Err(e) => reply(2, format!("{e:#}").as_bytes()),
+        },
+        5 => match b.drop_cache().await {
             Ok(()) => reply(0, b""),
             Err(e) => reply(2, format!("{e:#}").as_bytes()),
         },

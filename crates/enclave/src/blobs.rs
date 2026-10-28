@@ -30,6 +30,9 @@ pub const OP_PUT: u8 = 1;
 pub const OP_GET: u8 = 2;
 pub const OP_DELETE_PREFIX: u8 = 3;
 pub const OP_RESET: u8 = 4;
+/// Drop the parent's local cache (it may hold records another enclave has
+/// since overwritten in the shared store).
+pub const OP_DROP_CACHE: u8 = 5;
 /// Largest single file we store (plaintext).
 pub const MAX_FILE_BYTES: usize = 64 << 20;
 /// The parent's limit on one stored blob (crates/host: MAX_BLOB_BYTES).
@@ -138,6 +141,7 @@ impl BlobClient {
                     Some(vec![])
                 }
                 OP_GET => m.get(id).cloned(),
+                OP_DROP_CACHE => Some(vec![]),
                 _ => {
                     m.retain(|k, _| !k.starts_with(id));
                     Some(vec![])
@@ -189,6 +193,10 @@ impl BlobClient {
 
     pub async fn get(&self, id: &BlobId) -> Result<Option<Vec<u8>>> {
         self.call(OP_GET, id, &[]).await
+    }
+
+    pub async fn drop_cache(&self) -> Result<()> {
+        self.call(OP_DROP_CACHE, &[], &[]).await.map(|_| ())
     }
 
     pub async fn delete_session(&self, tag: &[u8; 8]) -> Result<()> {

@@ -56,12 +56,12 @@ const KEY: &[u8] = b"attest-handoff-key/1";
 const CHALLENGE: &[u8] = b"attest-handoff-challenge/1";
 
 /// A MAC under the operator's handoff token.
-fn mac(token: &str, parts: &[&[u8]]) -> String {
+pub(crate) fn mac(token: &str, parts: &[&[u8]]) -> String {
     let k = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, token.as_bytes());
     hex::encode(ring::hmac::sign(&k, &hash(parts)).as_ref())
 }
 
-fn mac_ok(token: &str, parts: &[&[u8]], got: &Value) -> bool {
+pub(crate) fn mac_ok(token: &str, parts: &[&[u8]], got: &Value) -> bool {
     let Some(tag) = got.as_str().and_then(|g| hex::decode(g).ok()) else {
         return false;
     };
@@ -82,11 +82,11 @@ pub struct Payload {
     pub sessions: Vec<(String, String)>,
 }
 
-fn b64() -> base64::engine::GeneralPurpose {
+pub(crate) fn b64() -> base64::engine::GeneralPurpose {
     base64::engine::general_purpose::STANDARD
 }
 
-fn hash(parts: &[&[u8]]) -> [u8; 32] {
+pub(crate) fn hash(parts: &[&[u8]]) -> [u8; 32] {
     let mut h = Vec::new();
     for p in parts {
         h.extend_from_slice(&(p.len() as u64).to_le_bytes());
@@ -225,11 +225,15 @@ impl Giver {
         let n_g = hex32(&body["challenge"], "challenge")?;
         let r_pub = hex32(&body["public_key"], "public_key")?;
         let n_r = hex32(&body["nonce"], "nonce")?;
+        let copy = body["copy"].as_bool().unwrap_or(false);
         let doc_hash = attest_core::sha256(body["document_b64"].as_str().unwrap_or("").as_bytes());
         ensure!(
-            mac_ok(token, &[REQUEST, &n_g, &r_pub, &n_r, &doc_hash], &body["mac"]),
+            mac_ok(token, &[REQUEST, &n_g, &r_pub, &n_r, &doc_hash, &[copy as u8]], &body["mac"]),
             "wrong handoff token"
         );
+        if copy {
+            return self.give_copy(ctx, att, &n_g, &r_pub, &n_r, body).await;
+        }
         // The receiver that already succeeded, asking again: same answer.
         if let Some((k, n, resp)) = &*self.committed.lock().unwrap_or_else(|e| e.into_inner()) {
             ensure!(k == &r_pub && n == &n_r, "this enclave already handed its sessions over");
@@ -269,6 +273,70 @@ impl Giver {
         };
         ctx.blobs.fence();
         std::mem::forget(owner);
+        let (resp, _) = seal_payload(ctx, att, sessions, &r_pub, &n_r)?;
+        crate::log(&format!(
+            "handoff: sessions handed to a successor ({} sessions); this enclave now only answers that they moved",
+            ctx.store.len()
+        ));
+        *self.committed.lock().unwrap_or_else(|e| e.into_inner()) = Some((r_pub, n_r, resp.clone()));
+        Ok(resp)
+    }
+
+    /// A copy for a standby: the same payload, but this enclave keeps
+    /// serving, and the standby then follows its writes (replica.rs).
+    async fn give_copy(
+        &self,
+        ctx: &Arc<crate::sessions::Ctx>,
+        att: &Attester,
+        n_g: &[u8; 32],
+        r_pub: &[u8; 32],
+        n_r: &[u8; 32],
+        body: &Value,
+    ) -> Result<Value> {
+        if let Some(resp) = ctx.repl.repeat(r_pub, n_r) {
+            return Ok(resp);
+        }
+        ensure!(!ctx.standby.load(Ordering::SeqCst), "this enclave is itself a standby");
+        ensure!(!ctx.moved.load(Ordering::SeqCst), "this enclave's sessions moved");
+        self.take_challenge(n_g, r_pub)?;
+        check_peer(
+            body["document_b64"].as_str(),
+            &own_pcrs(att)?,
+            n_g,
+            r_pub,
+            &hash(&[REQUEST, n_r]),
+        )?;
+        // Everything written, so the heads in the copy are current.
+        let sessions = {
+            let _owner = tokio::time::timeout(Duration::from_secs(120), ctx.owner.write())
+                .await
+                .map_err(|_| anyhow!("requests that change sessions are still under way; try again shortly"))?;
+            ctx.store.write_all(&ctx.persist).await.context("writing state for a standby")?
+        };
+        ctx.repl.publish(sessions.clone());
+        let (resp, key) = seal_payload(ctx, att, sessions, r_pub, n_r)?;
+        ctx.repl.add(*r_pub, *n_r, channel_key(&key), resp.clone());
+        crate::log("replica: a standby took a copy of this lineage");
+        Ok(resp)
+    }
+}
+
+/// The key a primary and its standby share after a copy.
+pub fn channel_key(handoff_key: &[u8; 32]) -> [u8; 32] {
+    hash(&[b"attest-replica-channel/1", handoff_key])
+}
+
+/// The payload, encrypted to the receiver and attested; also the key used.
+fn seal_payload(
+    ctx: &Arc<crate::sessions::Ctx>,
+    att: &Attester,
+    sessions: Vec<(String, String)>,
+    r_pub: &[u8; 32],
+    n_r: &[u8; 32],
+) -> Result<(Value, [u8; 32])> {
+    let r_pub = *r_pub;
+    let n_r = *n_r;
+    {
         let payload = serde_json::to_vec(&Payload {
             master_key: hex::encode(ctx.persist.keys.master()),
             signing_key: hex::encode(ctx.signing.to_bytes()),
@@ -296,22 +364,17 @@ impl Giver {
             .map_err(|_| anyhow!("encryption failed"))?;
         let user_data = hash(&[RESPONSE, &n_r, &r_pub, &g_pub, &attest_core::sha256(&ct)]);
         let doc = att.attest(&user_data, &g_pub, Some(&n_r))?;
-        crate::log(&format!(
-            "handoff: sessions handed to a successor ({} sessions); this enclave now only answers that they moved",
-            ctx.store.len()
-        ));
         let resp = json!({
             "public_key": hex::encode(&g_pub),
             "ciphertext": b64().encode(&ct),
             "document_b64": doc.map(|d| b64().encode(d)),
         });
-        *self.committed.lock().unwrap_or_else(|e| e.into_inner()) = Some((r_pub, n_r, resp.clone()));
-        Ok(resp)
+        Ok((resp, key))
     }
 }
 
 /// `host[:port]`, port 443 unless given.
-fn split_peer(peer: &str) -> Result<(String, u16)> {
+pub(crate) fn split_peer(peer: &str) -> Result<(String, u16)> {
     match peer.rsplit_once(':') {
         Some((h, p)) if !h.contains(':') || h.starts_with('[') => Ok((h.trim_matches(['[', ']']).to_string(), p.parse()?)),
         _ => Ok((peer.to_string(), 443)),
@@ -320,7 +383,14 @@ fn split_peer(peer: &str) -> Result<(String, u16)> {
 
 /// The receiving side: obtain the lineage from the enclave at `peer`,
 /// retrying for a few minutes with the same key and nR throughout.
-pub async fn receive(net: &Net, att: &Attester, dev: bool, peer: &str, token: &str) -> Result<Payload> {
+pub struct Received {
+    pub payload: Payload,
+    /// For a copy: the key shared with the primary, and this side's id.
+    pub channel: [u8; 32],
+    pub id: [u8; 32],
+}
+
+pub async fn receive(net: &Net, att: &Attester, dev: bool, peer: &str, token: &str, copy: bool) -> Result<Received> {
     let rng = ring::rand::SystemRandom::new();
     let mine = agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng)
         .map_err(|_| anyhow!("key generation failed"))?;
@@ -335,7 +405,7 @@ pub async fn receive(net: &Net, att: &Attester, dev: bool, peer: &str, token: &s
         if attempt > 0 {
             tokio::time::sleep(Duration::from_secs(10)).await;
         }
-        match attempt_once(net, att, dev, peer, token, &r_pub, &n_r).await {
+        match attempt_once(net, att, dev, peer, token, &r_pub, &n_r, copy).await {
             Ok((g_pub, ct)) => {
                 let key = agreement::agree_ephemeral(
                     mine,
@@ -346,7 +416,11 @@ pub async fn receive(net: &Net, att: &Attester, dev: bool, peer: &str, token: &s
                 let plain = ChaCha20Poly1305::new(Key::from_slice(&key))
                     .decrypt(Nonce::from_slice(&[0u8; 12]), AeadPayload { msg: &ct, aad: RESPONSE })
                     .map_err(|_| anyhow!("the handoff payload failed authentication"))?;
-                return Ok(serde_json::from_slice(&plain)?);
+                return Ok(Received {
+                    payload: serde_json::from_slice(&plain)?,
+                    channel: channel_key(&key),
+                    id: r_pub,
+                });
             }
             Err(e) => {
                 last = format!("{e:#}");
@@ -356,7 +430,7 @@ pub async fn receive(net: &Net, att: &Attester, dev: bool, peer: &str, token: &s
             }
         }
     }
-    anyhow::bail!("couldn't take the sessions over from {peer}: {last}")
+    anyhow::bail!("couldn't get the lineage from {peer}: {last}")
 }
 
 /// One try: a challenge, the request, and a checked response (G's key and
@@ -369,6 +443,7 @@ async fn attempt_once(
     token: &str,
     r_pub: &[u8; 32],
     n_r: &[u8; 32],
+    copy: bool,
 ) -> Result<([u8; 32], Vec<u8>)> {
     let (host, port) = split_peer(peer)?;
     let https = !dev;
@@ -388,7 +463,8 @@ async fn attempt_once(
         "public_key": hex::encode(r_pub),
         "nonce": hex::encode(n_r),
         "document_b64": doc_b64,
-        "mac": mac(token, &[REQUEST, &n_g, r_pub, n_r, &doc_hash]),
+        "copy": copy,
+        "mac": mac(token, &[REQUEST, &n_g, r_pub, n_r, &doc_hash, &[copy as u8]]),
     });
     let resp = net
         .request_peer("POST", https, &host, port, "/api/internal/handoff", serde_json::to_vec(&req)?, t)

@@ -21,6 +21,7 @@ mod net;
 mod notify;
 mod nsm;
 mod persist;
+mod replica;
 mod run;
 mod sandbox;
 mod sessions;
@@ -98,6 +99,10 @@ struct HostConfig {
     /// deployment: an enclave gives its sessions only to a request carrying
     /// it, and sends it when taking over. Unset: this enclave won't hand off.
     handoff_token: Option<String>,
+    /// With `peer`: take a copy of the lineage and stand by, following
+    /// `peer`'s writes, instead of taking its sessions over (replica.rs).
+    #[serde(default)]
+    standby: bool,
 }
 
 const LOG_VSOCK_PORT: u32 = 5004;
@@ -216,17 +221,19 @@ async fn take_over(
     dev: bool,
     peer: &str,
     token: &str,
-) -> Result<handoff::Payload> {
+    copy: bool,
+) -> Result<handoff::Received> {
     if let Some(host) = peer.rsplit_once(':').map(|(h, _)| h).or(Some(peer)) {
         net.allow(host.trim_matches(['[', ']']));
     }
-    let p = handoff::receive(net, attester, dev, peer, token).await?;
+    let r = handoff::receive(net, attester, dev, peer, token, copy).await?;
     log(&format!(
-        "handoff: took over {} sessions from boot {}",
-        p.sessions.len(),
-        p.giver_boot
+        "handoff: {} {} sessions from boot {}",
+        if copy { "standing by for" } else { "took over" },
+        r.payload.sessions.len(),
+        r.payload.giver_boot
     ));
-    Ok(p)
+    Ok(r)
 }
 
 fn main() -> Result<()> {
@@ -285,9 +292,17 @@ async fn service() -> Result<()> {
     // Take the sessions over from a running enclave of this image, or start
     // a new lineage. Inside Nitro the kernel RNG is fed by the NSM hardware
     // RNG.
+    let mut follower = None;
     let (signing, keys, lineage, heads) = match cfg.peer.clone().filter(|p| !p.is_empty()) {
         Some(peer) => {
-            let p = take_over(&net, &attester, args.dev, &peer, cfg.handoff_token.as_deref().unwrap_or("")).await?;
+            let r = take_over(&net, &attester, args.dev, &peer, cfg.handoff_token.as_deref().unwrap_or(""), cfg.standby).await?;
+            let p = r.payload;
+            let heads = if cfg.standby {
+                follower = Some(Arc::new(replica::Follower::new(&peer, args.dev, r.id, r.channel, p.sessions)));
+                Vec::new()
+            } else {
+                p.sessions
+            };
             // The stored state is the lineage's: never clear it.
             blobs.skip_reset();
             let key = |h: &str| -> Result<[u8; 32]> {
@@ -303,7 +318,7 @@ async fn service() -> Result<()> {
                     generation: p.generation + 1,
                     restored_from_boot: Some(p.giver_boot),
                 },
-                p.sessions,
+                heads,
             )
         }
         None => {
@@ -407,6 +422,8 @@ async fn service() -> Result<()> {
         }),
         lineage,
         moved: std::sync::atomic::AtomicBool::new(false),
+        repl: Default::default(),
+        standby: std::sync::atomic::AtomicBool::new(follower.is_some()),
         owner: tokio::sync::RwLock::new(()),
         blobs,
         // Fixed in the image: a host-chosen size would let the host shape
@@ -424,10 +441,20 @@ async fn service() -> Result<()> {
         let restored = ctx.store.restore(&ctx, heads).await;
         log(&format!("handoff: restored {restored} of {n} sessions"));
     }
-    tokio::spawn(sessions::write_loop(ctx.clone()));
+    match &follower {
+        // A standby writes nothing until promoted.
+        Some(f) => {
+            tokio::spawn(f.clone().follow(net.clone()));
+        }
+        None => {
+            tokio::spawn(sessions::write_loop(ctx.clone()));
+        }
+    }
     let app = Arc::new(App {
         ctx: ctx.clone(),
         giver: handoff::Giver::new(cfg.handoff_token.clone()),
+        follower,
+        handoff_token: cfg.handoff_token.clone(),
         attester,
         conns: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
         concurrency: args.concurrency,
@@ -530,6 +557,9 @@ struct App {
     ctx: Arc<Ctx>,
     /// Handing this enclave's sessions to a successor (handoff.rs).
     giver: handoff::Giver,
+    /// Set on a standby: following the primary (replica.rs).
+    follower: Option<Arc<replica::Follower>>,
+    handoff_token: Option<String>,
     attester: nsm::Attester,
     /// Open client connections (TLS handshakes included), bounded.
     conns: Arc<tokio::sync::Semaphore>,
@@ -730,6 +760,12 @@ async fn handle(app: Arc<App>, req: Request<hyper::body::Incoming>) -> Resp {
             &json!({"error": "this server's sessions moved to its successor; try again shortly", "moved": true}),
         );
     }
+    if app.ctx.standby.load(std::sync::atomic::Ordering::SeqCst) && is_session {
+        return json_resp(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"error": "this is a standby enclave; it serves sessions only if the primary fails", "standby": true}),
+        );
+    }
     let r: Result<Resp, ApiError> = match (method.as_str(), parts.as_slice()) {
         ("GET", [""]) | ("GET", ["s", _]) => Ok(respond(
             StatusCode::OK,
@@ -750,6 +786,8 @@ async fn handle(app: Arc<App>, req: Request<hyper::body::Incoming>) -> Resp {
         )),
         ("POST", ["api", "internal", "handoff", "challenge"]) => handoff_challenge(&app, req).await,
         ("POST", ["api", "internal", "handoff"]) => give_handoff(&app, req).await,
+        ("POST", ["api", "internal", "replica", "sync"]) => replica_sync(&app, req).await,
+        ("POST", ["api", "internal", "replica", "promote"]) => promote(&app, req).await,
         ("POST", ["api", "sessions"]) => create_session(&app, &req),
         (_, ["api", "sessions", id, rest @ ..]) => session_route(&app, id, rest, req).await,
         _ => Err(ApiError(
@@ -757,11 +795,41 @@ async fn handle(app: Arc<App>, req: Request<hyper::body::Incoming>) -> Resp {
             format!("not found: {method} {path} (see /agents.md)"),
         )),
     };
-    r.unwrap_or_else(|ApiError(s, m)| json_resp(s, &json!({"error": m})))
+    let resp = r.unwrap_or_else(|ApiError(s, m)| json_resp(s, &json!({"error": m})));
+    // A change to a session is answered once a standby has it too.
+    if is_session && method != "GET" && resp.status().is_success() {
+        app.ctx.repl.confirm(&app.ctx).await;
+    }
+    resp
+}
+
+async fn replica_sync(app: &App, req: Request<hyper::body::Incoming>) -> Result<Resp, ApiError> {
+    let body = body_json(req).await?;
+    if app.ctx.standby.load(std::sync::atomic::Ordering::SeqCst) || app.ctx.moved.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "this enclave isn't serving sessions".into()));
+    }
+    match app.ctx.repl.sync(&body).await {
+        Ok(v) => Ok(json_resp(StatusCode::OK, &v)),
+        Err(e) => Err(ApiError(StatusCode::FORBIDDEN, format!("{e:#}"))),
+    }
+}
+
+async fn promote(app: &App, req: Request<hyper::body::Incoming>) -> Result<Resp, ApiError> {
+    let body = body_json(req).await?;
+    let Some(f) = &app.follower else {
+        return Err(ApiError(StatusCode::CONFLICT, "this enclave isn't a standby".into()));
+    };
+    match f.promote(&app.ctx, app.handoff_token.as_deref(), &body).await {
+        Ok(v) => Ok(json_resp(StatusCode::OK, &v)),
+        Err(e) => Err(ApiError(StatusCode::FORBIDDEN, format!("{e:#}"))),
+    }
 }
 
 async fn handoff_challenge(app: &App, req: Request<hyper::body::Incoming>) -> Result<Resp, ApiError> {
     let body = body_json(req).await?;
+    if app.ctx.standby.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "this is a standby; hand off from the primary".into()));
+    }
     match app.giver.challenge(&body) {
         Ok(v) => Ok(json_resp(StatusCode::OK, &v)),
         Err(e) => Err(ApiError(StatusCode::FORBIDDEN, format!("{e:#}"))),
@@ -790,6 +858,7 @@ fn health(app: &App) -> Value {
     let ok = expires_in.is_none_or(|s| s > 24 * 3600) && conns_open < MAX_CONNECTIONS * 9 / 10;
     json!({
         "ok": ok,
+        "standby": ctx.standby.load(std::sync::atomic::Ordering::SeqCst),
         "boot_id": ctx.info.boot_id,
         "uptime_s": now - (ctx.info.booted_at_ms / 1000) as i64,
         "certificate": cert.map(|c| json!({"issuer": c.issuer, "not_after": c.not_after, "expires_in_s": expires_in})),

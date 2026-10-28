@@ -63,6 +63,10 @@ pub struct Ctx {
     pub lineage: crate::persist::Lineage,
     /// Set once this enclave handed its sessions to a successor: it serves
     /// no session requests after that.
+    /// Standbys following this enclave's writes (replica.rs).
+    pub repl: crate::replica::Replication,
+    /// True while this enclave is a standby: it serves no sessions.
+    pub standby: AtomicBool,
     pub moved: AtomicBool,
     /// Held (shared) by every request that changes session state, and
     /// exclusively by a handoff: so a handoff waits for changes already

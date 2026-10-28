@@ -91,9 +91,18 @@ sandbox mode, so only confirmed addresses get mail. Agents poll instead. See
   They survive a move to another enclave of that image (a bigger machine, a
   second region): started with the running one as its peer, the new enclave
   proves its image and takes over the key, the signing key and the latest
-  state; runs that were going are recorded as interrupted. If no enclave of
-  the lineage is running (a crash with no successor, or an image upgrade),
-  the key is gone and so are the sessions. `/api/info` shows the lineage and
+  state; runs that were going are recorded as interrupted. A **standby**
+  (config `standby: true` with the primary as `peer`) takes a copy the same
+  way, while the primary keeps serving, and follows the hash of every
+  session's latest state. A request that changes a session is answered only
+  once the standby has the change (or after 10 s). If the primary's machine
+  dies, the operator promotes the standby (`POST /api/internal/replica/promote`
+  with a MAC under the handoff token), which it accepts only after 20 s
+  without contact with the primary. If the operator cuts two healthy
+  enclaves apart and promotes the standby, both serve: a party then sees only
+  one, which can hide recent changes from them but not invent any. If no
+  enclave of the lineage is running (both machines lost, or an image
+  upgrade), the key is gone and so are the sessions. `/api/info` shows the lineage and
   which boot it came from; the boot id still makes restarts visible.
 - The auditee controls every byte the agent reads, so steering through the
   code is disclosed, not prevented. If the auditee operates the model

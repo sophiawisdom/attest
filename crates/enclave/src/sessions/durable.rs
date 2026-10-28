@@ -285,6 +285,16 @@ impl Store {
         Ok(heads)
     }
 
+    /// Each session's latest written head, for a standby to follow.
+    pub fn heads_now(&self) -> Vec<(String, String)> {
+        let mut heads: Vec<(String, String)> = lock(&self.sessions)
+            .values()
+            .filter_map(|s| lock(&s.written).1.clone().map(|h| (s.id.clone(), h)))
+            .collect();
+        heads.extend(lock(&self.pending).iter().cloned());
+        heads
+    }
+
     /// Take over sessions from a predecessor, each from the head it named.
     /// A session that can't be read back after a few tries waits in
     /// `pending` (retried later), rather than being dropped.
@@ -351,6 +361,7 @@ pub async fn write_loop(ctx: Arc<Ctx>) {
             continue;
         }
         ctx.store.write_changed(&ctx.persist).await;
+        ctx.repl.publish(ctx.store.heads_now());
         if tick % 30 == 0 {
             ctx.store.retry_pending(&ctx).await;
         }

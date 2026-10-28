@@ -167,6 +167,18 @@ def main():
         host = start_host(work, 1)
         check(blob(2, ident(5, 0)) == (0, b"new"), "the new generation is picked up from CURRENT")
 
+        print("drop cache (a standby taking over)")
+        blob(1, ident(7, 0), b"current")
+        cached = os.path.join(work, "blobs", (b"\x07" * 8).hex(), ident(7, 0)[8:].hex())
+        check(os.path.exists(cached), "the blob is cached")
+        # As if another instance overwrote it in S3 after this cache took it.
+        with open(cached, "wb") as f:
+            f.write(b"stale")
+        check(blob(2, ident(7, 0)) == (0, b"stale"), "a stale cache entry is served before the drop")
+        check(blob(5, ident(0, 0)) == (0, b""), "drop-cache is acknowledged")
+        check(blob(2, ident(7, 0)) == (0, b"current"), "afterwards the blob comes from S3")
+        check(blob(2, ident(5, 0)) == (0, b"new"), "and nothing stored was lost")
+
         print("S3 errors")
         urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{S3_PORT}/_fail?n=2", method="POST"))
         check(blob(1, ident(6, 0), b"retried") == (0, b""), "two 500s are retried")
