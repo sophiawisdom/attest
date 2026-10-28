@@ -198,8 +198,9 @@ struct RunState {
     /// running | awaiting_release | released | declined
     status: &'static str,
     steps: u32,
-    trace: Vec<Value>,
-    /// Bytes in `trace` (counted in TRACE_BYTES), and whether it hit its cap.
+    trace: Trace,
+    /// Raw bytes recorded in `trace` (capped per run), and whether it hit
+    /// its cap. The compressed size is what counts toward TRACE_BYTES.
     trace_bytes: usize,
     trace_full: bool,
     turns: Option<Vec<Turn>>,
@@ -270,8 +271,59 @@ const MAX_QUESTION_VERSIONS: usize = 100;
 const MAX_MODEL_PROPOSALS: usize = 50;
 const MAX_RUNS: usize = 50;
 /// Trace kept for one run, and for all runs on the server.
-const MAX_TRACE_BYTES_PER_RUN: usize = 8 << 20;
+/// Raw trace content per run: model exchanges in full, tool calls and the
+/// agent's own log. Stored compressed.
+const MAX_TRACE_BYTES_PER_RUN: usize = 40 << 20;
+/// Compressed trace bytes across all sessions.
 const MAX_TRACE_BYTES_TOTAL: usize = 2 << 30;
+
+/// A run's trace entries, each kept LZ4-compressed: tool output and model
+/// exchanges are mostly text and JSON, which compress several times over.
+#[derive(Default)]
+struct Trace {
+    entries: Vec<Vec<u8>>,
+    /// Compressed bytes held.
+    stored: usize,
+}
+
+impl Trace {
+    fn from_entries(v: &[Value]) -> Self {
+        let mut t = Trace::default();
+        for e in v {
+            t.push(e);
+        }
+        TRACE_BYTES.fetch_add(t.stored, std::sync::atomic::Ordering::Relaxed);
+        t
+    }
+
+    fn push(&mut self, e: &Value) {
+        let c = lz4_flex::compress_prepend_size(e.to_string().as_bytes());
+        self.stored += c.len();
+        self.entries.push(c);
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Entries from `after` on, up to about `max` raw bytes (at least one),
+    /// and the index to continue from.
+    fn page(&self, after: usize, max: usize) -> (Vec<Value>, usize) {
+        let mut out = Vec::new();
+        let mut size = 0;
+        let mut i = after.min(self.entries.len());
+        while i < self.entries.len() {
+            let raw = lz4_flex::decompress_size_prepended(&self.entries[i]).unwrap_or_default();
+            if !out.is_empty() && size + raw.len() > max {
+                break;
+            }
+            size += raw.len();
+            out.push(serde_json::from_slice(&raw).unwrap_or(Value::Null));
+            i += 1;
+        }
+        (out, i)
+    }
+}
 static TRACE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn clean(s: Option<&str>) -> Option<String> {
@@ -352,7 +404,7 @@ impl Store {
             // stored files go once they end (Bundle's Drop).
             drop(st.code.take());
             st.expired = true;
-            let freed: usize = st.runs.iter().map(|r| r.trace_bytes).sum();
+            let freed: usize = st.runs.iter().map(|r| r.trace.stored).sum();
             TRACE_BYTES.fetch_sub(freed.min(TRACE_BYTES.load(std::sync::atomic::Ordering::Relaxed)), std::sync::atomic::Ordering::Relaxed);
             // The session is gone from the map; drop what it held.
             st.runs.clear();
@@ -1249,8 +1301,8 @@ impl Session {
             messages: messages.clone(),
             status: "running",
             steps: 0,
-            trace,
-            trace_bytes: 0,
+            trace_bytes: trace.iter().map(|e| e.to_string().len()).sum(),
+            trace: Trace::from_entries(&trace),
             trace_full: false,
             turns: None,
             full: None,
@@ -1388,7 +1440,11 @@ impl Session {
             .find(|r| r.id == run_id)
             .ok_or_else(|| anyhow!("no such run"))?;
         Ok(
-            json!({"run_id": r.id, "status": r.status, "next": r.trace.len(), "entries": &r.trace[after.min(r.trace.len())..]}),
+            {
+                // Pages of up to 4 MiB: a run's trace can be 40 MiB.
+                let (entries, next) = r.trace.page(after, 4 << 20);
+                json!({"run_id": r.id, "status": r.status, "next": next, "more": next < r.trace.len(), "entries": entries})
+            },
         )
     }
 
@@ -1725,16 +1781,21 @@ impl RunJob {
                     let size: usize = entries.iter().map(|e| e.to_string().len()).sum();
                     use std::sync::atomic::Ordering::Relaxed;
                     let total = TRACE_BYTES.load(Relaxed);
+                    // The stored size is unknown until compressed; the raw
+                    // size bounds it, so check the global budget with that.
                     if r.trace_bytes + size > MAX_TRACE_BYTES_PER_RUN
                         || total + size > MAX_TRACE_BYTES_TOTAL
                     {
                         r.trace_full = true;
-                        r.trace.push(json!({"type": "error", "content": "the trace reached its size limit; later steps aren't recorded (the run continues)"}));
+                        r.trace.push(&json!({"type": "error", "content": "the trace reached its size limit; later steps aren't recorded (the run continues)"}));
                         return;
                     }
                     r.trace_bytes += size;
-                    TRACE_BYTES.fetch_add(size, Relaxed);
-                    r.trace.extend(entries);
+                    let before = r.trace.stored;
+                    for e in &entries {
+                        r.trace.push(e);
+                    }
+                    TRACE_BYTES.fetch_add(r.trace.stored - before, Relaxed);
                 }
                 // No wake-up here: the ticker below wakes the auditee on a
                 // fixed schedule, so the timing of their trace fetches (which

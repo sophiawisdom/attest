@@ -483,7 +483,7 @@ function traceHtml(entries) {
       out.push(`<div class="ev"><div class="who"></div><div class="what"><details><summary class="small">${esc(e.name)} · ${num(n)} line${n === 1 ? "" : "s"}</summary><pre class="out">${esc(c)}</pre></details></div></div>`);
     } else if (e.type === "model_exchange") {
       const req = e.request || {};
-      out.push(`<div class="ev"><div class="who">Model</div><div class="what"><details><summary class="small">exchange · ${num(req.bytes)} bytes sent · HTTP ${esc(e.status)}</summary><div class="small faint" style="margin-top:6px">Latest input</div><pre class="out">${esc(req.latest || "")}</pre><div class="small faint">Response</div><pre class="out">${esc(e.response || "")}</pre></details></div></div>`);
+      out.push(`<div class="ev"><div class="who">Model</div><div class="what"><details><summary class="small">exchange · ${num(req.bytes)} bytes sent · HTTP ${esc(e.status)}</summary><div class="small faint" style="margin-top:6px">New input (items ${num(req.new_from || 0)}–${num(req.items || 0)})</div><pre class="out">${esc(JSON.stringify(req.new || [], null, 1).slice(0, 200000))}</pre><div class="small faint">Response</div><pre class="out">${esc(e.response || "")}</pre></details></div></div>`);
     } else if (e.type === "harness_log") out.push(`<div class="ev"><div class="who">Agent log</div><div class="what"><pre class="out" style="margin:0">${esc(e.content)}</pre></div></div>`);
     else if (e.type === "harness") out.push(`<div class="ev"><div class="who">Harness</div><div class="what faint small">${esc(e.content)}</div></div>`);
     else if (e.type === "error") out.push(`<div class="ev"><div class="who">Error</div><div class="what"><div class="callout bad"><span>${esc(e.content)}</span></div></div></div>`);
@@ -732,10 +732,15 @@ async function refresh(wait = false) {
     if (!isAuditee()) continue;
     const t = S.traces[r.id] || (S.traces[r.id] = { entries: [], next: 0, done: false });
     if (t.done) continue;
-    const res = await sapi(`/runs/${r.id}/trace?after=${t.next}`);
-    // Idempotent even if two refreshes overlap: place entries by position.
-    const start = res.next - res.entries.length;
-    t.entries = t.entries.slice(0, start).concat(res.entries); t.next = res.next; t.done = res.status !== "running";
+    // Pages of up to a few MiB; keep fetching while there's more.
+    for (let page = 0; page < 20; page++) {
+      const res = await sapi(`/runs/${r.id}/trace?after=${t.next}`);
+      // Idempotent even if two refreshes overlap: place entries by position.
+      const start = res.next - res.entries.length;
+      t.entries = t.entries.slice(0, start).concat(res.entries); t.next = res.next;
+      t.done = res.status !== "running" && !res.more;
+      if (!res.more) break;
+    }
   }
   render();
 }

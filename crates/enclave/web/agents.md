@@ -160,6 +160,11 @@ limits `events` to newer ones. A simple agent loop is: fetch, act on
 `next_actions` if your policy says so, then wait on `version`.
 
 The auditee can follow a run live with `GET /api/sessions/ID/runs/RUN_ID/trace?after=N`.
+Responses come in pages of up to 4 MiB: continue from `next` while `more`
+is true. A run records up to 40 MiB: for a jailed agent, every model
+exchange in full (`request.new` holds the input items added since the
+previous request, plus instructions and tools whenever the history starts
+over, and `response` the provider's reply), and the agent's own log.
 
 ## Who sees what
 

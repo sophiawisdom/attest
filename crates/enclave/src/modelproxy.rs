@@ -56,6 +56,8 @@ struct Upstream {
     token: String,
     usage: Arc<Mutex<Usage>>,
     record: Arc<dyn Fn(Value) + Send + Sync>,
+    /// Input items the previous request had, to record only what's new.
+    seen_items: Mutex<usize>,
     /// One upstream request at a time.
     inflight: tokio::sync::Semaphore,
 }
@@ -427,6 +429,7 @@ impl ModelProxy {
             usage: usage.clone(),
             record,
             inflight: tokio::sync::Semaphore::new(1),
+            seen_items: Mutex::new(0),
         });
         let task = tokio::spawn(async move {
             // Connections live in this set, so dropping the proxy (which
@@ -561,7 +564,10 @@ async fn handle(up: Arc<Upstream>, req: Request<hyper::body::Incoming>) -> Respo
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
     let host = up.target.host.clone();
-    let req_summary = summarize_request(&raw);
+    let req_summary = {
+        let mut seen = up.seen_items.lock().unwrap_or_else(|e| e.into_inner());
+        new_input(&raw, &mut seen)
+    };
     let _one_at_a_time = up.inflight.acquire().await;
     let resp = match up
         .net
@@ -616,7 +622,7 @@ async fn handle(up: Arc<Upstream>, req: Request<hyper::body::Incoming>) -> Respo
         "type": "model_exchange",
         "status": resp.status,
         "request": req_summary,
-        "response": truncate(&text, 40_000),
+        "response": text,
     }));
     let ctype = resp
         .header("content-type")
@@ -629,32 +635,40 @@ async fn handle(up: Arc<Upstream>, req: Request<hyper::body::Incoming>) -> Respo
         .unwrap()
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}… [{} more bytes]", &s[..end], s.len() - end)
-}
 
-/// The newest input item(s) of a request: what the harness just sent
-/// (usually tool output), without repeating the whole history each time.
-fn summarize_request(body: &[u8]) -> Value {
+/// What a request adds to the conversation, in full: the input items after
+/// those the previous request already had (each request resends the whole
+/// history), plus the instructions and tools the first time. If the history
+/// got shorter (the harness compacted it), everything is recorded again.
+/// Together the exchanges are the complete record of what the model saw.
+fn new_input(body: &[u8], seen: &mut usize) -> Value {
     let Ok(v) = serde_json::from_slice::<Value>(body) else {
         return json!({"bytes": body.len()});
     };
     let items = v
         .get("input")
         .or(v.get("messages"))
-        .and_then(|x| x.as_array());
-    let last: Vec<Value> = items
-        .map(|a| a.iter().rev().take(3).rev().cloned().collect())
-        .unwrap_or_default();
-    let last = serde_json::to_string(&last).unwrap_or_default();
-    json!({"model": v.get("model"), "items": items.map(|a| a.len()), "latest": truncate(&last, 20_000), "bytes": body.len()})
+        .and_then(|x| x.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or(&[]);
+    let restart = items.len() < *seen || *seen == 0;
+    let from = if restart { 0 } else { *seen };
+    *seen = items.len();
+    let mut out = json!({
+        "model": v.get("model"),
+        "items": items.len(),
+        "new_from": from,
+        "new": &items[from..],
+        "bytes": body.len(),
+    });
+    if restart {
+        for k in ["system", "instructions", "tools"] {
+            if let Some(x) = v.get(k) {
+                out[k] = x.clone();
+            }
+        }
+    }
+    out
 }
 
 /// Pull usage, model and provider out of a JSON or SSE response body.

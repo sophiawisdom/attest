@@ -444,14 +444,15 @@ async fn run_jailed(
     let stderr = child.stderr.take().unwrap();
     let p2 = progress.clone();
     let log_task = tokio::spawn(async move {
-        let mut lines = BoundedLines::new(stderr, 4000);
-        let mut budget = 400_000usize;
+        // Claude Code's stream-json puts whole tool results on one line.
+        let mut lines = BoundedLines::new(stderr, 256 << 10);
+        let mut budget = 40usize << 20;
         let mut batch = Vec::new();
         while let Some(l) = lines.next_line().await {
             if budget == 0 {
                 continue;
             }
-            let l: String = l.chars().take(4000).collect();
+            let l: String = l.chars().take(256 << 10).collect();
             // Charge per line too, so empty lines can't make unbounded updates.
             budget = budget.saturating_sub(l.len() + 200);
             batch.push(l);
