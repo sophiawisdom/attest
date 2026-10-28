@@ -1,0 +1,8 @@
+{
+  "name": "attest-jail-pi",
+  "private": true,
+  "description": "pi coding agent for the attest jail, installed with npm ci from the lockfile",
+  "dependencies": {
+    "@mariozechner/pi-coding-agent": "0.73.1"
+  }
+}

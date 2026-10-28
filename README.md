@@ -90,7 +90,7 @@ sandbox mode, so only confirmed addresses get mail. Agents poll instead. See
   1.25x apart), and a jailed harness gets at most 300 model calls. Response
   sizes come from the provider and can't be padded, so a model steered to
   vary its reply lengths could signal a few bits per call to whoever runs the
-  parent. The Codex harness runs arbitrary commands, so it can choose request
+  parent. The jailed harnesses (Codex, Claude Code, pi) run arbitrary commands, so they can choose request
   sizes and timing deliberately (bounded by the call cap, one call at a
   time); the built-in harness only sends requests the enclave builds. API
   responses to the browser and agents are padded the same way. If that matters, the auditee should run the enclave themselves

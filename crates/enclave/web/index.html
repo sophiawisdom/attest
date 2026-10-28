@@ -401,7 +401,7 @@ function renderModel(v) {
     body += `<details data-keep="mform" ${open ? "open" : ""}><summary>${isAuditee() ? (approved ? "Use a different model" : "Choose model and key") : "Offer your own model and key"}</summary>
       <div class="stack" style="margin-top:10px">
         <div class="seg" id="mProv">${providers.map((p, i) => `<button type="button" data-act="prov" data-p="${p.id}" aria-pressed="${i === 0}">${esc(p.label)}</button>`).join("")}</div>
-        ${(S.info?.harness?.agents || []).length > 1 ? `<label class="f">Agent<select id="mAgent">${S.info.harness.agents.map(a => `<option value="${esc(a.split(" ")[0])}">${a === "builtin" ? "Built-in tools (read, grep, python sandbox)" : esc(a) + " (full shell in a jail; OpenAI or OpenRouter)"}</option>`).join("")}</select></label>` : ""}
+        ${(S.info?.harness?.agents || []).length > 1 ? `<label class="f">Agent<select id="mAgent">${S.info.harness.agents.map(a => `<option value="${esc(a.split(" ")[0])}">${a === "builtin" ? "Built-in tools (read, grep, python sandbox)" : esc(a) + " (full shell in a jail; " + ({codex: "OpenAI or OpenRouter", "claude-code": "Anthropic or OpenRouter", pi: "any provider"}[a.split(" ")[0]] || "") + ")"}</option>`).join("")}</select></label>` : ""}
         <div class="grid2"><label class="f">Model<input type="text" id="mModel" placeholder="${esc(providers[0].ph)}"></label>
           <label class="f">API key${isAuditee() ? "" : " (optional)"}<input type="password" id="mKey" autocomplete="off" placeholder="${isAuditee() ? "sk-…" : "leave empty: the auditee supplies theirs"}"></label></div>
         <label class="check" id="mZdrRow" hidden><input type="checkbox" id="mZdr" checked><span>Zero-data-retention endpoints only</span></label>

@@ -24,7 +24,7 @@ record pointing at the IP, not proxied through a CDN).
 The default `m7g.xlarge` (4 vCPU, 16 GiB; the enclave gets 2 vCPU and
 10 GiB) costs about $0.16/hour, roughly $120/month, plus about $3.60/month
 for the Elastic IP. SES email costs $0.10 per thousand. `--type m7g.large`
-halves the instance cost, with a 4 GiB enclave (fine for repositories up to a few hundred MB). You also pay your model
+halves the instance cost, with a 4 GiB enclave, of which the agent harnesses (Codex, Claude Code, pi) take about 1 GB (fine for repositories up to a few hundred MB). You also pay your model
 provider for each audit.
 
 ## Deploy

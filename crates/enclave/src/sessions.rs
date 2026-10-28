@@ -126,7 +126,7 @@ struct ModelProposal {
     api_key: String,
     openrouter_zdr: bool,
     mock_endpoint: Option<String>,
-    /// "builtin" or "codex".
+    /// "builtin", or a jailed harness: "codex", "claude-code", "pi".
     agent: String,
     /// Whose provider account the key belongs to.
     key_from: Role,
@@ -954,15 +954,14 @@ impl Session {
             key_owner: None,
             upstream_providers: vec![],
             openrouter_zdr: (m.provider == Provider::Openrouter).then_some(m.openrouter_zdr),
-            agent: if m.agent == "codex" {
-                format!("codex {}", crate::harnesses::CODEX_VERSION)
-            } else {
-                "builtin".into()
-            },
+            agent: crate::harnesses::Agent::parse(&m.agent)
+                .map(|a| a.label())
+                .unwrap_or_else(|| "builtin".into()),
             key_from: Some(m.key_from),
         };
-        let harness_job = (m.agent == "codex").then(|| {
+        let harness_job = crate::harnesses::Agent::parse(&m.agent).map(|agent| {
             (
+                agent,
                 m.provider,
                 m.model.clone(),
                 m.api_key.clone(),
@@ -1091,7 +1090,7 @@ impl Session {
             model_info,
             history,
             messages: messages.iter().map(|(r, _)| r.clone()).collect(),
-            harness_prompt: crate::harnesses::codex_prompt(
+            harness_prompt: crate::harnesses::agent_prompt(
                 &q.text,
                 &q.answer_format,
                 previous_verdict
@@ -1428,7 +1427,7 @@ struct RunJob {
     history: History,
     messages: Vec<MessageRecord>,
     /// For jailed harnesses: (provider, model, key), and the prompt.
-    harness_job: Option<(Provider, String, String, bool)>,
+    harness_job: Option<(crate::harnesses::Agent, Provider, String, String, bool)>,
     harness_prompt: String,
 }
 
@@ -1496,9 +1495,10 @@ impl RunJob {
                 upstream_providers: vec![],
                 key_owner: None,
             },
-            (Ok(_), Some((provider, model, key, zdr))) => {
+            (Ok(_), Some((agent, provider, model, key, zdr))) => {
                 let timeout = run_time_limit(self.question.max_steps);
-                crate::harnesses::run_codex(
+                crate::harnesses::run_agent(
+                    *agent,
                     self.ctx.net.clone(),
                     &self.run_id,
                     &self.bundle,

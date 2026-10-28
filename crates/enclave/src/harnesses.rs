@@ -1,5 +1,5 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
-//! Real agent harnesses (currently OpenAI Codex) run in the native jail.
+//! Real agent harnesses (OpenAI Codex, Claude Code, pi) run in the native jail.
 //!
 //! The harness gets a shell with the repository read-only at /repo and a
 //! 20 MB scratch /work, and reaches its model only through the per-run
@@ -14,40 +14,101 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+// Pinned in build/Dockerfile (and build/pi/package-lock.json for pi).
 pub const CODEX_VERSION: &str = "0.164.0";
+pub const CLAUDE_CODE_VERSION: &str = "2.1.311";
+pub const PI_VERSION: &str = "0.73.1";
 pub const IMAGE_ROOT: &str = "/opt/jailroot";
 /// Loopback port inside the jail's network namespace that reaches the proxy.
 const PROXY_PORT: u16 = 8080;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Agent {
+    Codex,
+    ClaudeCode,
+    Pi,
+}
+
+pub const AGENTS: [Agent; 3] = [Agent::Codex, Agent::ClaudeCode, Agent::Pi];
+
+impl Agent {
+    pub fn parse(s: &str) -> Option<Agent> {
+        AGENTS.into_iter().find(|a| a.id() == s)
+    }
+    pub fn id(self) -> &'static str {
+        match self {
+            Agent::Codex => "codex",
+            Agent::ClaudeCode => "claude-code",
+            Agent::Pi => "pi",
+        }
+    }
+    pub fn version(self) -> &'static str {
+        match self {
+            Agent::Codex => CODEX_VERSION,
+            Agent::ClaudeCode => CLAUDE_CODE_VERSION,
+            Agent::Pi => PI_VERSION,
+        }
+    }
+    /// How certificates and /api/info name it: "codex 0.164.0".
+    pub fn label(self) -> String {
+        format!("{} {}", self.id(), self.version())
+    }
+    fn binary(self) -> &'static str {
+        match self {
+            Agent::Codex => "/usr/bin/codex",
+            Agent::ClaudeCode => "/usr/bin/claude",
+            Agent::Pi => "/usr/bin/pi",
+        }
+    }
+    fn installed(self) -> bool {
+        cfg!(target_os = "linux")
+            && std::path::Path::new(&format!("{IMAGE_ROOT}{}", self.binary())).exists()
+    }
+    /// Which providers' wire formats the harness speaks.
+    fn providers(self) -> &'static [Provider] {
+        match self {
+            Agent::Codex => &[Provider::Openai, Provider::Openrouter],
+            Agent::ClaudeCode => &[Provider::Anthropic, Provider::Openrouter],
+            Agent::Pi => &[Provider::Openai, Provider::Anthropic, Provider::Openrouter],
+        }
+    }
+}
+
 pub fn available() -> Vec<String> {
     let mut v = vec!["builtin".to_string()];
-    if cfg!(target_os = "linux")
-        && std::path::Path::new(&format!("{IMAGE_ROOT}/usr/bin/codex")).exists()
-    {
-        v.push(format!("codex {CODEX_VERSION}"));
-    }
+    v.extend(
+        AGENTS
+            .into_iter()
+            .filter(|a| a.installed())
+            .map(Agent::label),
+    );
     v
 }
 
 pub fn supports(agent: &str, provider: Provider) -> anyhow::Result<()> {
-    match agent {
-        "builtin" => Ok(()),
-        "codex" => {
-            anyhow::ensure!(
-                available().iter().any(|a| a.starts_with("codex")),
-                "this server does not have the codex harness"
-            );
-            anyhow::ensure!(
-                matches!(provider, Provider::Openai | Provider::Openrouter),
-                "codex needs an OpenAI-compatible provider (openai or openrouter)"
-            );
-            Ok(())
-        }
-        other => anyhow::bail!("unknown agent {other:?} (builtin, codex)"),
+    if agent == "builtin" {
+        return Ok(());
     }
+    let Some(a) = Agent::parse(agent) else {
+        anyhow::bail!("unknown agent {agent:?} (builtin, codex, claude-code, pi)");
+    };
+    anyhow::ensure!(
+        a.installed(),
+        "this server does not have the {agent} harness"
+    );
+    anyhow::ensure!(
+        a.providers().contains(&provider),
+        "{agent} works with {}",
+        a.providers()
+            .iter()
+            .map(|p| p.as_str())
+            .collect::<Vec<_>>()
+            .join(" or ")
+    );
+    Ok(())
 }
 
-pub fn codex_prompt(
+pub fn agent_prompt(
     question: &str,
     format: &AnswerFormat,
     previous: Option<(&Verdict, &str)>,
@@ -82,7 +143,8 @@ fn parse_verdict(text: &str, format: &AnswerFormat) -> Result<Verdict, String> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn run_codex(
+pub async fn run_agent(
+    agent: Agent,
     net: crate::net::Net,
     run_id: &str,
     bundle: &Arc<Bundle>,
@@ -108,6 +170,7 @@ pub async fn run_codex(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (
+            agent,
             net,
             run_id,
             bundle,
@@ -120,7 +183,7 @@ pub async fn run_codex(
             timeout,
             progress,
         );
-        return fail("the codex harness needs a Linux enclave".into());
+        return fail("agent harnesses need a Linux enclave".into());
     }
     #[cfg(target_os = "linux")]
     {
@@ -144,47 +207,19 @@ pub async fn run_codex(
         };
         let repo = format!("{scratch}/repo");
         progress(vec![
-            json!({"type": "harness", "content": format!("Preparing the repository for codex {CODEX_VERSION} ({} files)...", bundle.info.file_count)}),
+            json!({"type": "harness", "content": format!("Preparing the repository for {} ({} files)...", agent.label(), bundle.info.file_count)}),
         ]);
         if let Err(e) = crate::jail::materialize(bundle, &repo).await {
             crate::jail::unmount(&repo);
             return fail(format!("preparing the repository: {e:#}"));
         }
-        let provider_cfg = format!(
-            "model_providers.attest={{ name = \"attest\", base_url = \"http://127.0.0.1:{PROXY_PORT}/v1\", env_key = \"ATTEST_PROXY_TOKEN\", wire_api = \"responses\" }}"
-        );
+        let (argv, env) = command(agent, provider, model, &proxy.token, prompt);
         let spec = crate::jail::Spec {
             repo: repo.clone(),
             image_root: IMAGE_ROOT.into(),
             scratch: scratch.clone(),
-            argv: vec![
-                "/usr/bin/codex".into(),
-                "exec".into(),
-                "--skip-git-repo-check".into(),
-                "--dangerously-bypass-approvals-and-sandbox".into(),
-                "--color".into(),
-                "never".into(),
-                "-m".into(),
-                model.into(),
-                "-c".into(),
-                "model_provider=\"attest\"".into(),
-                "-c".into(),
-                provider_cfg,
-                "-c".into(),
-                "check_for_update_on_startup=false".into(),
-                "--output-last-message".into(),
-                "/work/last-message.txt".into(),
-                prompt,
-            ],
-            env: vec![
-                ("PATH".into(), "/usr/bin:/bin".into()),
-                ("HOME".into(), "/work".into()),
-                ("CODEX_HOME".into(), "/work".into()),
-                ("TMPDIR".into(), "/tmp".into()),
-                ("ATTEST_PROXY_TOKEN".into(), proxy.token.clone()),
-                ("NO_COLOR".into(), "1".into()),
-                ("TERM".into(), "dumb".into()),
-            ],
+            argv,
+            env,
             cwd: "/repo".into(),
             work_mib: 20,
             collect: vec!["verdict.json".into(), "last-message.txt".into()],
@@ -230,13 +265,16 @@ pub async fn run_codex(
                     (Err(why), 0) => (
                         None,
                         Outcome::Error {
-                            message: format!("codex did not produce a valid verdict: {why}"),
+                            message: format!(
+                                "{} did not produce a valid verdict: {why}",
+                                agent.id()
+                            ),
                         },
                     ),
                     (Err(_), c) => (
                         None,
                         Outcome::Error {
-                            message: format!("codex exited with status {c}"),
+                            message: format!("{} exited with status {c}", agent.id()),
                         },
                     ),
                 }
@@ -254,6 +292,120 @@ pub async fn run_codex(
             key_owner: usage.key_owner,
         }
     }
+}
+
+/// The command line and environment for `agent`, talking to its model only
+/// through the proxy at 127.0.0.1:PROXY_PORT with the per-run `token`.
+///
+/// Each harness is kept from loading instructions or plugins from the
+/// repository (AGENTS.md, CLAUDE.md, .claude/settings.json hooks, pi
+/// extensions), which the auditee controls; it reads them only as code.
+#[cfg(target_os = "linux")]
+fn command(
+    agent: Agent,
+    provider: Provider,
+    model: &str,
+    token: &str,
+    prompt: String,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let base = format!("http://127.0.0.1:{PROXY_PORT}");
+    let mut env: Vec<(String, String)> = vec![
+        ("PATH".into(), "/usr/bin:/bin".into()),
+        ("HOME".into(), "/work".into()),
+        ("TMPDIR".into(), "/tmp".into()),
+        ("NO_COLOR".into(), "1".into()),
+        ("TERM".into(), "dumb".into()),
+        ("SHELL".into(), "/bin/bash".into()),
+    ];
+    let s = |x: &str| x.to_string();
+    let argv = match agent {
+        Agent::Codex => {
+            env.push(("CODEX_HOME".into(), "/work".into()));
+            env.push(("ATTEST_PROXY_TOKEN".into(), token.into()));
+            vec![
+                s("/usr/bin/codex"), s("exec"), s("--skip-git-repo-check"),
+                s("--dangerously-bypass-approvals-and-sandbox"), s("--color"), s("never"),
+                s("-m"), s(model),
+                s("-c"), s("model_provider=\"attest\""),
+                s("-c"), format!("model_providers.attest={{ name = \"attest\", base_url = \"{base}/v1\", env_key = \"ATTEST_PROXY_TOKEN\", wire_api = \"responses\" }}"),
+                s("-c"), s("check_for_update_on_startup=false"),
+                s("-c"), s("project_doc_max_bytes=0"),
+                s("--output-last-message"), s("/work/last-message.txt"),
+                prompt,
+            ]
+        }
+        Agent::ClaudeCode => {
+            for (k, v) in [
+                ("ANTHROPIC_BASE_URL", base.as_str()),
+                ("ANTHROPIC_API_KEY", token),
+                ("ANTHROPIC_SMALL_FAST_MODEL", model),
+                ("ANTHROPIC_DEFAULT_HAIKU_MODEL", model),
+                ("CLAUDE_CONFIG_DIR", "/work/.claude"),
+                ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+                ("DISABLE_AUTOUPDATER", "1"),
+                ("DISABLE_TELEMETRY", "1"),
+            ] {
+                env.push((k.into(), v.into()));
+            }
+            // stream-json goes to stderr, which becomes the live trace.
+            vec![
+                s("/bin/sh"),
+                s("-c"),
+                s("exec /usr/bin/claude \"$@\" 1>&2"),
+                s("sh"),
+                // (--disallowedTools takes a list, so another flag must follow it.)
+                s("--disallowedTools"),
+                s("WebSearch,WebFetch"),
+                s("-p"),
+                s("--bare"),
+                s("--setting-sources"),
+                s("user"),
+                s("--strict-mcp-config"),
+                s("--no-session-persistence"),
+                s("--permission-mode"),
+                s("bypassPermissions"),
+                s("--output-format"),
+                s("stream-json"),
+                s("--verbose"),
+                s("--model"),
+                s(model),
+                prompt,
+            ]
+        }
+        Agent::Pi => {
+            let (api, url) = match provider {
+                Provider::Anthropic => ("anthropic-messages", base.clone()),
+                _ => ("openai-responses", format!("{base}/v1")),
+            };
+            let models = json!({"providers": {"attest": {
+                "baseUrl": url, "api": api, "apiKey": "ATTEST_PROXY_TOKEN",
+                "models": [{"id": model, "reasoning": true, "contextWindow": 200000, "maxTokens": 16000}],
+            }}});
+            for (k, v) in [
+                ("PI_CODING_AGENT_DIR", "/work/.pi/agent"),
+                ("ATTEST_PROXY_TOKEN", token),
+                ("PI_OFFLINE", "1"),
+                ("PI_TELEMETRY", "0"),
+                ("PI_SKIP_VERSION_CHECK", "1"),
+            ] {
+                env.push((k.into(), v.into()));
+            }
+            env.push(("ATTEST_PI_MODELS".into(), models.to_string()));
+            // pi reads its provider from a file; /work starts empty.
+            vec![
+                s("/bin/sh"), s("-c"),
+                s("mkdir -p \"$PI_CODING_AGENT_DIR\" && printf '%s' \"$ATTEST_PI_MODELS\" > \"$PI_CODING_AGENT_DIR/models.json\" && exec /usr/bin/pi \"$@\" 1>&2"),
+                s("sh"),
+                // Text mode: pi's json mode repeats the whole message on every
+                // token. The proxy already records each request in the trace.
+                s("-p"), s("--provider"), s("attest"), s("--model"), s(model),
+                s("--no-session"), s("--no-context-files"), s("--no-extensions"), s("--no-skills"),
+                s("--no-prompt-templates"), s("--no-themes"), s("--offline"),
+                prompt,
+            ]
+        }
+    };
+    (argv, env)
 }
 
 /// Run the jail executor, streaming its log into the trace.
@@ -324,7 +476,7 @@ async fn run_jailed(
     let _ = tokio::time::timeout(Duration::from_secs(10), log_task).await;
     match r {
         Err(_) => Err(format!(
-            "codex did not finish within {} minutes",
+            "the agent did not finish within {} minutes",
             timeout.as_secs() / 60
         )),
         Ok(None) => Err("the jail ended without a result".into()),

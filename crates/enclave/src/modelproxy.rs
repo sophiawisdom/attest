@@ -90,8 +90,8 @@ pub fn vet_request_zdr(
         .as_object_mut()
         .ok_or("request body is not a JSON object")?;
     let endpoint = path.rsplit('/').next().unwrap_or("");
-    let allowed: &[&str] = match (provider, endpoint) {
-        (Provider::Anthropic, _) => &[
+    let allowed: &[&str] = match endpoint {
+        "messages" => &[
             "model",
             "messages",
             "system",
@@ -104,8 +104,10 @@ pub fn vet_request_zdr(
             "top_k",
             "thinking",
             "stop_sequences",
+            "context_management",
+            "output_config",
         ],
-        (_, "responses") => &[
+        "responses" => &[
             "model",
             "input",
             "instructions",
@@ -147,6 +149,8 @@ pub fn vet_request_zdr(
     // Harness bookkeeping the provider doesn't need (Codex sends install and
     // session ids here): removed rather than forwarded.
     obj.remove("client_metadata");
+    // Claude Code: device and session ids.
+    obj.remove("metadata");
     if let Some(bad) = obj.keys().find(|k| !allowed.contains(&k.as_str())) {
         return Err(format!(
             "request field {bad:?} is not allowed through the attest proxy"
@@ -157,15 +161,47 @@ pub fn vet_request_zdr(
             "only the approved model {approved_model:?} may be used"
         ));
     }
+    // The wire format decides the tool and content rules: OpenRouter
+    // serves both the Anthropic and the OpenAI shapes.
+    let wire = if endpoint == "messages" {
+        Provider::Anthropic
+    } else {
+        Provider::Openai
+    };
     if let Some(tools) = obj.get("tools") {
-        vet_tools(provider, tools, 0)?;
+        vet_tools(wire, tools, 0)?;
+    }
+    // Server-side context editing may only drop old thinking or tool
+    // results; output_config may only set effort or an output format.
+    if let Some(cm) = obj.get("context_management") {
+        let edits = cm
+            .get("edits")
+            .and_then(|e| e.as_array())
+            .ok_or("context_management needs an edits list")?;
+        if cm.as_object().map_or(true, |m| m.len() != 1) {
+            return Err("context_management may only contain edits".into());
+        }
+        for e in edits {
+            let ty = e.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if !(ty.starts_with("clear_thinking_") || ty.starts_with("clear_tool_uses_")) {
+                return Err(format!("context edit {ty:?} is not allowed"));
+            }
+        }
+    }
+    if let Some(oc) = obj.get("output_config").and_then(|o| o.as_object()) {
+        if let Some(k) = oc
+            .keys()
+            .find(|k| !["effort", "format"].contains(&k.as_str()))
+        {
+            return Err(format!("output_config field {k:?} is not allowed"));
+        }
     }
     // Content: only text, tool calls/results and reasoning. Anything that
     // points the provider at a URL or a stored file (images, documents,
     // file ids) is refused, wherever it appears.
     for key in ["input", "messages", "system", "instructions"] {
         if let Some(c) = obj.get(key) {
-            vet_content(provider, c, 0)?;
+            vet_content(wire, c, 0)?;
         }
     }
     if endpoint == "responses" {
@@ -204,6 +240,11 @@ const CONTENT_TYPES: &[&str] = &[
     "tool_result",
     "thinking",
     "redacted_thinking",
+    // Markers inside Anthropic content: cache_control, a tool call made
+    // directly by the model, a reference to a tool defined in the request.
+    "ephemeral",
+    "direct",
+    "tool_reference",
 ];
 const URL_KEYS: &[&str] = &[
     "image_url",
@@ -299,11 +340,37 @@ fn vet_content(provider: Provider, v: &Value, depth: usize) -> Result<(), String
     }
 }
 
+/// Anthropic beta flags that only change formatting, thinking or how the
+/// request's own context is handled. Others (server tools, files, MCP
+/// connectors and anything new) are dropped, so they stay off.
+fn known_betas(v: &str) -> String {
+    const OK: &[&str] = &[
+        "interleaved-thinking-",
+        "context-management-",
+        "claude-code-",
+        "mid-conversation-tool-changes-",
+        "thinking-token-count-",
+        "advanced-tool-use-",
+        "effort-",
+        "fine-grained-tool-streaming-",
+        "token-efficient-tools-",
+        "prompt-caching-",
+        "output-128k-",
+        "context-1m-",
+    ];
+    v.split(',')
+        .map(str::trim)
+        .filter(|b| OK.iter().any(|p| b.starts_with(p)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Map a harness request path to the provider path, or refuse it.
 fn upstream_path(provider: Provider, path: &str) -> Option<String> {
     let p = path.trim_start_matches("/v1");
     let allowed = match provider {
         Provider::Anthropic => p == "/messages",
+        Provider::Openrouter => p == "/messages" || p == "/responses" || p == "/chat/completions",
         _ => p == "/responses" || p == "/chat/completions",
     };
     if !allowed {
@@ -435,11 +502,15 @@ async fn handle(up: Arc<Upstream>, req: Request<hyper::body::Incoming>) -> Respo
         .iter()
         .filter(|(k, _)| keep.contains(&k.as_str()))
         .map(|(k, v)| {
-            (
-                k.to_string(),
-                String::from_utf8_lossy(v.as_bytes()).into_owned(),
-            )
+            let v = String::from_utf8_lossy(v.as_bytes()).into_owned();
+            let v = if k.as_str() == "anthropic-beta" {
+                known_betas(&v)
+            } else {
+                v
+            };
+            (k.to_string(), v)
         })
+        .filter(|(_, v)| !v.is_empty())
         .collect();
     let raw = match http_body_util::Limited::new(req.into_body(), 32 << 20)
         .collect()
@@ -567,15 +638,14 @@ fn summarize_request(body: &[u8]) -> Value {
 fn usage_of(text: &str) -> (u64, u64, Option<String>, Option<String>) {
     let (mut i, mut o, mut model, mut prov) = (0, 0, None, None);
     let mut take = |v: &Value| {
-        let r = v.get("response").unwrap_or(v);
+        let r = v.get("response").or(v.get("message")).unwrap_or(v);
         if let Some(u) = r.get("usage") {
             let gi = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
             let ni = gi("input_tokens") + gi("prompt_tokens") + gi("cache_read_input_tokens");
             let no = gi("output_tokens") + gi("completion_tokens");
-            if ni + no > 0 {
-                i = ni;
-                o = no;
-            }
+            // Anthropic streams usage in pieces; others report it once.
+            i = i.max(ni);
+            o = o.max(no);
         }
         if let Some(m) = r.get("model").and_then(|x| x.as_str()) {
             model = Some(m.to_string());
@@ -655,6 +725,42 @@ mod tests {
         )
         .is_err());
         assert!(vet_request(Provider::Anthropic, "/v1/messages", "m", br#"{"model":"m","messages":[],"tools":[{"type":"web_fetch_20250910","name":"web_fetch"}]}"#).is_err());
+        // Claude Code: Messages API through OpenRouter, with context editing,
+        // cache markers and its metadata (dropped).
+        let cc = |extra: &str| {
+            format!(
+                r#"{{"model":"m","max_tokens":10,"metadata":{{"user_id":"d"}},"output_config":{{"effort":"low"}},"thinking":{{"type":"adaptive"}},"system":[{{"type":"text","text":"s","cache_control":{{"type":"ephemeral"}}}}],"messages":[{{"role":"assistant","content":[{{"type":"tool_use","id":"t","name":"Bash","input":{{}},"caller":{{"type":"direct"}}}}]}}],"tools":[{{"name":"Bash","input_schema":{{"type":"object"}}}}]{extra}}}"#
+            )
+        };
+        let out = vet_request(Provider::Openrouter, "/v1/messages", "m", cc(r#","context_management":{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}"#).as_bytes()).unwrap();
+        assert!(!String::from_utf8_lossy(&out).contains("user_id"));
+        assert!(vet_request(
+            Provider::Openrouter,
+            "/v1/messages",
+            "m",
+            cc(r#","context_management":{"edits":[{"type":"compact_20260101"}]}"#).as_bytes()
+        )
+        .is_err());
+        assert!(vet_request(
+            Provider::Openrouter,
+            "/v1/messages",
+            "m",
+            cc(r#","mcp_servers":[{"type":"url","url":"https://x"}]"#).as_bytes()
+        )
+        .is_err());
+        assert!(vet_request(
+            Provider::Openrouter,
+            "/v1/messages",
+            "m",
+            cc(r#","output_config":{"effort":"low","tools":[]}"#).as_bytes()
+        )
+        .is_err());
+        assert_eq!(
+            upstream_path(Provider::Openrouter, "/v1/messages").as_deref(),
+            Some("/api/v1/messages")
+        );
+        assert!(upstream_path(Provider::Openai, "/v1/messages").is_none());
+        assert_eq!(known_betas("interleaved-thinking-2025-05-14, mcp-client-2025-04-04,files-api-2025-04-14,effort-2025-11-24"), "interleaved-thinking-2025-05-14,effort-2025-11-24");
         // Codex 0.164 sends tools as an input item, grouped in namespaces.
         let at = |tool: &str| {
             format!(

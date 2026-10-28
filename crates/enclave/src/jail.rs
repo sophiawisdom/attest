@@ -346,7 +346,7 @@ fn exec_inner(spec_json: &str) -> anyhow::Result<i32> {
             "size=16m,mode=0755",
         )?;
         for d in [
-            "bin", "usr", "repo", "work", "tmp", "dev", "proc", "etc", ".old",
+            "bin", "usr", "lib", "lib64", "repo", "work", "tmp", "dev", "proc", "etc", ".old",
         ] {
             std::fs::create_dir_all(format!("{root}/{d}"))?;
         }
@@ -360,6 +360,13 @@ fn exec_inner(spec_json: &str) -> anyhow::Result<i32> {
             &format!("{root}/usr"),
             true,
         )?;
+        // Shared libraries for the glibc-linked harnesses (Node, Claude Code).
+        for d in ["lib", "lib64"] {
+            let src = format!("{}/{d}", spec.image_root);
+            if std::path::Path::new(&src).is_dir() {
+                bind(&src, &format!("{root}/{d}"), true)?;
+            }
+        }
         // The repository: root-owned, mode 0444/0555, so the agent can read
         // but not change it, and reads still update access times.
         bind(&spec.repo, &format!("{root}/repo"), false)?;

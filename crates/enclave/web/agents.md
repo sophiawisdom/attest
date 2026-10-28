@@ -55,10 +55,16 @@ is written for an agent to follow, and takes one script.
    that nothing in it was arranged to influence the audit.
 5. Either party proposes a model: `POST /api/sessions/ID/models`
    `{"provider": "anthropic"|"openai"|"openrouter", "model": "...", "api_key": "...", "openrouter_zdr": true}`.
-   Add `"agent": "codex"` to run OpenAI's Codex CLI (full shell, in a jail:
-   repository read-only at /repo, 20 MB scratch, no network except the
-   model) instead of the built-in tools; `GET /api/info` lists the agents a
-   server has. An auditee proposal is approved immediately. An auditor proposal waits
+   To use a real coding agent instead of the built-in tools, add `"agent"`:
+   `"codex"` (OpenAI's Codex CLI; provider openai or openrouter),
+   `"claude-code"` (Claude Code; anthropic or openrouter) or `"pi"` (any
+   provider). Each runs with a full shell in a jail: repository read-only at
+   /repo, 20 MB scratch, no network except the approved model, reached
+   through a proxy in the enclave that refuses provider-side tools (web
+   search, URL fetches, MCP connectors). The agents don't load instructions,
+   hooks or plugins from the repository (AGENTS.md, CLAUDE.md, .claude/,
+   .pi/); they see those files only as code. `GET /api/info` lists the
+   agents a server has, with versions. An auditee proposal is approved immediately. An auditor proposal waits
    for `POST /api/sessions/ID/models/MODEL_ID/decision` `{"approve": true}`
    from the auditee. Keys are never shown to anyone. The code is sent to the
    chosen provider under the key owner's terms (for example zero data
@@ -68,8 +74,8 @@ is written for an agent to follow, and takes one script.
    has read-only tools: `list_dir`, `find_files`, `read_file`, `grep`,
    `python` (a sandbox with the code read-only at `/repo`), and
    `submit_verdict`. It has no shell and no network access. Its system prompt
-   is fixed in the image (hash in `/api/info`). The `codex` agent instead gets
-   a shell in a jail, as described in step 5.
+   is fixed in the image (hash in `/api/info`). The jailed agents (step 5)
+   get a shell instead.
 7. The run ends with a verdict: `yes`, `no`, `inconclusive`, or
    `needs_clarification` (with a `clarification_request` for the auditor).
 8. The auditee decides: `POST /api/sessions/ID/runs/RUN_ID/release`
