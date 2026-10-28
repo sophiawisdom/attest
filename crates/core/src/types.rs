@@ -275,7 +275,15 @@ pub struct Manifest {
     /// (including ones inherited from parent runs).
     pub auditor_messages: Vec<MessageRecord>,
     pub affidavit: AffidavitRecord,
+    /// The code snapshot. With no code connected, an empty tree
+    /// (`file_count` 0) and `has_code` false.
     pub code: CodeInfo,
+    #[serde(default = "yes")]
+    pub has_code: bool,
+    /// Services the agent could reach through the enclave (Slack, email,
+    /// bank data, custom APIs), with what the enclave confirmed about each.
+    #[serde(default)]
+    pub connections: Vec<ConnectionRecord>,
     pub model: ModelInfo,
     pub harness: HarnessInfo,
     pub activity: Activity,
@@ -294,6 +302,36 @@ pub struct Manifest {
     /// lineage than the one that signed the certificate (`boot_id`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ran_on_boot_id: Option<String>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// A service the auditee connected. The enclave holds its credentials and
+/// makes every request itself, over TLS it verifies, so what the agent saw
+/// came from these hosts.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ConnectionRecord {
+    pub id: u32,
+    /// "slack", "gmail", "plaid", "github_api" or "http" (a custom API).
+    pub kind: String,
+    /// The name the agent calls it by.
+    pub name: String,
+    pub hosts: Vec<String>,
+    /// HTTP methods the agent may use.
+    pub methods: Vec<String>,
+    /// What the enclave learned from the service itself when connecting,
+    /// e.g. "Slack workspace Acme (T0123)". None for a custom API: then only
+    /// the host name is known.
+    pub identity: Option<String>,
+    /// The auditee's description of it, shown to the agent.
+    pub description: String,
+    pub connected_at_ms: u64,
+    /// Requests the agent made through it in this run (0 in a verdict-only
+    /// certificate).
+    #[serde(default)]
+    pub calls: u32,
 }
 
 fn full_detail() -> String {

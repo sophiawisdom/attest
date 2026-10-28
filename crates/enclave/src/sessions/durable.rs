@@ -81,6 +81,7 @@ struct SnapshotRef<'a> {
     notify: Vec<(Role, NotifyRecord)>,
     event_counts: [u64; 2],
     disclosures: &'a Vec<DisclosureState>,
+    connections: &'a Vec<crate::connections::Connection>,
 }
 
 /// ...and owned, to read it back.
@@ -102,6 +103,8 @@ struct Snapshot {
     notify: Vec<(Role, NotifyRecord)>,
     event_counts: [u64; 2],
     disclosures: Vec<DisclosureState>,
+    #[serde(default)]
+    connections: Vec<crate::connections::Connection>,
 }
 
 fn code_name(b: &Bundle) -> String {
@@ -253,6 +256,7 @@ impl Session {
                     .collect(),
                 event_counts: st.event_counts,
                 disclosures: &st.disclosures,
+                connections: &st.connections,
             })?
         };
         let generation = lock(&self.written).0 + 1;
@@ -548,6 +552,7 @@ async fn restore_session(ctx: &Arc<Ctx>, sid: &str, head_ref: &str) -> Result<Ar
             .collect(),
         event_counts: snap.event_counts,
         disclosures: snap.disclosures,
+        connections: snap.connections,
         disclosures_in_flight: 0,
     };
     // Runs that were going when the state was written can't continue here:

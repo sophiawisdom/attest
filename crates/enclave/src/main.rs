@@ -11,6 +11,7 @@ mod acme;
 mod aws;
 mod blobs;
 mod budget;
+mod connections;
 mod bundle;
 mod cgroups;
 mod handoff;
@@ -1191,9 +1192,10 @@ async fn session_route(
             let token = v["token"].as_str().unwrap_or("").trim().to_string();
             github::check_repo(&repo)?;
             github::check_ref(&r)?;
-            // No token: a public repository.
-            if token.len() > 400 {
-                return Err(anyhow!("that token is too long").into());
+            // A public repository needs no enclave: anyone can audit it. The
+            // token is what makes this an import of something private.
+            if token.is_empty() || token.len() > 400 {
+                return Err(anyhow!("a GitHub token with read access to the repository is required").into());
             }
             crate::budget::ensure_room(sessions::UPLOAD_ALLOWANCE).map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
             let (ctx2, sid) = (ctx.clone(), s.id.clone());
@@ -1215,6 +1217,20 @@ async fn session_route(
             let mut out = s.set_code(ctx, role, bundle, sessions::CodeSource::Github { repo: repo.clone(), commit: commit.clone() })?;
             out["github"] = json!({"repo": repo, "ref": r, "commit": commit});
             ok(out)
+        }
+        ("POST", ["connections"]) => {
+            if role != attest_core::Role::Auditee {
+                return Err(anyhow!("only the auditee connects services").into());
+            }
+            let v = body_json(req).await?;
+            // Checked against the service before it's added (outside the
+            // session lock: it makes requests).
+            let c = connections::connect(&ctx.net, 0, &v).await?;
+            ok(s.add_connection(ctx, role, c)?)
+        }
+        ("DELETE", ["connections", cid]) => {
+            let id: u32 = cid.parse().map_err(|_| anyhow!("bad connection id"))?;
+            ok(s.remove_connection(ctx, role, id)?)
         }
         ("POST", ["models"]) => ok(s.propose_model(ctx, role, &body_json(req).await?)?),
         ("POST", ["models", mid, "decision"]) => {

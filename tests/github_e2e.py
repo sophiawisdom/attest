@@ -1,6 +1,9 @@
-"""Importing code from GitHub (needs internet: fetches this public repo).
+"""Importing code from GitHub (needs internet).
 
-    python3 tests/github_e2e.py
+    GITHUB_TOKEN=... python3 tests/github_e2e.py
+
+With GITHUB_TOKEN (any token that can read sophiawisdom/attest) it also
+imports the repository; without one it checks only the refusals.
 """
 import os
 import subprocess
@@ -35,11 +38,17 @@ def main():
         check(st != 200, "only the auditee provides code")
         st, v = call(PORT, "POST", path, ae, {"repo": "../etc"})
         check(st == 400, "a malformed repository name is refused")
-        st, v = call(PORT, "POST", path, ae, {"repo": "sophiawisdom/no-such-repo-attest-test"})
-        check(st == 400 and "no such repository" in v["error"], "a missing repository is reported")
+        st, v = call(PORT, "POST", path, ae, {"repo": "sophiawisdom/attest"})
+        check(st == 400 and "token" in v["error"] and "required" in v["error"], "a token is required (public code needs no enclave)")
+        st, v = call(PORT, "POST", path, ae, {"repo": "sophiawisdom/no-such-repo-attest-test", "token": "ghp_not_a_real_token"})
+        check(st == 400, "a missing repository or bad token is reported")
         st, v = call(PORT, "POST", path, ae, {"repo": "sophiawisdom/attest", "token": "ghp_not_a_real_token"})
         check(st == 400 and "token" in v["error"], "a bad token is reported")
-        v = ok(PORT, "POST", path, ae, {"repo": "sophiawisdom/attest", "ref": "main"})
+        token = os.environ.get("GITHUB_TOKEN", "")
+        if not token:
+            print("ALL GITHUB CHECKS PASSED (no GITHUB_TOKEN: import not tested)")
+            return
+        v = ok(PORT, "POST", path, ae, {"repo": "sophiawisdom/attest", "ref": "main", "token": token})
         check(v["file_count"] > 10 and len(v["github"]["commit"]) == 40, f"the repository is imported ({v['file_count']} files at {v['github']['commit'][:7]})")
         view = ok(PORT, "GET", f"/api/sessions/{sid}", ae)
         events = [e["text"] for e in view.get("events", [])]

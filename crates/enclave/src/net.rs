@@ -69,6 +69,21 @@ impl Net {
             .insert(host.to_ascii_lowercase());
     }
 
+    /// A copy that may also reach `hosts` (a session's connected services),
+    /// without adding them to this enclave's own allowlist.
+    pub fn scoped(&self, hosts: &[String]) -> Net {
+        let mut set = self.allowed.read().unwrap().clone();
+        set.extend(hosts.iter().map(|h| h.to_ascii_lowercase()));
+        Net {
+            allowed: Arc::new(std::sync::RwLock::new(set)),
+            ..self.clone()
+        }
+    }
+
+    pub fn is_dev(&self) -> bool {
+        self.dev
+    }
+
     pub fn allowed_hosts(&self) -> Vec<String> {
         self.allowed.read().unwrap().iter().cloned().collect()
     }

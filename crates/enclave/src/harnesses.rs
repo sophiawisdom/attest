@@ -164,6 +164,7 @@ pub async fn run_agent(
     progress: Arc<dyn Fn(Vec<Value>) + Send + Sync>,
 ) -> AgentOutput {
     let fail = |msg: String| AgentOutput {
+        connections: vec![],
         turns: vec![],
         verdict: None,
         outcome: Outcome::Error { message: msg },
@@ -297,6 +298,7 @@ pub async fn run_agent(
             Err(e) => (None, Outcome::Error { message: e }),
         };
         AgentOutput {
+            connections: vec![],
             turns: vec![],
             verdict,
             outcome,

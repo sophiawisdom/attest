@@ -133,6 +133,8 @@ struct State {
     disclosures: Vec<DisclosureState>,
     /// Drafts being prepared right now (counted against the limits).
     disclosures_in_flight: usize,
+    /// Services connected for the agent (connections.rs).
+    connections: Vec<crate::connections::Connection>,
 }
 
 /// A status: one of a fixed set of strings. (An alias, so serde doesn't
@@ -268,6 +270,9 @@ struct RunState {
     model_id: u32,
     tree: String,
     commitment: String,
+    /// The connections the run had (their ids).
+    #[serde(default)]
+    connections: Vec<u32>,
     /// Every auditor message in this conversation, including inherited ones.
     messages: Vec<(MessageRecord, String)>,
     /// running | awaiting_release | released | declined
@@ -348,6 +353,8 @@ pub fn invite_token(creator_token: &str) -> String {
     let k = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, creator_token.as_bytes());
     hex::encode(ring::hmac::sign(&k, b"attest-invite/1").as_ref())
 }
+
+const MAX_CONNECTIONS: usize = 12;
 
 fn random_hex(n: usize) -> String {
     let mut b = vec![0u8; n];
@@ -878,6 +885,35 @@ impl Session {
         Ok(serde_json::to_value(&info)?)
     }
 
+    /// Add a service the agent may use (already checked by connections::connect).
+    pub fn add_connection(self: &Arc<Self>, ctx: &Arc<Ctx>, role: Role, mut c: crate::connections::Connection) -> Result<Value> {
+        ensure!(role == Role::Auditee, "only the auditee connects services");
+        let mut st = lock(&self.st);
+        ensure!(st.connections.len() < MAX_CONNECTIONS, "a session has at most {MAX_CONNECTIONS} connections");
+        ensure!(!st.connections.iter().any(|x| x.rec.name == c.rec.name), "a connection named {} already exists; give this one another name", c.rec.name);
+        c.rec.id = st.connections.iter().map(|x| x.rec.id).max().unwrap_or(0) + 1;
+        let rec = c.rec.clone();
+        st.connections.push(c);
+        let msg = format!(
+            "The auditee connected {} ({}){}.",
+            rec.name,
+            rec.hosts.join(", "),
+            rec.identity.as_ref().map(|i| format!(": {i}")).unwrap_or_default()
+        );
+        self.event(ctx, &mut st, "connection_added", msg, None, Some(role), false);
+        self.maybe_start(ctx, &mut st);
+        Ok(serde_json::to_value(&rec)?)
+    }
+
+    pub fn remove_connection(self: &Arc<Self>, ctx: &Arc<Ctx>, role: Role, id: u32) -> Result<Value> {
+        ensure!(role == Role::Auditee, "only the auditee removes connections");
+        let mut st = lock(&self.st);
+        let i = st.connections.iter().position(|c| c.rec.id == id).ok_or_else(|| anyhow!("no connection {id}"))?;
+        let c = st.connections.remove(i);
+        self.event(ctx, &mut st, "connection_removed", format!("The auditee removed the connection {}.", c.rec.name), None, Some(role), false);
+        Ok(json!({"removed": id}))
+    }
+
     pub fn propose_model(self: &Arc<Self>, ctx: &Arc<Ctx>, role: Role, v: &Value) -> Result<Value> {
         crate::budget::ensure_room(SESSION_ALLOWANCE)?;
         let provider: Provider = v["provider"].as_str().unwrap_or_default().parse()?;
@@ -1162,11 +1198,18 @@ impl Session {
         // excerpts of the old code) mustn't mix with the new, nor new code go
         // to a model or account that was replaced.
         let model = st.models.iter().find(|m| m.id == parent.model_id).unwrap();
+        let tree = st.code.as_ref().map(|c| c.info.tree_sha256.clone()).unwrap_or_default();
+        let conns: Vec<u32> = st.connections.iter().map(|c| c.rec.id).collect();
         ensure!(
-            model.status == "approved"
-                && st.code.as_ref().map(|c| &c.info.tree_sha256) == Some(&parent.tree),
-            "the code or the model changed since run {}; revise the question to run it again",
+            model.status == "approved" && tree == parent.tree && conns == parent.connections,
+            "the code, the connected services or the model changed since run {}; revise the question to run it again",
             parent.number
+        );
+        // The agent can send requests to services the auditee runs, so a
+        // message hidden from the auditee could reach them that way.
+        ensure!(
+            !blinded || conns.is_empty(),
+            "blinded messages aren't possible with connected services: the agent's requests to them could carry the message to the auditee"
         );
         let rec = MessageRecord {
             sent_at_ms: now_ms(),
@@ -1249,22 +1292,30 @@ impl Session {
         {
             return;
         }
-        let Some(code) = &st.code else { return };
-        let Some((tree, _)) = &st.affidavit else {
-            return;
+        // Something to investigate: code, connected services, or both.
+        let tree = match &st.code {
+            Some(code) => {
+                if !st.affidavit.as_ref().is_some_and(|(t, _)| t == &code.info.tree_sha256) {
+                    return;
+                }
+                code.info.tree_sha256.clone()
+            }
+            None if !st.connections.is_empty() => String::new(),
+            None => return,
         };
-        if tree != &code.info.tree_sha256 {
-            return;
-        }
+        let conns: Vec<u32> = st.connections.iter().map(|c| c.rec.id).collect();
         let Some(m) = st.models.iter().rev().find(|m| m.status == "approved") else {
             return;
         };
         if llm::is_fine_tuned(m.provider, &m.model) && !q.allow_fine_tuned {
             return;
         }
+        if jailed_conflict(st, m).is_some() {
+            return;
+        }
         let (qv, mid) = (q.version, m.id);
         if st.runs.iter().any(|r| {
-            r.parent.is_none() && r.question_version == qv && r.model_id == mid && &r.tree == tree
+            r.parent.is_none() && r.question_version == qv && r.model_id == mid && r.tree == tree && r.connections == conns
         }) {
             return;
         }
@@ -1296,11 +1347,24 @@ impl Session {
             .find(|q| q.version == spec.question_version)
             .cloned()
             .ok_or_else(|| anyhow!("no question"))?;
-        let bundle = st.code.clone().ok_or_else(|| anyhow!("no code"))?;
-        let (_, affidavit) = st
-            .affidavit
-            .clone()
-            .ok_or_else(|| anyhow!("no affidavit"))?;
+        let has_code = st.code.is_some();
+        ensure!(has_code || !st.connections.is_empty(), "nothing is connected");
+        let bundle = match &st.code {
+            Some(b) => b.clone(),
+            None => Arc::new(Bundle::empty(&self.id, ctx.blobs.clone(), ctx.cache.clone())),
+        };
+        let affidavit = match &st.affidavit {
+            Some((_, a)) if has_code => a.clone(),
+            _ => AffidavitRecord {
+                organization: String::new(),
+                repo_url: None,
+                git_commit: None,
+                statement: "No code was connected.".into(),
+                confirmed_at_ms: now_ms(),
+                fetched_by_enclave: false,
+            },
+        };
+        let connections = st.connections.clone();
         let m = st
             .models
             .iter()
@@ -1363,8 +1427,8 @@ impl Session {
                 trace.push(json!({"type": "system", "content": harness::SYSTEM_PROMPT}));
                 let p = harness::user_prompt(
                     &q.text,
-                    bundle.info.file_count,
-                    bundle.info.total_bytes,
+                    has_code.then_some((bundle.info.file_count, bundle.info.total_bytes)),
+                    &connections.iter().map(|c| c.describe()).collect::<Vec<_>>(),
                     &q.answer_format,
                 );
                 trace.push(json!({"type": "user", "content": p}));
@@ -1380,7 +1444,7 @@ impl Session {
         }
 
         let text_sha = sha256_hex(q.text.as_bytes());
-        let mut prior_trees: Vec<String> = st.runs.iter().map(|r| r.tree.clone()).collect();
+        let mut prior_trees: Vec<String> = st.runs.iter().map(|r| r.tree.clone()).filter(|t| !t.is_empty()).collect();
         prior_trees.sort();
         prior_trees.dedup();
         let history = History {
@@ -1416,6 +1480,8 @@ impl Session {
             auditor_messages: messages.iter().map(|(r, _)| r.clone()).collect(),
             affidavit: affidavit.clone(),
             code: bundle.info.clone(),
+            has_code,
+            connections: connections.iter().map(|c| c.rec.clone()).collect(),
             model: model_info.clone(),
             harness: ctx.info.harness.clone(),
             activity: Activity::default(),
@@ -1436,8 +1502,9 @@ impl Session {
             parent: spec.parent.clone(),
             question_version: q.version,
             model_id: m.id,
-            tree: bundle.info.tree_sha256.clone(),
+            tree: if has_code { bundle.info.tree_sha256.clone() } else { String::new() },
             commitment: bundle.info.commitment_sha256.clone(),
+            connections: connections.iter().map(|c| c.rec.id).collect(),
             messages: messages.clone(),
             status: "running",
             steps: 0,
@@ -1489,6 +1556,8 @@ impl Session {
             parent: spec.parent,
             client,
             bundle,
+            has_code,
+            connections,
             turns,
             question,
             affidavit,
@@ -1543,6 +1612,7 @@ impl Session {
                 }
                 a
             }),
+            "connections": st.connections.iter().map(|c| &c.rec).collect::<Vec<_>>(),
             "models": st.models.iter().map(|m| m.public()).collect::<Vec<_>>(),
             "runs": runs,
             "disclosures": st.disclosures.iter().filter(|d| role == Role::Auditee || d.status == "published").map(|d| {
@@ -1877,6 +1947,8 @@ struct RunJob {
     parent: Option<String>,
     client: Client,
     bundle: Arc<Bundle>,
+    has_code: bool,
+    connections: Vec<crate::connections::Connection>,
     turns: Vec<Turn>,
     question: QuestionRecord,
     affidavit: AffidavitRecord,
@@ -1986,6 +2058,7 @@ impl RunJob {
         let pin = self.bundle.pin().await;
         match (&pin, &self.harness_job) {
             (Err(e), _) => run::AgentOutput {
+                connections: vec![],
                 turns: vec![],
                 verdict: None,
                 outcome: Outcome::Error {
@@ -2020,6 +2093,9 @@ impl RunJob {
                 run::agent_loop(
                     &self.client,
                     &self.bundle,
+                    self.has_code,
+                    self.connections.clone(),
+                    &self.ctx.net,
                     sandbox,
                     self.turns.clone(),
                     self.question.max_steps,
@@ -2050,6 +2126,12 @@ impl RunJob {
             auditor_messages: self.messages.clone(),
             affidavit: self.affidavit.clone(),
             code: self.bundle.info.clone(),
+            has_code: self.has_code,
+            connections: if out.connections.is_empty() {
+                self.connections.iter().map(|c| c.rec.clone()).collect()
+            } else {
+                out.connections.clone()
+            },
             model,
             harness: self.ctx.info.harness.clone(),
             activity: out.activity.clone(),
@@ -2136,6 +2218,7 @@ impl Drop for AbortOnDrop {
 
 fn failed_output(message: &str) -> run::AgentOutput {
     run::AgentOutput {
+        connections: vec![],
         turns: vec![],
         verdict: None,
         outcome: Outcome::Error {
@@ -2204,6 +2287,9 @@ fn public_body(full: &CertificateBody, details: bool, strict: bool) -> Certifica
         commitment_salt: String::new(),
     };
     m.activity = Activity::default();
+    for c in &mut m.connections {
+        c.calls = 0;
+    }
     m.instruction_scan = InstructionScan::default();
     m.history.prior_code_trees_in_session.clear();
     m.history.same_question_text_other_sessions = 0;
@@ -2349,6 +2435,19 @@ impl CodeSource {
     }
 }
 
+/// Why the approved model's agent can't run here, if it can't: the jailed
+/// agents (harnesses.rs) read code only and don't get connected services.
+fn jailed_conflict(st: &State, m: &ModelProposal) -> Option<&'static str> {
+    crate::harnesses::Agent::parse(&m.agent)?;
+    if !st.connections.is_empty() {
+        Some("Connected services work only with the built-in agent for now. Choose it in the model step, or remove the connections.")
+    } else if st.code.is_none() {
+        Some("This agent needs code. Connect a repository, or choose the built-in agent.")
+    } else {
+        None
+    }
+}
+
 fn status_line(st: &State, role: Role) -> String {
     let q = st.questions.last();
     if busy_for(st, role)
@@ -2378,9 +2477,15 @@ fn status_line(st: &State, role: Role) -> String {
     }
     let mut missing = Vec::new();
     match (&st.code, &st.affidavit) {
-        (None, _) => missing.push("the auditee to connect code"),
+        (None, _) if st.connections.is_empty() => missing.push("the auditee to connect code or services"),
+        (None, _) => {}
         (Some(c), Some((t, _))) if t == &c.info.tree_sha256 => {}
         _ => missing.push("the auditee to provide code"),
+    }
+    if let Some(m) = st.models.iter().rev().find(|m| m.status == "approved") {
+        if let Some(why) = jailed_conflict(st, m) {
+            return why.into();
+        }
     }
     if !st.models.iter().any(|m| m.status == "approved") {
         missing.push(if st.models.iter().any(|m| m.status == "pending") {

@@ -381,6 +381,13 @@ impl Bundle {
         }
     }
 
+    /// No files: a run over connected services only.
+    pub fn empty(session_id: &str, store: BlobClient, cache: Arc<Cache>) -> Self {
+        let mut dirs = BTreeSet::new();
+        dirs.insert(String::new());
+        Self::finish(BTreeMap::new(), dirs, ScanCounts::default(), Sealer::new(session_id), store, cache)
+    }
+
     /// The record a successor rebuilds this bundle from.
     pub fn manifest(&self) -> CodeManifest {
         CodeManifest {
@@ -888,8 +895,20 @@ fn verdict_schema(format: &attest_core::AnswerFormat) -> serde_json::Value {
 
 pub fn tool_schemas(
     format: &attest_core::AnswerFormat,
+    has_code: bool,
+    connections: &[String],
 ) -> Vec<(&'static str, &'static str, serde_json::Value)> {
-    let mut v = base_tool_schemas();
+    let mut v = if has_code { base_tool_schemas() } else { Vec::new() };
+    if !connections.is_empty() {
+        v.push(("http_request", "Make one HTTP request to a connected service. The enclave adds the credentials; you never see them. Give the path (with any query in `query`), not a full URL. Responses over 40k characters are cut: use the API's paging and filters.",
+            serde_json::json!({"type":"object","properties":{
+                "connection":{"type":"string","enum":connections},
+                "method":{"type":"string","description":"GET, POST, ... (each connection allows some)"},
+                "path":{"type":"string","description":"e.g. /api/conversations.history"},
+                "query":{"type":"object","description":"Query parameters"},
+                "body":{"description":"A JSON object, or a form-encoded string"}
+            },"required":["connection","method","path"]})));
+    }
     v.push(("submit_verdict", "Finish: record your verdict for the auditor (released only if the auditee approves). It must fit the agreed answer format.", verdict_schema(format)));
     v
 }

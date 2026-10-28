@@ -139,6 +139,7 @@ details > summary { cursor: pointer; color: var(--ink-2); }
 .steps3 .s { padding: 14px 16px; }
 .steps3 .s b { display: block; margin-bottom: 4px; }
 .foot { color: var(--ink-3); font-size: 12.5px; display: flex; gap: 14px; flex-wrap: wrap; justify-content: center; margin-top: 30px; }
+[hidden] { display: none !important; }
 </style>
 </head>
 <body>
@@ -246,7 +247,7 @@ function landing() {
     <p class="lead">An auditor asks a question. A model reads your code inside an attested AWS Nitro enclave and answers. You watch everything it does and decide whether the auditor sees the answer. Neither side sees the other's API key. Apart from you, only the model provider you approve receives the code.</p>
     <div class="steps3">
       <div class="panel s"><b>1. Start a session</b><span class="muted small">Either side can start. Your session page shows a link to send the other party over a channel you already trust, such as Signal.</span></div>
-      <div class="panel s"><b>2. Agree on the question</b><span class="muted small">The auditor asks; the auditee accepts, connects their code, and approves the model.</span></div>
+      <div class="panel s"><b>2. Agree on the question</b><span class="muted small">The auditor asks; the auditee accepts, connects what the agent may look at (code, Slack, email, bank data, any API), and approves the model.</span></div>
       <div class="panel s"><b>3. Release or decline</b><span class="muted small">You read the result and the full transcript first. The auditor gets a signed certificate if you release it.</span></div>
     </div>
     <div id="created">${S.info && S.info.open === false
@@ -376,33 +377,88 @@ function renderQuestion(v) {
 }
 
 // ---------------------------------------------------------------- tools
-function renderCode(v) {
-  const c = v.code, a = v.affidavit, cur = a?.current;
-  let body = "";
-  if (c && isAuditee()) body += `<div class="pills"><span class="pill"><b>${num(c.file_count)}</b> files</span><span class="pill"><b>${bytes(c.total_bytes)}</b></span><span class="pill">tree ${hash(c.tree_sha256)}</span><span class="pill">${esc(ago(c.uploaded_at_ms))}</span></div>`;
-  else if (c) body += `<div class="pills"><span class="pill">commitment ${hash(c.commitment_sha256)}</span><span class="pill">${esc(ago(c.uploaded_at_ms))}</span></div><p class="small muted">Size and tree hash stay hidden until a result is released; the certificate opens the commitment.</p>`;
-  if (c && cur) body += `<p class="small">${esc(a.record.statement)}</p>`;
-  if (isAuditee()) {
-    const link = `${ORIGIN}/s/${S.sid}#${S.token}`;
-    const cmd = `attest upload '${link}' ~/path/to/repo`;
-    const checked = LOCAL || S.info?.mode === "dev";
-    body += `<details data-keep="gh-${c ? c.tree_sha256 : "none"}" ${c ? "" : "open"}><summary>${c ? "Replace the code from GitHub" : "GitHub repository"}</summary><div class="stack" style="margin-top:10px">
-      <p class="small muted">The enclave fetches the repository from GitHub itself, and the certificate records the repository and commit it got. The token is used for that one download and never stored; the auditor and the model never see it.</p>
-      <div class="grid2"><label class="f">Repository<input type="text" id="ghRepo" placeholder="owner/name"></label><label class="f">Branch, tag or commit<input type="text" id="ghRef" placeholder="main"></label></div>
-      <label class="f">Token (private repositories only)<input type="password" id="ghToken" autocomplete="off" placeholder="github_pat_…">
-        <span class="hint">Make one at <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">github.com/settings/personal-access-tokens/new</a>: under Repository access pick only this repository; under Permissions set Contents to read-only. Give it a short expiry.</span></label>
-      ${checked ? "" : `<details><summary class="small">This browser hasn't checked the enclave</summary><div class="stack" style="margin-top:8px">
-        <p class="small muted">A browser can't confirm it's talking to the attested enclave rather than to whoever controls this address. To have your computer check before you paste a token, open the session with <code>attest open</code>:</p>
-        <div class="linkbox"><input type="text" readonly value="${esc(openCmd())}"><button class="btn" data-copy="${esc(openCmd())}">Copy</button></div></div></details>`}
-      <div class="row"><button class="btn primary" data-act="github">Import from GitHub</button></div></div></details>`;
-    body += `<details data-keep="upload-${c ? c.tree_sha256 : "none"}"><summary>Or upload files</summary><div class="stack" style="margin-top:10px">
-      <p class="small muted">An upload can't be checked against a repository, so the certificate says the auditee uploaded it. The CLI sends exactly your git-tracked files, records the repository and commit you say they are, and checks the enclave first.</p>
+// What the auditee can connect. Each pane's fields are sent as-is to
+// POST /connections (or /code/github for a repository).
+const TOOL_KINDS = [
+  { id: "github", label: "GitHub repository" },
+  { id: "slack", label: "Slack" },
+  { id: "gmail", label: "Gmail" },
+  { id: "plaid", label: "Plaid (bank data)" },
+  { id: "http", label: "Any HTTPS API" },
+  { id: "upload", label: "Upload code" },
+];
+const field = (id, label, ph = "", type = "text", hint = "") =>
+  `<label class="f">${label}<input type="${type}" id="${id}" placeholder="${esc(ph)}" autocomplete="off">${hint ? `<span class="hint">${hint}</span>` : ""}</label>`;
+const nameDesc = (k, ph) => `<div class="grid2">${field(`t_${k}_name`, "Name the agent uses", ph)}${field(`t_${k}_desc`, "What it is (shown to the agent, optional)", "")}</div>`;
+function toolPanes() {
+  const link = `${ORIGIN}/s/${S.sid}#${S.token}`;
+  const cmd = `attest upload '${link}' ~/path/to/repo`;
+  return {
+    github: `<p class="small muted">The enclave downloads the repository from GitHub itself, and the certificate records the repository and commit it got. Public code needs no enclave: anyone can audit it directly.</p>
+      <div class="grid2">${field("ghRepo", "Repository", "owner/name")}${field("ghRef", "Branch, tag or commit", "main")}</div>
+      ${field("ghToken", "Token", "github_pat_…", "password", `Make one at <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">github.com/settings/personal-access-tokens/new</a>: under Repository access pick only this repository; under Permissions set Contents to read-only. It's used for this one download and never stored.`)}
+      <div class="row"><button class="btn primary" data-act="github">Import repository</button></div>`,
+    slack: `<p class="small muted">The agent can read channels and messages through the Slack Web API. The enclave asks Slack which workspace the token belongs to, and the certificate says so.</p>
+      ${field("t_slack_token", "Token", "xoxb-… or xoxp-…", "password", `Create an app at <a href="https://api.slack.com/apps" target="_blank" rel="noopener">api.slack.com/apps</a>, give it only read scopes (for example channels:read, channels:history, users:read, and search:read for a user token), install it to your workspace and paste its token. The scopes are the hard limit; the agent is also told never to post or change anything.`)}
+      ${nameDesc("slack", "slack")}
+      <div class="row"><button class="btn primary" data-act="connect" data-kind="slack">Connect Slack</button></div>`,
+    gmail: `<p class="small muted">The agent can search and read mail through the Gmail API, read-only. The enclave asks Google which address the mailbox is, and the certificate says so.</p>
+      ${field("t_gmail_refresh_token", "Refresh token", "1//…", "password", `From an OAuth client of yours with the <code>gmail.readonly</code> scope. Or leave the three fields below empty and paste a one-hour access token (for example from <a href="https://developers.google.com/oauthplayground" target="_blank" rel="noopener">the OAuth Playground</a>).`)}
+      <div class="grid2">${field("t_gmail_client_id", "OAuth client ID", "….apps.googleusercontent.com")}${field("t_gmail_client_secret", "OAuth client secret", "", "password")}</div>
+      ${field("t_gmail_access_token", "Or: access token", "ya29.…", "password")}
+      ${nameDesc("gmail", "gmail")}
+      <div class="row"><button class="btn primary" data-act="connect" data-kind="gmail">Connect Gmail</button></div>`,
+    plaid: `<p class="small muted">The agent can read accounts, balances and transactions through Plaid. The enclave asks Plaid which institution the item is at, and the certificate says so.</p>
+      <div class="grid2">${field("t_plaid_client_id", "Client ID", "")}${field("t_plaid_secret", "Secret", "", "password")}</div>
+      <div class="grid2">${field("t_plaid_access_token", "Access token", "access-production-…", "password")}<label class="f">Environment<select id="t_plaid_environment"><option>production</option><option>sandbox</option></select></label></div>
+      ${nameDesc("plaid", "plaid")}
+      <div class="row"><button class="btn primary" data-act="connect" data-kind="plaid">Connect Plaid</button></div>`,
+    http: `<p class="small muted">Any HTTPS API: an internal service, a database's HTTP interface, another SaaS. The enclave adds the credential to every request to this host and nowhere else. It can't tell who runs the host, so the certificate shows only its name.</p>
+      ${field("t_http_base_url", "Base URL", "https://api.example.com")}
+      <div class="grid2">${field("t_http_header_name", "Credential header (optional)", "Authorization")}${field("t_http_header_value", "Header value", "Bearer …", "password")}</div>
+      <div class="f">Methods the agent may use<div class="row">${["GET", "POST", "PUT", "PATCH", "DELETE"].map(m => `<label class="check"><input type="checkbox" class="t_http_m" value="${m}" ${m === "GET" ? "checked" : ""}><span>${m}</span></label>`).join("")}</div><span class="hint">Most APIs read with GET. Allow others only if the API needs them to read (some query APIs use POST).</span></div>
+      ${nameDesc("http", "api")}
+      <div class="row"><button class="btn primary" data-act="connect" data-kind="http">Connect API</button></div>`,
+    upload: `<p class="small muted">An upload can't be checked against a repository, so the certificate says the auditee uploaded it. The CLI sends exactly your git-tracked files, records the repository and commit you say they are, and checks the enclave first.</p>
       <div class="linkbox"><input type="text" readonly value="${esc(cmd)}"><button class="btn" data-copy="${esc(cmd)}">Copy</button></div>
       <p class="small muted">Or choose a folder here. Everything in it is sent except <code>.git</code>, including untracked files.</p>
       <label class="drop"><input type="file" id="folder" webkitdirectory multiple hidden><b>Choose a folder</b></label>
-      <div id="upStatus"></div></div></details>`;
-  } else if (!c) body += `<p class="muted">Waiting for the auditee to connect their code. You'll see a commitment to it; its size and hash come with a released certificate, its contents never.</p>`;
-  patch("cCode", head(2, "Connect tools", !!(c && cur)) + `<div class="pad stack">${body}</div>`);
+      <div id="upStatus"></div>`,
+  };
+}
+function renderCode(v) {
+  const c = v.code, a = v.affidavit, cur = a?.current, conns = v.connections || [];
+  let body = "";
+  if (c || conns.length) {
+    body += `<div class="stack" style="gap:8px">`;
+    if (c) {
+      body += `<div class="panel pad stack" style="gap:6px"><div class="row"><b>Code</b>${isAuditee()
+        ? `<span class="pill"><b>${num(c.file_count)}</b> files</span><span class="pill"><b>${bytes(c.total_bytes)}</b></span><span class="pill">tree ${hash(c.tree_sha256)}</span>`
+        : `<span class="pill">commitment ${hash(c.commitment_sha256)}</span>`}<span class="faint small">${esc(ago(c.uploaded_at_ms))}</span></div>
+        ${cur ? `<span class="small">${esc(a.record.statement)}</span>` : ""}
+        ${isAuditee() ? "" : `<span class="small muted">Size and tree hash stay hidden until a result is released; the certificate opens the commitment.</span>`}</div>`;
+    }
+    for (const k of conns) {
+      body += `<div class="panel pad stack" style="gap:6px"><div class="row"><b>${esc(k.name)}</b><span class="pill">${esc(k.kind)}</span><span class="pill">${esc(k.methods.join(", "))}</span><span class="faint small">${esc(ago(k.connected_at_ms))}</span>
+        ${isAuditee() ? `<button class="btn" style="margin-left:auto" data-act="disconnect" data-id="${k.id}">Remove</button>` : ""}</div>
+        <span class="small">${esc(k.hosts.join(", "))}${k.identity ? ` · <b>${esc(k.identity)}</b> <span class="faint">(confirmed by the service)</span>` : ` · <span class="faint">owner not verified</span>`}</span>
+        ${k.description ? `<span class="small muted">${esc(k.description)}</span>` : ""}</div>`;
+    }
+    body += `</div>`;
+  }
+  if (isAuditee()) {
+    const panes = toolPanes(), tab = S.toolTab || "github";
+    const checked = LOCAL || S.info?.mode === "dev";
+    body += `<details data-keep="tools-add" ${c || conns.length ? "" : "open"}><summary>${c || conns.length ? "Connect something else" : "Connect what the agent may look at"}</summary><div class="stack" style="margin-top:10px">
+      <div class="seg" id="toolTabs">${TOOL_KINDS.map(k => `<button type="button" data-act="tool-tab" data-k="${k.id}" aria-pressed="${k.id === tab}">${esc(k.label)}</button>`).join("")}</div>
+      ${TOOL_KINDS.map(k => `<div class="stack" data-pane="${k.id}" ${k.id === tab ? "" : "hidden"}>${panes[k.id]}</div>`).join("")}
+      <p class="small faint">Credentials stay inside the enclave: the agent names a connection and the enclave adds them to each request. Neither the auditor nor the model sees them.</p>
+      ${checked ? "" : `<details><summary class="small">This browser hasn't checked the enclave</summary><div class="stack" style="margin-top:8px">
+        <p class="small muted">A browser can't confirm it's talking to the attested enclave rather than to whoever controls this address. To have your computer check before you paste a credential, open the session with <code>attest open</code>:</p>
+        <div class="linkbox"><input type="text" readonly value="${esc(openCmd())}"><button class="btn" data-copy="${esc(openCmd())}">Copy</button></div></div></details>`}
+    </div></details>`;
+  } else if (!c && !conns.length) body += `<p class="muted">Waiting for the auditee to connect what the agent may look at: code, Slack, email, bank data or other services. You'll see what's connected and whom each service says the account belongs to.</p>`;
+  patch("cCode", head(2, "Connect tools", !!((c && cur) || conns.length)) + `<div class="pad stack">${body}</div>`);
 }
 
 // ---------------------------------------------------------------- model
@@ -526,7 +582,7 @@ function traceHtml(entries) {
 function renderRuns(v) {
   const runs = [...v.runs].reverse();
   let body;
-  if (!runs.length) body = `<div class="pad"><p class="muted">The agent starts automatically once the question is accepted, the code is connected, and a model is approved.</p></div>`;
+  if (!runs.length) body = `<div class="pad"><p class="muted">The agent starts automatically once the question is accepted, something is connected, and a model is approved.</p></div>`;
   else body = runs.map(r => runHtml(v, r)).join("");
   patch("cRuns", head(4, "Agent runs", runs.some(r => r.status === "released"), `<span class="faint small">${runs.length || ""}</span>`) + body);
   for (const r of runs) if (isAuditee()) patch("tx-" + r.id, traceHtml(S.traces[r.id]?.entries || []));
@@ -558,7 +614,7 @@ function runHtml(v, r) {
     if ((r.status === "released" || r.status === "declined") && !busyNow && r === [...v.runs].reverse().find(x => x.status === "released" || x.status === "declined"))
       main += `<details data-keep="fu-${r.id}"><summary>Send the agent a follow-up</summary><div class="stack" style="margin-top:10px">
         <textarea id="fu-${r.id}" placeholder="What did you check to rule out the RL pipeline?"></textarea>
-        <label class="check"><input type="checkbox" id="fub-${r.id}"><span>Blind this message from the auditee<br><span class="faint small">They see that you sent one and everything the agent does in response, but not your text. They still decide on release.</span></span></label>
+        ${(v.connections || []).length ? `<span class="faint small">Blinded messages aren't available here: the agent's requests to the connected services could carry the text to the auditee.</span>` : `<label class="check"><input type="checkbox" id="fub-${r.id}"><span>Blind this message from the auditee<br><span class="faint small">They see that you sent one and everything the agent does in response, but not your text. They still decide on release.</span></span></label>`}
         <div class="row"><button class="btn primary" data-act="followup" data-run="${r.id}">Send follow-up</button></div></div></details>`;
   }
   return `<div class="run pad stack">${meta}${msgHtml}${main}</div>`;
@@ -630,6 +686,12 @@ document.addEventListener("click", async (e) => {
     if (!S.sid) { await loadInfo(); $("#landingVerify").innerHTML = verifyPanel(); return; }
     document.getElementById("verify")?.scrollIntoView({ behavior: "smooth" }); return;
   }
+  if (act === "tool-tab") {
+    S.toolTab = b.dataset.k;
+    $$("#toolTabs button").forEach(x => x.setAttribute("aria-pressed", String(x === b)));
+    $$("[data-pane]").forEach(p => p.hidden = p.dataset.pane !== b.dataset.k);
+    return;
+  }
   if (act === "prov") {
     $$("#mProv button").forEach(x => x.setAttribute("aria-pressed", String(x === b)));
     const p = [...PROVIDERS, { id: "mock", ph: "gpt-mock" }].find(x => x.id === b.dataset.p);
@@ -666,7 +728,17 @@ document.addEventListener("click", async (e) => {
     },
     "q-accept": () => sapi("/question/decision", { method: "POST", body: { version: Number(b.dataset.v), accept: true, note: val("qNote") } }),
     "q-reject": () => sapi("/question/decision", { method: "POST", body: { version: Number(b.dataset.v), accept: false, note: val("qNote") } }),
-    "github": () => sapi("/code/github", { method: "POST", timeout: 15 * 60 * 1000, body: { repo: val("ghRepo").trim(), ref: val("ghRef").trim() || undefined, token: val("ghToken").trim() || undefined } }),
+    "github": () => sapi("/code/github", { method: "POST", timeout: 15 * 60 * 1000, body: { repo: val("ghRepo").trim(), ref: val("ghRef").trim() || undefined, token: val("ghToken").trim() } }),
+    "connect": () => {
+      const k = b.dataset.kind, body = { kind: k };
+      for (const el of $$(`[data-pane="${k}"] [id^="t_${k}_"]`)) {
+        const f = el.id.slice(`t_${k}_`.length), x = el.value.trim();
+        if (x) body[f === "desc" ? "description" : f] = x;
+      }
+      if (k === "http") body.methods = $$(".t_http_m").filter(x => x.checked).map(x => x.value);
+      return sapi("/connections", { method: "POST", timeout: 60000, body });
+    },
+    "disconnect": () => sapi(`/connections/${b.dataset.id}`, { method: "DELETE" }),
     "propose-model": () => sapi("/models", { method: "POST", body: { provider: $("#mProv [aria-pressed=true]").dataset.p, model: val("mModel"), api_key: val("mKey"), openrouter_zdr: $("#mZdr")?.checked, openrouter_only: (val("mOnly") || "").split(",").map(s => s.trim()).filter(Boolean), mock_endpoint: val("mMock"), agent: val("mAgent") || "builtin", ...cloudValues("m") } }),
     "m-approve": () => sapi(`/models/${b.dataset.id}/decision`, { method: "POST", body: { approve: true, api_key: val("ak-" + b.dataset.id) || undefined, accept_auditor_account: $("#acc-" + b.dataset.id)?.checked || false, ...cloudValues("a" + b.dataset.id) } }),
     "m-reject": () => sapi(`/models/${b.dataset.id}/decision`, { method: "POST", body: { approve: false } }),

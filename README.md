@@ -4,8 +4,9 @@ Ask a question about code you can't see, and get a signed answer.
 
 Either party starts a session and sends the other a private link (over
 Signal or whatever they already use). The **auditor** asks a question. The
-**auditee** accepts it, connects their code (the enclave fetches it from
-GitHub itself, or the auditee uploads it), and approves a model
+**auditee** accepts it, connects what the agent may look at (Slack, Gmail,
+Plaid, any HTTPS API, or a private repository the enclave fetches from
+GitHub itself), and approves a model
 and API key (either side can propose one). A model with read-only tools
 (list, find, read, grep) reads the code inside an AWS Nitro Enclave and
 answers. The auditee watches everything and decides whether the auditor sees

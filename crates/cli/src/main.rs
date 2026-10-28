@@ -550,7 +550,17 @@ async fn main() -> Result<()> {
                 m.session_id, m.run_id, m.run_number
             );
             println!("question  v{}: {}", m.question.version, m.question.text);
-            println!("source    {}", m.affidavit.statement);
+            if m.has_code {
+                println!("code      {}", m.affidavit.statement);
+            }
+            for c in &m.connections {
+                println!(
+                    "connected {} ({}): {}",
+                    c.name,
+                    c.hosts.join(", "),
+                    c.identity.as_deref().unwrap_or("owner not verified")
+                );
+            }
             if m.verdict_only() {
                 println!("code      commitment {} (not opened: verdict-only release)", m.code.commitment_sha256);
             } else {

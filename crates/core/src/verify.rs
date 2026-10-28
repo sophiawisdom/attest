@@ -313,12 +313,18 @@ pub fn manifest_warnings(m: &Manifest) -> Vec<String> {
             categories(s)
         ));
     }
-    if m.activity.files_read == 0 && !m.verdict_only() {
+    if m.has_code && m.activity.files_read == 0 && !m.verdict_only() {
         w.push("the agent read no files".into());
     }
-    if m.affidavit.git_commit.is_none() {
+    for c in &m.connections {
+        match &c.identity {
+            Some(i) => w.push(format!("the agent could reach {} ({}), whose data the auditee controls; the service identified the account as {i}", c.name, c.hosts.join(", "))),
+            None => w.push(format!("the agent could reach {} ({}), an API the auditee chose; the enclave knows only its host name", c.name, c.hosts.join(", "))),
+        }
+    }
+    if m.has_code && m.affidavit.git_commit.is_none() {
         w.push("the code's repository and commit are not recorded".into());
-    } else if !m.affidavit.fetched_by_enclave {
+    } else if m.has_code && !m.affidavit.fetched_by_enclave {
         w.push("the code was uploaded: its repository and commit are the auditee's word, not checked by the enclave".into());
     }
     let blinded = m.auditor_messages.iter().filter(|x| x.blinded).count();

@@ -22,6 +22,8 @@ pub struct AgentOutput {
     pub response_models: Vec<String>,
     pub upstream_providers: Vec<String>,
     pub key_owner: Option<String>,
+    /// The run's connections, with how many requests went through each.
+    pub connections: Vec<ConnectionRecord>,
 }
 
 /// Run until the model submits a verdict, errors, or hits `max_steps`.
@@ -29,14 +31,20 @@ pub struct AgentOutput {
 pub async fn agent_loop(
     client: &Client,
     bundle: &std::sync::Arc<Bundle>,
+    has_code: bool,
+    connections: Vec<crate::connections::Connection>,
+    net: &crate::net::Net,
     sandbox: Option<std::sync::Arc<crate::sandbox::Sandbox>>,
     mut turns: Vec<Turn>,
     max_steps: u32,
     format: &AnswerFormat,
     progress: &(dyn Fn(Vec<Value>) + Send + Sync),
 ) -> AgentOutput {
-    let schemas = tool_schemas(format);
+    let names: Vec<String> = connections.iter().map(|c| c.rec.name.clone()).collect();
+    let schemas = tool_schemas(format, has_code, &names);
     let mut tools = Tools::new(bundle, sandbox);
+    let mut conns: Vec<(crate::connections::Connection, crate::net::Net)> =
+        connections.into_iter().map(|c| { let n = c.net(net); (c, n) }).collect();
     let mut activity = Activity::default();
     let mut response_models = BTreeSet::new();
     let mut upstream = BTreeSet::new();
@@ -115,6 +123,14 @@ pub async fn agent_loop(
                     }
                     Err(e) => format!("error: {e}"),
                 }
+            } else if call.name == "http_request" {
+                let name = call.args["connection"].as_str().unwrap_or("");
+                match conns.iter_mut().find(|(c, _)| c.rec.name == name) {
+                    Some((c, n)) => c.request(n, &call.args).await.unwrap_or_else(|e| format!("error: {e:#}")),
+                    None => format!("error: no connection named {name:?}; the connections are: {}", names.join(", ")),
+                }
+            } else if !has_code {
+                "error: no code is connected in this session; use http_request".to_string()
             } else {
                 tools.call(&call.name, &call.args).await
             };
@@ -153,6 +169,7 @@ pub async fn agent_loop(
         response_models: response_models.into_iter().collect(),
         upstream_providers: upstream.into_iter().collect(),
         key_owner,
+        connections: conns.into_iter().map(|(c, _)| c.rec).collect(),
     }
 }
 

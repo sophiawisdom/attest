@@ -41,6 +41,13 @@ def respond(messages):
             return "", [tool_call(f"{uid}_p", "python", {"code": code})]
         out = tools[0]["content"]
         return "", [tool_call(f"{uid}_v", "submit_verdict", {"answer": "yes" if "True" in out else "no", "confidence": 0.9, "summary": "python said: " + out.replace("\n", " | ")})]
+    if "HTTPTOOL" in question:
+        if n == 0:
+            return "", [tool_call(f"{uid}_h", "http_request", {"connection": "ledger", "method": "GET", "path": "/records", "query": {"year": 2026}})]
+        if n == 1:
+            return "", [tool_call(f"{uid}_h2", "http_request", {"connection": "ledger", "method": "POST", "path": "/records"})]
+        out = tools[0]["content"] + " || " + tools[1]["content"]
+        return "", [tool_call(f"{uid}_v", "submit_verdict", {"answer": "yes" if "paid" in out else "no", "confidence": 0.9, "summary": "api said: " + out.replace("\n", " ")[:3000]})]
     if n == 0:
         return "Looking at the layout.", [tool_call(f"{uid}_0", "list_dir", {"path": ""})]
     if n == 1:

@@ -53,12 +53,40 @@ is written for an agent to follow, and takes one script.
    `{"version": 1, "accept": true, "note": "optional"}`. A rejected or
    answered question can be revised (step 1 again). Each revision is a new
    version that needs acceptance.
-3. The auditee provides code. From GitHub:
+3. The auditee connects what the agent may look at: services, code, or
+   both. A run needs at least one.
+
+   Services: `POST /api/sessions/ID/connections` with a `kind` and its
+   credentials, plus optional `name` (what the agent calls it) and
+   `description` (shown to the agent):
+   - `{"kind": "slack", "token": "xoxb-..."}` (Slack Web API, GET and POST)
+   - `{"kind": "gmail", "refresh_token": "...", "client_id": "...",
+     "client_secret": "..."}` or `{"kind": "gmail", "access_token": "..."}`
+     (Gmail API, GET only; needs the gmail.readonly scope)
+   - `{"kind": "plaid", "client_id": "...", "secret": "...",
+     "access_token": "...", "environment": "production"}` (POST)
+   - `{"kind": "github_api", "token": "..."}` (GitHub REST API, GET only)
+   - `{"kind": "http", "base_url": "https://api.example.com",
+     "header_name": "Authorization", "header_value": "Bearer ...",
+     "methods": ["GET"]}` (any HTTPS API)
+   The enclave first asks the service who the credentials belong to
+   (`identity`, for example "Slack workspace Acme (T0123, ...)"; none for a
+   custom API, where only the host is known) and refuses credentials the
+   service rejects. Credentials never leave the enclave except to that
+   service: the agent's `http_request` tool names a connection, a method the
+   connection allows, a path and a query, and the enclave adds them. Echoed
+   credentials are masked in responses. Both parties see each connection's
+   kind, name, hosts, methods and identity; certificates list them with the
+   number of requests made (zeroed in a verdict-only certificate).
+   `DELETE /api/sessions/ID/connections/CONNECTION_ID` removes one. Connected
+   services need the built-in agent.
+
+   Code, from GitHub:
    `POST /api/sessions/ID/code/github` `{"repo": "owner/name", "ref": "main",
    "token": "..."}`. The enclave resolves the ref to a commit and downloads
    that commit's archive itself, over its own TLS connections to GitHub; the
-   token (a fine-grained, read-only token for contents; omit it for a public
-   repository) is used for those requests and never stored. Send a token
+   token (required: a fine-grained, read-only token for contents; public
+   code needs no enclave) is used for those requests and never stored. Send a token
    only over a connection you checked ends in the enclave (`attest open`, or
    your own attestation check; see "Verifying this service"). The response
    adds `github.commit`. The session's source record (`affidavit` in views
