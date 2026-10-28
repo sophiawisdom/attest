@@ -11,6 +11,8 @@
 //! Outbound tunnels may go to any public address on port 443 (webhooks can
 //! point anywhere); the enclave decides where it connects.
 
+mod s3;
+
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use std::net::IpAddr;
@@ -43,11 +45,30 @@ struct Args {
     dev_tunnel: String,
     /// Where sealed files are kept. Kept across restarts of this daemon; wiped
     /// when a new enclave boot says so (the old keys died with the old boot).
+    /// With --s3-bucket this is a cache of the bucket.
     #[arg(long, default_value = "/var/lib/attest/blobs")]
     blob_dir: String,
-    /// Disk quota for sealed files.
+    /// Disk quota for sealed files (with S3: the cache size).
     #[arg(long, default_value_t = 50)]
     blob_quota_gib: u64,
+    /// Testing: the quota in MiB instead (overrides --blob-quota-gib).
+    #[arg(long, hide = true)]
+    blob_quota_mib: Option<u64>,
+    /// Keep sealed files in this S3 bucket too: a put is acknowledged once
+    /// it's in S3, and the local directory becomes a cache. Uses the
+    /// instance role's credentials.
+    #[arg(long)]
+    s3_bucket: Option<String>,
+    #[arg(long, default_value = "us-west-2")]
+    s3_region: String,
+    /// Key prefix inside the bucket.
+    #[arg(long, default_value = "blobs")]
+    s3_prefix: String,
+    /// Dev/testing: an S3-compatible endpoint (path style), e.g.
+    /// http://127.0.0.1:19000. Credentials then come from AWS_ACCESS_KEY_ID
+    /// and AWS_SECRET_ACCESS_KEY, or dummy values.
+    #[arg(long)]
+    s3_endpoint: Option<String>,
     /// Dev only: address for the blob store.
     #[arg(long, default_value = "127.0.0.1:5005")]
     dev_blobs: String,
@@ -329,15 +350,81 @@ fn serde_json_check(b: &[u8]) -> Result<()> {
 // ------------------------------------------------------------------ sealed file store
 
 /// Sealed files, one directory per session tag: `<dir>/<tag hex>/<id hex>`.
+/// With S3 configured, every file is also in the bucket under
+/// `<prefix>/<generation>/<tag hex>/<id hex>`, and the directory is a cache
+/// of it, trimmed least-recently-used first.
 struct Blobs {
     dir: std::path::PathBuf,
     quota: u64,
     used: std::sync::Mutex<u64>,
+    remote: Option<Remote>,
+    /// One cache trim at a time.
+    trimming: tokio::sync::Mutex<()>,
+}
+
+/// The bucket side. A reset starts a new generation (recorded in
+/// `<prefix>/CURRENT`) and deletes older ones in the background, so it's
+/// instant and can't race the new boot's first writes.
+struct Remote {
+    s3: std::sync::Arc<s3::S3>,
+    prefix: String,
+    generation: std::sync::RwLock<String>,
+    /// Background deletions in flight.
+    deleting: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Session tags deleted in this daemon's lifetime: reads for them answer
+    /// "not found" even while the bucket side is still being deleted.
+    deleted_tags: std::sync::Mutex<std::collections::HashSet<Vec<u8>>>,
+}
+
+impl Remote {
+    fn gen(&self) -> String {
+        self.generation.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+    fn key(&self, id: &[u8; 24]) -> String {
+        format!("{}/{}/{}/{}", self.prefix, self.gen(), hex(&id[..8]), hex(&id[8..]))
+    }
+    fn current_key(&self) -> String {
+        format!("{}/CURRENT", self.prefix)
+    }
+
+    /// Delete everything under `prefix` except what `keep` accepts, in the
+    /// background (bounded; old generations left over by a failure are
+    /// retried at the next daemon start).
+    fn delete_later(
+        &self,
+        prefix: String,
+        keep: impl Fn(&str) -> bool + Send + 'static,
+    ) -> tokio::task::JoinHandle<()> {
+        let (s3, sem) = (self.s3.clone(), self.deleting.clone());
+        tokio::spawn(async move {
+            let Ok(_p) = sem.acquire_owned().await else { return };
+            match s3.delete_prefix(&prefix, keep).await {
+                Ok(0) => {}
+                Ok(n) => log(&format!("blob store: deleted {n} objects under {prefix} in S3")),
+                Err(e) => log(&format!("blob store: deleting {prefix} in S3: {e:#}")),
+            }
+        })
+    }
+
+    /// Remove older generations, keeping CURRENT and this one.
+    fn delete_old_generations(&self) {
+        let (keep_gen, keep_cur) = (format!("{}/{}/", self.prefix, self.gen()), self.current_key());
+        let _ = self.delete_later(format!("{}/", self.prefix), move |k| k.starts_with(&keep_gen) || k == keep_cur);
+    }
 }
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
+
+fn new_generation() -> Result<String> {
+    let mut b = [0u8; 16];
+    use std::io::Read;
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
+    Ok(hex(&b))
+}
+
+const GENERATION_FILE: &str = ".generation";
 
 /// Total size of the regular files under `p`.
 fn dir_size(p: &std::path::Path) -> u64 {
@@ -373,8 +460,63 @@ fn remove_all_under(p: &std::path::Path) -> u64 {
     freed
 }
 
+/// Cached files with their last-use time (mtime, refreshed on reads).
+fn cached_files(p: &std::path::Path, out: &mut Vec<(std::time::SystemTime, std::path::PathBuf, u64)>) {
+    let Ok(rd) = std::fs::read_dir(p) else { return };
+    for e in rd.flatten() {
+        match e.file_type() {
+            Ok(t) if t.is_dir() => cached_files(&e.path(), out),
+            Ok(t) if t.is_file() => {
+                let path = e.path();
+                if path.file_name().is_some_and(|n| n == GENERATION_FILE)
+                    || path.extension().is_some_and(|x| x == "tmp")
+                {
+                    continue;
+                }
+                if let Ok(m) = e.metadata() {
+                    out.push((m.modified().unwrap_or(std::time::UNIX_EPOCH), path, m.len()));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T> {
     tokio::task::spawn_blocking(f).await.context("disk worker")
+}
+
+type CredsFetch =
+    std::sync::Arc<dyn Fn() -> s3::futures::BoxFuture<Result<(s3::Creds, std::time::Duration)>> + Send + Sync>;
+
+/// Instance role credentials for S3 (or, with a test endpoint, from the
+/// environment), refreshed about every 15 minutes.
+fn s3_credentials(test_endpoint: bool) -> CredsFetch {
+    std::sync::Arc::new(move || {
+        Box::pin(async move {
+            if test_endpoint {
+                let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+                return Ok((
+                    s3::Creds {
+                        access_key_id: env("AWS_ACCESS_KEY_ID", "test"),
+                        secret_access_key: env("AWS_SECRET_ACCESS_KEY", "test"),
+                        session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
+                    },
+                    std::time::Duration::from_secs(3600),
+                ));
+            }
+            let v: serde_json::Value = serde_json::from_slice(&role_credentials().await?)?;
+            let s = |k: &str| v[k].as_str().map(String::from).context("incomplete role credentials");
+            Ok((
+                s3::Creds {
+                    access_key_id: s("access_key_id")?,
+                    secret_access_key: s("secret_access_key")?,
+                    session_token: Some(s("session_token")?),
+                },
+                std::time::Duration::from_secs(20 * 60),
+            ))
+        })
+    })
 }
 
 impl Blobs {
@@ -383,14 +525,84 @@ impl Blobs {
     async fn open(args: &Args) -> Result<Self> {
         let dir = std::path::PathBuf::from(&args.blob_dir);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let remote = match &args.s3_bucket {
+            None => None,
+            Some(bucket) => Some(Self::open_remote(args, bucket, &dir).await?),
+        };
         let d = dir.clone();
         let used = blocking(move || dir_size(&d)).await?;
         log(&format!("blob store at {}: {} MiB kept", dir.display(), used >> 20));
         Ok(Self {
             dir,
-            quota: args.blob_quota_gib << 30,
+            quota: args.blob_quota_mib.map(|m| m << 20).unwrap_or(args.blob_quota_gib << 30),
             used: std::sync::Mutex::new(used),
+            remote,
+            trimming: tokio::sync::Mutex::new(()),
         })
+    }
+
+    async fn open_remote(args: &Args, bucket: &str, dir: &std::path::Path) -> Result<Remote> {
+        anyhow::ensure!(
+            !args.s3_prefix.is_empty()
+                && args.s3_prefix.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b)),
+            "--s3-prefix: letters, digits, - and _"
+        );
+        let s3 = std::sync::Arc::new(s3::S3::new(
+            bucket,
+            &args.s3_region,
+            args.s3_endpoint.as_deref(),
+            s3_credentials(args.s3_endpoint.is_some()),
+        )?);
+        let prefix = args.s3_prefix.clone();
+        let cur = format!("{prefix}/CURRENT");
+        // Retry for a while: at boot the network or the role may lag.
+        let mut found = None;
+        let mut last = None;
+        for attempt in 1..=30 {
+            match s3.get(&cur).await {
+                Ok(v) => {
+                    found = Some(v);
+                    break;
+                }
+                Err(e) => {
+                    log(&format!("blob store: reading {cur} from S3 (attempt {attempt}): {e:#}"));
+                    last = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+        }
+        let generation = match found {
+            None => return Err(last.unwrap_or_else(|| anyhow::anyhow!("S3 unreachable"))),
+            Some(Some(g)) if g.len() == 32 && g.iter().all(|c| c.is_ascii_hexdigit()) => {
+                String::from_utf8(g).unwrap_or_default()
+            }
+            Some(_) => {
+                let g = new_generation()?;
+                s3.put(&cur, g.clone().into_bytes()).await?;
+                g
+            }
+        };
+        // A cache from another generation is stale.
+        let marker = dir.join(GENERATION_FILE);
+        if std::fs::read_to_string(&marker).ok().as_deref() != Some(generation.as_str()) {
+            let d = dir.to_path_buf();
+            let freed = blocking(move || remove_all_under(&d)).await?;
+            if freed > 0 {
+                log(&format!("blob store: cache was from another generation; cleared {} MiB", freed >> 20));
+            }
+            std::fs::write(&marker, &generation)?;
+        }
+        log(&format!("blob store: S3 bucket {bucket}, prefix {prefix}, generation {generation}"));
+        let r = Remote {
+            s3,
+            prefix,
+            generation: std::sync::RwLock::new(generation),
+            deleting: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+            deleted_tags: Default::default(),
+        };
+        // Finish any deletion of old generations that a restart cut short.
+        r.delete_old_generations();
+        Ok(r)
     }
 
     fn path(&self, id: &[u8; 24]) -> std::path::PathBuf {
@@ -402,19 +614,62 @@ impl Blobs {
         *u = if delta >= 0 { u.saturating_add(delta as u64) } else { u.saturating_sub(delta.unsigned_abs()) };
     }
 
-    /// Store a blob: reserve its size, write a temporary file and rename it
-    /// into place; replacing a blob credits the old one's size. On failure
-    /// the reservation is returned.
-    async fn put(self: &std::sync::Arc<Self>, id: [u8; 24], data: Vec<u8>) -> Result<(), String> {
-        let len = data.len() as u64;
-        {
-            let mut u = self.used.lock().unwrap_or_else(|p| p.into_inner());
-            if *u + len > self.quota {
-                return Err("blob store full".into());
-            }
-            *u += len;
+    fn try_reserve(&self, len: u64) -> bool {
+        let mut u = self.used.lock().unwrap_or_else(|p| p.into_inner());
+        if *u + len > self.quota {
+            return false;
         }
-        let (b, path) = (self.clone(), self.path(&id));
+        *u += len;
+        true
+    }
+
+    /// Reserve `len` bytes of local space. With S3 a full cache is trimmed
+    /// (least recently used first; those files are in the bucket) instead
+    /// of refusing.
+    async fn reserve(self: &std::sync::Arc<Self>, len: u64) -> Result<(), String> {
+        if self.try_reserve(len) {
+            return Ok(());
+        }
+        if self.remote.is_none() || len > self.quota {
+            return Err("blob store full".into());
+        }
+        let _one = self.trimming.lock().await;
+        if self.try_reserve(len) {
+            return Ok(());
+        }
+        let (dir, target) = (self.dir.clone(), (self.quota / 10 * 9).saturating_sub(len));
+        let used = *self.used.lock().unwrap_or_else(|p| p.into_inner());
+        let freed = blocking(move || {
+            let mut files = Vec::new();
+            cached_files(&dir, &mut files);
+            files.sort();
+            let mut freed = 0u64;
+            for (_, path, n) in files {
+                if used.saturating_sub(freed) <= target {
+                    break;
+                }
+                if std::fs::remove_file(&path).is_ok() {
+                    freed += n;
+                }
+            }
+            freed
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        self.add(-(freed as i64));
+        log(&format!("blob store: trimmed {} KiB from the cache", freed >> 10));
+        if self.try_reserve(len) {
+            Ok(())
+        } else {
+            Err("blob store full".into())
+        }
+    }
+
+    /// Write a file into the local directory (temp file, then rename), with
+    /// its size already reserved.
+    async fn write_local(self: &std::sync::Arc<Self>, id: [u8; 24], data: Vec<u8>) -> Result<(), String> {
+        let len = data.len() as u64;
+        let path = self.path(&id);
         let r = blocking(move || -> std::io::Result<u64> {
             std::fs::create_dir_all(path.parent().unwrap())?;
             let old = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -428,24 +683,126 @@ impl Blobs {
         .await;
         match r {
             Ok(Ok(old)) => {
-                b.add(-(old as i64));
+                self.add(-(old as i64));
                 Ok(())
             }
             Ok(Err(e)) => {
-                b.add(-(len as i64));
+                self.add(-(len as i64));
                 Err(e.to_string())
             }
             Err(e) => {
-                b.add(-(len as i64));
+                self.add(-(len as i64));
                 Err(e.to_string())
             }
         }
+    }
+
+    /// Store a blob. Without S3: on local disk, or "full". With S3: in the
+    /// bucket (that's what makes the acknowledgement durable), and in the
+    /// cache.
+    async fn put(self: &std::sync::Arc<Self>, id: [u8; 24], data: Vec<u8>) -> Result<(), String> {
+        let len = data.len() as u64;
+        let Some(r) = &self.remote else {
+            self.reserve(len).await?;
+            return self.write_local(id, data).await;
+        };
+        let cached = match self.reserve(len).await {
+            Ok(()) => self.write_local(id, data.clone()).await.is_ok(),
+            Err(_) => false,
+        };
+        if let Err(e) = r.s3.put(&r.key(&id), data).await {
+            // Not acknowledged, so don't serve it from the cache either.
+            if cached {
+                let path = self.path(&id);
+                if let Ok(Ok(())) = blocking(move || std::fs::remove_file(path)).await {
+                    self.add(-(len as i64));
+                }
+            }
+            return Err(format!("storing in S3: {e:#}"));
+        }
+        Ok(())
+    }
+
+    /// A blob, from the cache or (with S3) the bucket; None if unknown.
+    async fn get(self: &std::sync::Arc<Self>, id: [u8; 24]) -> Result<Option<Vec<u8>>, String> {
+        let path = self.path(&id);
+        let p = path.clone();
+        if let Ok(Ok(d)) = blocking(move || std::fs::read(p)).await {
+            if self.remote.is_some() {
+                // Mark it recently used, for the cache trim.
+                let _ = blocking(move || {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .and_then(|f| f.set_modified(std::time::SystemTime::now()))
+                })
+                .await;
+            }
+            return Ok(Some(d));
+        }
+        let Some(r) = &self.remote else { return Ok(None) };
+        if r.deleted_tags.lock().unwrap_or_else(|p| p.into_inner()).contains(&id[..8]) {
+            return Ok(None);
+        }
+        let Some(d) = r.s3.get(&r.key(&id)).await.map_err(|e| format!("{e:#}"))? else {
+            return Ok(None);
+        };
+        if self.reserve(d.len() as u64).await.is_ok() {
+            let _ = self.write_local(id, d.clone()).await;
+        }
+        Ok(Some(d))
+    }
+
+    /// Delete everything with this session tag.
+    async fn delete_tag(self: &std::sync::Arc<Self>, tag: &[u8]) -> Result<()> {
+        let dir = self.dir.join(hex(tag));
+        let freed = blocking(move || {
+            let n = remove_all_under(&dir);
+            let _ = std::fs::remove_dir(&dir);
+            n
+        })
+        .await?;
+        self.add(-(freed as i64));
+        if let Some(r) = &self.remote {
+            r.deleted_tags.lock().unwrap_or_else(|p| p.into_inner()).insert(tag.to_vec());
+            // Usually done within the request; a huge upload finishes in the
+            // background (tags are random per upload and never reused, so
+            // that can't race new writes).
+            let job = r.delete_later(format!("{}/{}/{}/", r.prefix, r.gen(), hex(tag)), |_| false);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(90), job).await;
+        }
+        Ok(())
+    }
+
+    /// A new enclave lineage: everything stored is unreadable now.
+    async fn reset(self: &std::sync::Arc<Self>) -> Result<()> {
+        let dir = self.dir.clone();
+        if let Some(r) = &self.remote {
+            let g = new_generation()?;
+            r.s3.put(&r.current_key(), g.clone().into_bytes()).await?;
+            *r.generation.write().unwrap_or_else(|p| p.into_inner()) = g.clone();
+            let freed = blocking(move || {
+                let n = remove_all_under(&dir);
+                let _ = std::fs::write(dir.join(GENERATION_FILE), &g);
+                n
+            })
+            .await?;
+            self.add(-(freed as i64));
+            r.delete_old_generations();
+            log(&format!("blob store: new enclave boot; new S3 generation, cleared {} MiB of cache", freed >> 20));
+            return Ok(());
+        }
+        let freed = blocking(move || remove_all_under(&dir)).await?;
+        self.add(-(freed as i64));
+        log(&format!("blob store: new enclave boot; cleared {} MiB", freed >> 20));
+        Ok(())
     }
 }
 
 /// op u8 | id [24] | len u64le | data  ->  status u8 | len u64le | data
 ///   1 put, 2 get, 3 delete everything with this id's 8-byte session tag,
 ///   4 reset: a new enclave booted, so everything stored is unreadable now.
+/// Status: 0 ok, 1 not found, 2 error (message in data).
 async fn handle_blob<S: Io>(b: std::sync::Arc<Blobs>, mut s: S) -> Result<()> {
     use tokio::io::AsyncReadExt;
     let op = s.read_u8().await?;
@@ -468,28 +825,19 @@ async fn handle_blob<S: Io>(b: std::sync::Arc<Blobs>, mut s: S) -> Result<()> {
             Ok(()) => reply(0, b""),
             Err(e) => reply(2, e.as_bytes()),
         },
-        2 => match tokio::fs::read(b.path(&id)).await {
-            Ok(d) => reply(0, &d),
-            Err(_) => reply(1, b""),
+        2 => match b.get(id).await {
+            Ok(Some(d)) => reply(0, &d),
+            Ok(None) => reply(1, b""),
+            Err(e) => reply(2, e.as_bytes()),
         },
-        3 => {
-            let dir = b.dir.join(hex(&id[..8]));
-            let freed = blocking(move || {
-                let n = remove_all_under(&dir);
-                let _ = std::fs::remove_dir(&dir);
-                n
-            })
-            .await?;
-            b.add(-(freed as i64));
-            reply(0, b"")
-        }
-        4 => {
-            let dir = b.dir.clone();
-            let freed = blocking(move || remove_all_under(&dir)).await?;
-            b.add(-(freed as i64));
-            log(&format!("blob store: new enclave boot; cleared {} MiB", freed >> 20));
-            reply(0, b"")
-        }
+        3 => match b.delete_tag(&id[..8]).await {
+            Ok(()) => reply(0, b""),
+            Err(e) => reply(2, format!("{e:#}").as_bytes()),
+        },
+        4 => match b.reset().await {
+            Ok(()) => reply(0, b""),
+            Err(e) => reply(2, format!("{e:#}").as_bytes()),
+        },
         _ => reply(2, b"bad op"),
     };
     s.write_all(&out).await?;
