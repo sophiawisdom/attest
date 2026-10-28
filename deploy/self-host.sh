@@ -4,7 +4,7 @@
 #   deploy/self-host.sh [--name attest] [--region us-west-2] [--type m7g.xlarge]
 #                       [--email-from you@example.com] [--operator "Your Name"]
 #                       [--domain attest.example.com] [--commit SHA] [--repo URL]
-#                       [--acme-staging]
+#                       [--acme-staging] [--bucket NAME | --no-s3]
 #
 # Only AWS is needed. Without --domain the server gets a Let's Encrypt
 # certificate for its Elastic IP. --email-from turns on email notifications
@@ -12,18 +12,24 @@
 # Let's Encrypt's staging CA (untrusted certificate; for test deploys, which
 # don't count against the 5-per-week limit per IP or domain).
 #
-# First run: creates a key pair, security group, IAM role (SES only), Elastic
-# IP and Graviton instance; builds the enclave image on it from --commit (default: the newest
+# First run: creates a key pair, security group, IAM role (SES, and S3 on
+# its bucket only), an S3 bucket for sealed files, Elastic IP and Graviton
+# instance; builds the enclave image on it from --commit (default: the newest
 # commit with published measurements); checks PCR0 against
 # measurements/<commit>.pcrs.json when that file exists; starts the service.
-# Later runs with the same --name reuse the instance and redeploy (which ends
-# all sessions). Undo everything with deploy/teardown.sh --name NAME.
+# Later runs with the same --name reuse the instance and redeploy. Undo
+# everything with deploy/teardown.sh --name NAME (the bucket is kept unless
+# --delete-data).
 #
-# Needs: aws CLI with credentials (EC2, IAM role creation, SES, SSM read), ssh, git, curl, python3.
+# The bucket (default NAME-ACCOUNT-REGION, or --bucket) holds only
+# ciphertext the enclave sealed; the host writes every sealed file there and
+# keeps its disk as a cache. --no-s3 keeps files on the instance's disk only.
+#
+# Needs: aws CLI with credentials (EC2, IAM role creation, S3, SES, SSM read), ssh, git, curl, python3.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-NAME=attest REGION=us-west-2 TYPE=m7g.xlarge DOMAIN="" OPERATOR="" COMMIT="" REPO="" EMAIL_FROM=""
+NAME=attest REGION=us-west-2 TYPE=m7g.xlarge DOMAIN="" OPERATOR="" COMMIT="" REPO="" EMAIL_FROM="" BUCKET_ARG="" NO_S3=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --name) NAME=$2; shift 2 ;;
@@ -35,7 +41,9 @@ while [ $# -gt 0 ]; do
     --commit) COMMIT=$2; shift 2 ;;
     --repo) REPO=$2; shift 2 ;;
     --acme-staging) ACME_DIR=https://acme-staging-v02.api.letsencrypt.org/directory; shift ;;
-    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    --bucket) BUCKET_ARG=$2; shift 2 ;;
+    --no-s3) NO_S3=1; shift ;;
+    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -51,7 +59,8 @@ KEY="$STATE_DIR/$NAME-key.pem"
 mkdir -p "$STATE_DIR"
 # shellcheck disable=SC1090
 [ -f "$STATE" ] && source "$STATE"
-save() { printf 'REGION=%q\nINSTANCE=%q\nSG=%q\nALLOC=%q\nIP=%q\n' "$REGION" "${INSTANCE:-}" "${SG:-}" "${ALLOC:-}" "${IP:-}" > "$STATE"; }
+BUCKET=${BUCKET_ARG:-${BUCKET:-}}
+save() { printf 'REGION=%q\nINSTANCE=%q\nSG=%q\nALLOC=%q\nIP=%q\nBUCKET=%q\n' "$REGION" "${INSTANCE:-}" "${SG:-}" "${ALLOC:-}" "${IP:-}" "${BUCKET:-}" > "$STATE"; }
 
 # Enclave size per instance type: the parent keeps the rest.
 case "$TYPE" in
@@ -62,7 +71,8 @@ case "$TYPE" in
 esac
 
 say "checking AWS credentials"
-aws sts get-caller-identity --query Account --output text
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+echo "$ACCOUNT"
 
 if [ -z "$REPO" ]; then
   REPO=$(git remote get-url origin 2>/dev/null || echo https://github.com/sophiawisdom/attest)
@@ -81,7 +91,35 @@ if [ -z "$COMMIT" ]; then
 fi
 echo "repo $REPO @ $COMMIT"
 
-say "IAM role for the instance (SES only)"
+if [ -z "$NO_S3" ]; then
+  say "S3 bucket for sealed files"
+  if [ -z "$BUCKET" ]; then
+    # NAME-ACCOUNT-REGION, shortening NAME to fit S3's 63 characters.
+    REST="-$ACCOUNT-$REGION"
+    BUCKET="${NAME:0:$((63 - ${#REST}))}$REST"
+    BUCKET="${BUCKET/#-/a-}"
+  fi
+  [[ "$BUCKET" =~ ^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$ ]] || { echo "bucket name $BUCKET: lowercase letters, digits and dashes" >&2; exit 2; }
+  if ! awsr s3api head-bucket --bucket "$BUCKET" >/dev/null 2>&1; then
+    if [ "$REGION" = us-east-1 ]; then
+      awsr s3api create-bucket --bucket "$BUCKET" >/dev/null
+    else
+      awsr s3api create-bucket --bucket "$BUCKET" --create-bucket-configuration "LocationConstraint=$REGION" >/dev/null
+    fi
+    echo "created s3://$BUCKET"
+  fi
+  awsr s3api put-public-access-block --bucket "$BUCKET" \
+    --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+  awsr s3api put-bucket-encryption --bucket "$BUCKET" \
+    --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+  awsr s3api put-bucket-versioning --bucket "$BUCKET" --versioning-configuration Status=Enabled
+  # Versions of deleted or replaced files are kept 30 days, then removed.
+  awsr s3api put-bucket-lifecycle-configuration --bucket "$BUCKET" --lifecycle-configuration \
+    '{"Rules":[{"ID":"old-versions","Status":"Enabled","Filter":{},"NoncurrentVersionExpiration":{"NoncurrentDays":30},"Expiration":{"ExpiredObjectDeleteMarker":true},"AbortIncompleteMultipartUpload":{"DaysAfterInitiation":7}}]}'
+  echo "s3://$BUCKET (private, encrypted, versioned)"
+fi
+
+say "IAM role for the instance (SES, and S3 on the bucket)"
 ROLE="$NAME-instance"
 if ! aws iam get-role --role-name "$ROLE" >/dev/null 2>&1; then
   aws iam create-role --role-name "$ROLE" --description "attest enclave parent: send and verify SES email" \
@@ -89,6 +127,16 @@ if ! aws iam get-role --role-name "$ROLE" >/dev/null 2>&1; then
 fi
 aws iam put-role-policy --role-name "$ROLE" --policy-name ses \
   --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ses:SendEmail","ses:VerifyEmailIdentity","ses:GetIdentityVerificationAttributes"],"Resource":"*"}]}'
+# The same role's credentials reach the enclave (for SES); that's fine for
+# S3 too: everything in the bucket is ciphertext the enclave sealed.
+if [ -z "$NO_S3" ]; then
+  aws iam put-role-policy --role-name "$ROLE" --policy-name s3 --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[
+    {\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3:PutObject\",\"s3:DeleteObject\"],\"Resource\":\"arn:aws:s3:::$BUCKET/*\"},
+    {\"Effect\":\"Allow\",\"Action\":[\"s3:ListBucket\"],\"Resource\":\"arn:aws:s3:::$BUCKET\"}]}"
+else
+  aws iam delete-role-policy --role-name "$ROLE" --policy-name s3 >/dev/null 2>&1 || true
+  BUCKET=""
+fi
 if ! aws iam get-instance-profile --instance-profile-name "$ROLE" >/dev/null 2>&1; then
   aws iam create-instance-profile --instance-profile-name "$ROLE" >/dev/null
   aws iam add-role-to-instance-profile --instance-profile-name "$ROLE" --role-name "$ROLE"
@@ -174,6 +222,7 @@ EOF
   IP=$(awsr ec2 describe-addresses --allocation-ids "$ALLOC" --query 'Addresses[0].PublicIp' --output text)
   save
 fi
+save
 echo "instance $INSTANCE at $IP"
 if [ "$(awsr ec2 describe-iam-instance-profile-associations --filters "Name=instance-id,Values=$INSTANCE" --query 'IamInstanceProfileAssociations[0].State' --output text)" = None ]; then
   awsr ec2 associate-iam-instance-profile --instance-id "$INSTANCE" --iam-instance-profile "Name=$ROLE" >/dev/null
@@ -215,12 +264,14 @@ else
 fi
 
 say "starting the service (this ends any sessions on the previous version)"
-"${SSH[@]}" "cd attest-src && CPUS=$ENC_CPUS MEM_MIB=$ENC_MIB deploy/run.sh >/dev/null && sleep 8 && curl -sk -m 10 https://127.0.0.1/healthz" | grep -q '"ok":true' \
+"${SSH[@]}" "cd attest-src && CPUS=$ENC_CPUS MEM_MIB=$ENC_MIB S3_BUCKET='$BUCKET' S3_REGION='$REGION' deploy/run.sh >/dev/null && sleep 8 && curl -sk -m 10 https://127.0.0.1/healthz" | grep -q '"ok":true' \
   || { echo "service did not come up; see ~/attest-host.log on the instance" >&2; exit 1; }
 
 say "done"
+if [ -n "$BUCKET" ]; then STORAGE="s3://$BUCKET (sealed files; kept by teardown unless --delete-data)"; else STORAGE="the instance's disk only (--no-s3)"; fi
 cat <<EOF
 Server:   https://${DOMAIN:-$IP}  (the enclave gets its Let's Encrypt certificate within a few minutes)
+Storage:  $STORAGE
 PCR0:     $PCR0
 Verify:   attest verify-service https://$IP --pcrs $PUBLISHED
 SSH:      ssh -i $KEY ec2-user@$IP
