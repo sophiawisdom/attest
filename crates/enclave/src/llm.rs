@@ -39,6 +39,12 @@ pub fn vet_model(p: Provider, model: &str) -> anyhow::Result<()> {
         !m.contains(':') || fine_tune,
         "model variants (\":online\" and other suffixes) are not allowed; name the base model"
     );
+    // OpenRouter's own models (auto, fusion, ...) are routers: they pick
+    // other models and some run web search and fetch on the model's behalf.
+    anyhow::ensure!(
+        !m.starts_with("openrouter/"),
+        "OpenRouter router models are not allowed; name an exact model"
+    );
     for bad in [
         "search",
         "research",
@@ -46,12 +52,107 @@ pub fn vet_model(p: Provider, model: &str) -> anyhow::Result<()> {
         "sonar",
         "computer-use",
         "browse",
-        "openrouter/auto",
+        "router",
+        "fusion",
         "agent",
     ] {
         anyhow::ensure!(!m.contains(bad), "models with built-in web or agent access ({bad}) are not allowed: the provider would reach the network on the model's behalf");
     }
     Ok(())
+}
+
+/// How OpenRouter may route an approved model: which upstream hosts may
+/// serve it (empty: any) and whether only zero-data-retention endpoints may.
+/// The parties agree on these out of band; the enclave enforces them on
+/// every request and records them in the certificate.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Routing {
+    pub zdr: bool,
+    pub only: Vec<String>,
+}
+
+/// OpenRouter plugins a request can switch off. Account defaults apply to
+/// any request that doesn't mention a plugin, and some of these reach the
+/// network (web, web-fetch) or swap the model (the routers), so every
+/// request turns them all off explicitly. `jev-router` and `alignment`
+/// don't accept `enabled: false`; `check_reported_model` catches a swap.
+pub const OPENROUTER_PLUGINS_OFF: &[&str] = &[
+    "auto-router",
+    "auto-beta-router",
+    "moderation",
+    "web",
+    "web-fetch",
+    "file-parser",
+    "response-healing",
+    "context-compression",
+    "tool-filter",
+    "pareto-router",
+    "fusion",
+    "switchyard-router",
+    "armor",
+];
+
+/// Check upstream host names as OpenRouter writes them: a provider slug,
+/// optionally with an endpoint suffix ("google-vertex", "amazon-bedrock",
+/// "google-vertex/us").
+pub fn vet_routing(provider: Provider, only: &[String]) -> anyhow::Result<()> {
+    if only.is_empty() {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        provider == Provider::Openrouter,
+        "openrouter_only applies to the openrouter provider"
+    );
+    anyhow::ensure!(only.len() <= 8, "at most 8 upstream hosts");
+    for h in only {
+        anyhow::ensure!(
+            !h.is_empty()
+                && h.len() <= 64
+                && h.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "-/".contains(c))
+                && !h.starts_with('/')
+                && !h.ends_with('/'),
+            "invalid upstream host {h:?} (use OpenRouter slugs like \"google-vertex\")"
+        );
+    }
+    Ok(())
+}
+
+/// Add the agreed routing and the plugin switch-offs to an OpenRouter
+/// request body, replacing anything the body said about either.
+pub fn apply_openrouter(obj: &mut serde_json::Map<String, Value>, r: &Routing) {
+    let mut p = serde_json::Map::new();
+    if r.zdr {
+        p.insert("zdr".into(), json!(true));
+        p.insert("data_collection".into(), json!("deny"));
+    }
+    if !r.only.is_empty() {
+        p.insert("only".into(), json!(r.only));
+        p.insert("allow_fallbacks".into(), json!(false));
+    }
+    obj.remove("provider");
+    if !p.is_empty() {
+        obj.insert("provider".into(), Value::Object(p));
+    }
+    obj.insert(
+        "plugins".into(),
+        OPENROUTER_PLUGINS_OFF
+            .iter()
+            .map(|id| json!({"id": id, "enabled": false}))
+            .collect(),
+    );
+}
+
+/// OpenRouter reports the model that answered. Anything other than the
+/// approved one means something rerouted the request (an account-default
+/// router plugin, say), so the reply is refused.
+pub fn check_reported_model(approved: &str, reported: Option<&str>) -> Result<(), String> {
+    match reported {
+        Some(m) if m != approved => Err(format!(
+            "OpenRouter answered with model {m:?}, not the approved {approved:?}"
+        )),
+        _ => Ok(()),
+    }
 }
 
 pub fn is_fine_tuned(p: Provider, model: &str) -> bool {
@@ -92,7 +193,7 @@ pub struct Client {
     pub provider: Provider,
     pub model: String,
     api_key: String,
-    pub openrouter_zdr: bool,
+    pub routing: Routing,
     mock: Option<(String, u16)>,
     net: Net,
 }
@@ -103,7 +204,7 @@ impl Client {
         provider: Provider,
         model: String,
         api_key: String,
-        openrouter_zdr: bool,
+        routing: Routing,
         mock: Option<String>,
     ) -> Result<Self> {
         let mock = match (provider, mock) {
@@ -120,7 +221,7 @@ impl Client {
             provider,
             model,
             api_key,
-            openrouter_zdr,
+            routing,
             mock,
             net,
         })
@@ -139,7 +240,7 @@ impl Client {
                 system,
                 turns,
                 tools,
-                self.provider == Provider::Openrouter && self.openrouter_zdr,
+                (self.provider == Provider::Openrouter).then_some(&self.routing),
             ),
         };
         let body = pad_json(serde_json::to_vec(&body)?);
@@ -164,10 +265,15 @@ impl Client {
                     String::from_utf8_lossy(&resp.body[..resp.body.len().min(2000)])
                 );
             }
-            return match self.provider {
-                Provider::Anthropic => parse_anthropic(&resp),
-                _ => parse_openai(&resp),
+            let reply = match self.provider {
+                Provider::Anthropic => parse_anthropic(&resp)?,
+                _ => parse_openai(&resp)?,
             };
+            if self.provider == Provider::Openrouter {
+                check_reported_model(&self.model, reply.model.as_deref())
+                    .map_err(|e| anyhow!(e))?;
+            }
+            return Ok(reply);
         }
     }
 
@@ -236,7 +342,7 @@ fn openai_body(
     system: &str,
     turns: &[Turn],
     tools: &[(&str, &str, Value)],
-    zdr: bool,
+    openrouter: Option<&Routing>,
 ) -> Value {
     let mut messages = vec![json!({"role": "system", "content": system})];
     for t in turns {
@@ -255,8 +361,8 @@ fn openai_body(
         .map(|(n, d, p)| json!({"type": "function", "function": {"name": n, "description": d, "parameters": p}}))
         .collect();
     let mut body = json!({"model": model, "messages": messages, "tools": tools, "max_completion_tokens": 16000});
-    if zdr {
-        body["provider"] = json!({"zdr": true, "data_collection": "deny"});
+    if let (Some(r), Some(obj)) = (openrouter, body.as_object_mut()) {
+        apply_openrouter(obj, r);
     }
     body
 }

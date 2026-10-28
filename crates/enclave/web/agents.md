@@ -55,6 +55,16 @@ is written for an agent to follow, and takes one script.
    that nothing in it was arranged to influence the audit.
 5. Either party proposes a model: `POST /api/sessions/ID/models`
    `{"provider": "anthropic"|"openai"|"openrouter", "model": "...", "api_key": "...", "openrouter_zdr": true}`.
+   With OpenRouter, add `"openrouter_only": ["google-vertex"]` to pin which
+   upstream host may serve the model (OpenRouter slugs: `google-vertex`,
+   `amazon-bedrock`, `azure`, `anthropic`, `openai`, or a region such as
+   `google-vertex/us`). The enclave sends that list with fallbacks off on
+   every request, switches off OpenRouter's plugins (account defaults
+   included), refuses router models (`openrouter/...`), and rejects any reply
+   naming a different model. The certificate records the pin. Which model
+   and host to use is for the parties to agree; for example, an auditee
+   that isn't the model's maker serving it (Claude on Vertex or Bedrock,
+   GPT on Azure) can't steer its answers.
    To use a real coding agent instead of the built-in tools, add `"agent"`:
    `"codex"` (OpenAI's Codex CLI; provider openai or openrouter),
    `"claude-code"` (Claude Code; anthropic or openrouter) or `"pi"` (any

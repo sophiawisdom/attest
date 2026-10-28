@@ -444,6 +444,11 @@ pub struct ModelInfo {
     /// OpenRouter only: upstream providers that actually served the calls.
     pub upstream_providers: Vec<String>,
     pub openrouter_zdr: Option<bool>,
+    /// OpenRouter only: the upstream hosts the parties allowed to serve the
+    /// model (OpenRouter slugs like "google-vertex"), enforced on every
+    /// request with fallbacks off. Empty: OpenRouter picked freely.
+    #[serde(default)]
+    pub openrouter_only: Vec<String>,
     /// "builtin" (attest's own tool loop) or a jailed harness like "codex 0.164.0".
     #[serde(default)]
     pub agent: String,

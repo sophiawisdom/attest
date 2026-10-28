@@ -237,11 +237,16 @@ pub fn manifest_warnings(m: &Manifest) -> Vec<String> {
     }
     if m.model.provider == Provider::Openrouter {
         w.push(format!(
-            "routed through OpenRouter (zero data retention {}); upstream providers: {}",
+            "routed through OpenRouter (zero data retention {}; {}); upstream providers: {}",
             if m.model.openrouter_zdr == Some(true) {
-                "requested"
+                "required"
             } else {
-                "not requested"
+                "not required"
+            },
+            if m.model.openrouter_only.is_empty() {
+                "upstream host not pinned, OpenRouter chose".to_string()
+            } else {
+                format!("upstream pinned to {}", m.model.openrouter_only.join(", "))
             },
             if m.model.upstream_providers.is_empty() {
                 "unreported".into()

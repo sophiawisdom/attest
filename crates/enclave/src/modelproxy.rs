@@ -7,6 +7,7 @@
 //! endpoints, over the enclave's own TLS, to the fixed provider host. Every
 //! exchange is recorded for the auditee's transcript.
 
+use crate::llm::Routing;
 use crate::net::Net;
 use anyhow::Result;
 use attest_core::Provider;
@@ -51,7 +52,7 @@ struct Upstream {
     provider: Provider,
     model: String,
     api_key: String,
-    openrouter_zdr: bool,
+    routing: Routing,
     token: String,
     usage: Arc<Mutex<Usage>>,
     record: Arc<dyn Fn(Value) + Send + Sync>,
@@ -72,17 +73,17 @@ pub fn vet_request(
     approved_model: &str,
     body: &[u8],
 ) -> Result<Vec<u8>, String> {
-    vet_request_zdr(provider, path, approved_model, body, false)
+    vet_request_routed(provider, path, approved_model, body, &Routing::default())
 }
 
-/// `vet_request`, and with `zdr` on OpenRouter, require zero-data-retention
-/// routing as the built-in harness does.
-pub fn vet_request_zdr(
+/// `vet_request`, plus on OpenRouter the agreed routing and plugin
+/// switch-offs, as the built-in harness sends them.
+pub fn vet_request_routed(
     provider: Provider,
     path: &str,
     approved_model: &str,
     body: &[u8],
-    zdr: bool,
+    routing: &Routing,
 ) -> Result<Vec<u8>, String> {
     let mut v: Value =
         serde_json::from_slice(body).map_err(|_| "request body is not JSON".to_string())?;
@@ -207,11 +208,8 @@ pub fn vet_request_zdr(
     if endpoint == "responses" {
         obj.insert("store".into(), Value::Bool(false));
     }
-    if provider == Provider::Openrouter && zdr {
-        obj.insert(
-            "provider".into(),
-            json!({"zdr": true, "data_collection": "deny"}),
-        );
+    if provider == Provider::Openrouter {
+        crate::llm::apply_openrouter(obj, routing);
     }
     let out = serde_json::to_vec(&v).map_err(|e| e.to_string())?;
     Ok(crate::llm::pad_json(out))
@@ -390,7 +388,7 @@ impl ModelProxy {
         provider: Provider,
         model: String,
         api_key: String,
-        openrouter_zdr: bool,
+        routing: Routing,
         socket_path: &str,
         record: Arc<dyn Fn(Value) + Send + Sync>,
     ) -> Result<Self> {
@@ -406,7 +404,7 @@ impl ModelProxy {
             provider,
             model,
             api_key,
-            openrouter_zdr,
+            routing,
             token: token.clone(),
             usage: usage.clone(),
             record,
@@ -519,7 +517,7 @@ async fn handle(up: Arc<Upstream>, req: Request<hyper::body::Incoming>) -> Respo
         Ok(b) => b.to_bytes().to_vec(),
         Err(_) => return reply(StatusCode::PAYLOAD_TOO_LARGE, "request too large"),
     };
-    let body = match vet_request_zdr(up.provider, &path, &up.model, &raw, up.openrouter_zdr) {
+    let body = match vet_request_routed(up.provider, &path, &up.model, &raw, &up.routing) {
         Ok(b) => b,
         Err(why) => {
             // Field names in `why` are request-chosen; keep the trace entry short.
@@ -570,6 +568,13 @@ async fn handle(up: Arc<Upstream>, req: Request<hyper::body::Incoming>) -> Respo
         }
     };
     let text = String::from_utf8_lossy(&resp.body).into_owned();
+    if up.provider == Provider::Openrouter {
+        if let Err(why) = crate::llm::check_reported_model(&up.model, usage_of(&text).2.as_deref())
+        {
+            (up.record)(json!({"type": "error", "content": why}));
+            return reply(StatusCode::BAD_GATEWAY, &why);
+        }
+    }
     {
         let mut u = up.usage.lock().unwrap();
         u.calls += 1;
@@ -688,6 +693,98 @@ mod tests {
         );
         assert!(upstream_path(Provider::Openai, "/v1/files").is_none());
         assert!(upstream_path(Provider::Anthropic, "/v1/responses").is_none());
+    }
+
+    #[test]
+    fn openrouter_routing() {
+        let r = Routing {
+            zdr: true,
+            only: vec!["google-vertex".into()],
+        };
+        for (path, body) in [
+            (
+                "/api/v1/chat/completions",
+                &br#"{"model":"anthropic/claude-opus-5.5","messages":[]}"#[..],
+            ),
+            (
+                "/api/v1/responses",
+                &br#"{"model":"anthropic/claude-opus-5.5","input":[]}"#[..],
+            ),
+            (
+                "/api/v1/messages",
+                &br#"{"model":"anthropic/claude-opus-5.5","messages":[]}"#[..],
+            ),
+        ] {
+            let out = vet_request_routed(
+                Provider::Openrouter,
+                path,
+                "anthropic/claude-opus-5.5",
+                body,
+                &r,
+            )
+            .unwrap();
+            let v: Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(v["provider"]["only"], json!(["google-vertex"]));
+            assert_eq!(v["provider"]["allow_fallbacks"], false);
+            assert_eq!(v["provider"]["zdr"], true);
+            let off: Vec<&str> = v["plugins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|p| p["enabled"] == false)
+                .map(|p| p["id"].as_str().unwrap())
+                .collect();
+            for id in ["web", "web-fetch", "fusion", "auto-router"] {
+                assert!(off.contains(&id), "{id} not disabled");
+            }
+        }
+        // Plugins are switched off even with no routing agreed.
+        let out = vet_request(
+            Provider::Openrouter,
+            "/api/v1/chat/completions",
+            "m",
+            br#"{"model":"m","messages":[]}"#,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert!(v.get("provider").is_none());
+        assert!(v["plugins"].as_array().unwrap().len() >= 10);
+        // Direct providers get neither field.
+        let out = vet_request(
+            Provider::Openai,
+            "/v1/responses",
+            "m",
+            br#"{"model":"m","input":[]}"#,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert!(v.get("plugins").is_none() && v.get("provider").is_none());
+        // The harness can't set its own routing.
+        assert!(vet_request_routed(
+            Provider::Openrouter,
+            "/api/v1/chat/completions",
+            "m",
+            br#"{"model":"m","messages":[],"provider":{"only":["x"]}}"#,
+            &r
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn openrouter_models() {
+        assert!(crate::llm::vet_model(Provider::Openrouter, "openrouter/fusion").is_err());
+        assert!(crate::llm::vet_model(Provider::Openrouter, "openrouter/fusion-flash").is_err());
+        assert!(crate::llm::vet_model(Provider::Openrouter, "openrouter/auto").is_err());
+        assert!(crate::llm::vet_model(Provider::Openrouter, "switchpoint/router").is_err());
+        assert!(crate::llm::vet_model(Provider::Openrouter, "anthropic/claude-opus-5.5").is_ok());
+        assert!(crate::llm::check_reported_model("a/b", Some("a/b")).is_ok());
+        assert!(crate::llm::check_reported_model("a/b", None).is_ok());
+        assert!(crate::llm::check_reported_model("a/b", Some("typesafe/jev")).is_err());
+        assert!(
+            crate::llm::vet_routing(Provider::Openrouter, &["google-vertex/us".into()]).is_ok()
+        );
+        assert!(crate::llm::vet_routing(Provider::Openrouter, &["Google Vertex".into()]).is_err());
+        assert!(crate::llm::vet_routing(Provider::Openai, &["azure".into()]).is_err());
     }
 
     #[test]

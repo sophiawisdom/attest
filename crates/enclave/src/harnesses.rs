@@ -151,7 +151,7 @@ pub async fn run_agent(
     provider: Provider,
     model: &str,
     api_key: &str,
-    openrouter_zdr: bool,
+    routing: crate::llm::Routing,
     prompt: String,
     format: &AnswerFormat,
     timeout: Duration,
@@ -170,17 +170,7 @@ pub async fn run_agent(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (
-            agent,
-            net,
-            run_id,
-            bundle,
-            provider,
-            model,
-            api_key,
-            openrouter_zdr,
-            prompt,
-            format,
-            timeout,
+            agent, net, run_id, bundle, provider, model, api_key, routing, prompt, format, timeout,
             progress,
         );
         return fail("agent harnesses need a Linux enclave".into());
@@ -196,7 +186,7 @@ pub async fn run_agent(
             provider,
             model.to_string(),
             api_key.to_string(),
-            openrouter_zdr,
+            routing,
             &socket,
             Arc::new(move |e| p2(vec![e])),
         )

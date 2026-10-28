@@ -385,7 +385,7 @@ function renderModel(v) {
   let body = "";
   const rows = [...v.models].reverse().filter(m => m.status !== "superseded");
   if (rows.length) body += `<div class="stack" style="gap:8px">${rows.map(m => `<div class="row" style="justify-content:space-between">
-      <div class="row" style="gap:8px"><b>${esc(m.provider)} / ${esc(m.model)}</b>${m.agent && m.agent !== "builtin" ? `<span class="pill">${esc(m.agent)}</span>` : ""}${statusPill(m.status)}${m.fine_tuned ? `<span class="pill warn">fine-tune</span>` : ""}<span class="faint small">${m.has_key ? `key from the ${esc(m.key_from || m.proposed_by)}` : "awaiting the auditee's key"}</span></div>
+      <div class="row" style="gap:8px"><b>${esc(m.provider)} / ${esc(m.model)}</b>${m.agent && m.agent !== "builtin" ? `<span class="pill">${esc(m.agent)}</span>` : ""}${statusPill(m.status)}${m.fine_tuned ? `<span class="pill warn">fine-tune</span>` : ""}${m.provider === "openrouter" ? `<span class="pill">${(m.openrouter_only || []).length ? "via " + esc(m.openrouter_only.join(", ")) : "any host"}${m.openrouter_zdr ? ", ZDR" : ""}</span>` : ""}<span class="faint small">${m.has_key ? `key from the ${esc(m.key_from || m.proposed_by)}` : "awaiting the auditee's key"}</span></div>
       ${isAuditee() && m.status === "pending" ? `<div class="row"><button class="btn danger" data-act="m-reject" data-id="${m.id}">Reject</button></div>` : ""}
     </div>${m.note ? `<div class="small faint">“${esc(m.note)}”</div>` : ""}
     ${isAuditee() && m.status === "pending" ? `<div class="stack" data-keep="approve-${m.id}" style="gap:8px;padding:10px 12px;background:var(--sunken);border-radius:8px">
@@ -405,6 +405,7 @@ function renderModel(v) {
         <div class="grid2"><label class="f">Model<input type="text" id="mModel" placeholder="${esc(providers[0].ph)}"></label>
           <label class="f">API key${isAuditee() ? "" : " (optional)"}<input type="password" id="mKey" autocomplete="off" placeholder="${isAuditee() ? "sk-…" : "leave empty: the auditee supplies theirs"}"></label></div>
         <label class="check" id="mZdrRow" hidden><input type="checkbox" id="mZdr" checked><span>Zero-data-retention endpoints only</span></label>
+        <label class="f" id="mOnlyRow" hidden>Upstream hosts (optional; OpenRouter slugs, comma-separated, e.g. google-vertex, amazon-bedrock, azure). Every request is pinned to these, with no fallback.<input id="mOnly" placeholder="any host" autocomplete="off"></label>
         <label class="f" id="mMockRow" hidden>Mock server<input type="text" id="mMock" value="127.0.0.1:19999"></label>
         <p class="faint small">The key stays inside the enclave and is never shown to anyone. The certificate records the provider, the model the provider reports, and the organization that owns the key. The code is sent to this provider.</p>
         <div class="row"><button class="btn primary" data-act="propose-model">${isAuditee() ? "Use this model" : "Propose to the auditee"}</button></div>
@@ -573,7 +574,7 @@ document.addEventListener("click", async (e) => {
   if (act === "prov") {
     $$("#mProv button").forEach(x => x.setAttribute("aria-pressed", String(x === b)));
     const p = [...PROVIDERS, { id: "mock", ph: "gpt-mock" }].find(x => x.id === b.dataset.p);
-    $("#mModel").placeholder = p.ph; $("#mZdrRow").hidden = p.id !== "openrouter"; $("#mMockRow").hidden = p.id !== "mock"; return;
+    $("#mModel").placeholder = p.ph; $("#mZdrRow").hidden = p.id !== "openrouter"; $("#mOnlyRow").hidden = p.id !== "openrouter"; $("#mMockRow").hidden = p.id !== "mock"; return;
   }
   if (act === "cert") {
     e.preventDefault();
@@ -610,7 +611,7 @@ document.addEventListener("click", async (e) => {
       if (!$("#aSign").checked) throw new Error("Tick the box to confirm the statement.");
       return sapi("/affidavit", { method: "POST", body: { organization: val("aOrg"), repo_url: val("aRepo"), git_commit: val("aCommit"), tree_sha256: b.dataset.tree } });
     },
-    "propose-model": () => sapi("/models", { method: "POST", body: { provider: $("#mProv [aria-pressed=true]").dataset.p, model: val("mModel"), api_key: val("mKey"), openrouter_zdr: $("#mZdr")?.checked, mock_endpoint: val("mMock"), agent: val("mAgent") || "builtin" } }),
+    "propose-model": () => sapi("/models", { method: "POST", body: { provider: $("#mProv [aria-pressed=true]").dataset.p, model: val("mModel"), api_key: val("mKey"), openrouter_zdr: $("#mZdr")?.checked, openrouter_only: (val("mOnly") || "").split(",").map(s => s.trim()).filter(Boolean), mock_endpoint: val("mMock"), agent: val("mAgent") || "builtin" } }),
     "m-approve": () => sapi(`/models/${b.dataset.id}/decision`, { method: "POST", body: { approve: true, api_key: val("ak-" + b.dataset.id) || undefined, accept_auditor_account: $("#acc-" + b.dataset.id)?.checked || false } }),
     "m-reject": () => sapi(`/models/${b.dataset.id}/decision`, { method: "POST", body: { approve: false } }),
     "release": () => sapi(`/runs/${b.dataset.run}/release`, { method: "POST", body: { release: true, note: val("note-" + b.dataset.run) } }),

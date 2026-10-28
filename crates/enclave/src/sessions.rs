@@ -124,7 +124,8 @@ struct ModelProposal {
     provider: Provider,
     model: String,
     api_key: String,
-    openrouter_zdr: bool,
+    /// OpenRouter only: required zero data retention and allowed upstream hosts.
+    routing: llm::Routing,
     mock_endpoint: Option<String>,
     /// "builtin", or a jailed harness: "codex", "claude-code", "pi".
     agent: String,
@@ -142,7 +143,7 @@ impl ModelProposal {
         json!({
             "id": self.id, "proposed_by": self.by, "provider": self.provider, "model": self.model, "agent": self.agent,
             "has_key": !self.api_key.is_empty(), "key_from": self.key_from,
-            "openrouter_zdr": self.openrouter_zdr, "status": self.status,
+            "openrouter_zdr": self.routing.zdr, "openrouter_only": self.routing.only, "status": self.status,
             "fine_tuned": llm::is_fine_tuned(self.provider, &self.model),
             "proposed_at_ms": self.proposed_at_ms, "decided_at_ms": self.decided_at_ms, "note": self.note,
         })
@@ -608,6 +609,23 @@ impl Session {
         );
         ensure!(api_key.len() < 1000, "key too long");
         let mock_endpoint = clean(v["mock_endpoint"].as_str());
+        let only: Vec<String> = match &v["openrouter_only"] {
+            Value::Null => vec![],
+            Value::Array(a) => a
+                .iter()
+                .map(|h| {
+                    h.as_str()
+                        .map(|s| s.trim().to_ascii_lowercase())
+                        .ok_or_else(|| anyhow!("openrouter_only must be a list of strings"))
+                })
+                .collect::<Result<_>>()?,
+            _ => anyhow::bail!("openrouter_only must be a list of strings"),
+        };
+        llm::vet_routing(provider, &only)?;
+        let routing = llm::Routing {
+            zdr: provider == Provider::Openrouter && v["openrouter_zdr"].as_bool().unwrap_or(false),
+            only,
+        };
         let agent = clean(v["agent"].as_str()).unwrap_or_else(|| "builtin".into());
         crate::harnesses::supports(&agent, provider)?;
         ensure!(
@@ -634,7 +652,7 @@ impl Session {
             provider,
             model: model.clone(),
             api_key,
-            openrouter_zdr: v["openrouter_zdr"].as_bool().unwrap_or(false),
+            routing,
             mock_endpoint,
             agent: agent.clone(),
             key_from: role,
@@ -940,7 +958,7 @@ impl Session {
             m.provider,
             m.model.clone(),
             m.api_key.clone(),
-            m.openrouter_zdr,
+            m.routing.clone(),
             m.mock_endpoint.clone(),
         )?;
         let model_info = ModelInfo {
@@ -953,7 +971,8 @@ impl Session {
             response_models: vec![],
             key_owner: None,
             upstream_providers: vec![],
-            openrouter_zdr: (m.provider == Provider::Openrouter).then_some(m.openrouter_zdr),
+            openrouter_zdr: (m.provider == Provider::Openrouter).then_some(m.routing.zdr),
+            openrouter_only: m.routing.only.clone(),
             agent: crate::harnesses::Agent::parse(&m.agent)
                 .map(|a| a.label())
                 .unwrap_or_else(|| "builtin".into()),
@@ -965,7 +984,7 @@ impl Session {
                 m.provider,
                 m.model.clone(),
                 m.api_key.clone(),
-                m.openrouter_zdr,
+                m.routing.clone(),
             )
         });
 
@@ -1427,7 +1446,13 @@ struct RunJob {
     history: History,
     messages: Vec<MessageRecord>,
     /// For jailed harnesses: (provider, model, key), and the prompt.
-    harness_job: Option<(crate::harnesses::Agent, Provider, String, String, bool)>,
+    harness_job: Option<(
+        crate::harnesses::Agent,
+        Provider,
+        String,
+        String,
+        llm::Routing,
+    )>,
     harness_prompt: String,
 }
 
@@ -1495,7 +1520,7 @@ impl RunJob {
                 upstream_providers: vec![],
                 key_owner: None,
             },
-            (Ok(_), Some((agent, provider, model, key, zdr))) => {
+            (Ok(_), Some((agent, provider, model, key, routing))) => {
                 let timeout = run_time_limit(self.question.max_steps);
                 crate::harnesses::run_agent(
                     *agent,
@@ -1505,7 +1530,7 @@ impl RunJob {
                     *provider,
                     model,
                     key,
-                    *zdr,
+                    routing.clone(),
                     self.harness_prompt.clone(),
                     &self.question.answer_format,
                     timeout,
