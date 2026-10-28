@@ -134,16 +134,31 @@ pub async fn run(net: Net, tls: Arc<ServerIdentity>, name: String, directory: St
     loop {
         match obtain(&net, &tls, &name, &directory, &mut account).await {
             Ok(()) => {
-                crate::log(&format!("acme: certificate installed for {name}"));
                 backoff = Duration::from_secs(60);
+                // Renew when a third of the certificate's lifetime is left,
+                // from its actual expiry; the fixed intervals are a fallback.
                 let ip = name.parse::<std::net::IpAddr>().is_ok();
-                tokio::time::sleep(if ip { RENEW_IP_AFTER } else { RENEW_AFTER }).await;
+                let fallback = if ip { RENEW_IP_AFTER } else { RENEW_AFTER };
+                let wait = match tls.current().not_after {
+                    Some(exp) => {
+                        let left = (exp - (attest_core::now_ms() / 1000) as i64).max(0) as u64;
+                        Duration::from_secs(left * 2 / 3).max(Duration::from_secs(3600))
+                    }
+                    None => fallback,
+                };
+                crate::log(&format!(
+                    "acme: certificate installed for {name}; renewing in {} h",
+                    wait.as_secs() / 3600
+                ));
+                tokio::time::sleep(wait).await;
             }
             Err(e) => {
                 tls.clear_challenge();
                 crate::log(&format!("acme: {e:#}; retrying in {backoff:?}"));
                 tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(6 * 3600));
+                // Capped at an hour: a six-day certificate must not run out
+                // between attempts.
+                backoff = (backoff * 2).min(Duration::from_secs(3600));
             }
         }
     }

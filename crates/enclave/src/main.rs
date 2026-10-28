@@ -94,14 +94,19 @@ const LOG_VSOCK_PORT: u32 = 5004;
 static LOG_TX: std::sync::OnceLock<tokio::sync::mpsc::Sender<String>> = std::sync::OnceLock::new();
 
 /// Operational log. Production enclaves have no console (and `eprintln!`
-/// panics when stderr is gone), so lines go to the parent over vsock, best
-/// effort. Never log code, keys, tokens or email addresses.
+/// panics when stderr is gone), so once forwarding starts, lines go only to
+/// the parent over vsock, best effort and never blocking the caller: a full
+/// queue drops the line. Never log code, keys, tokens or email addresses.
 pub fn log(msg: &str) {
     use std::io::Write;
-    let line = format!("[attest-enclave] {msg}");
-    let _ = writeln!(std::io::stderr(), "{line}");
-    if let Some(tx) = LOG_TX.get() {
-        let _ = tx.try_send(line);
+    let line: String = format!("[attest-enclave] {msg}").chars().take(4000).collect();
+    match LOG_TX.get() {
+        Some(tx) => {
+            let _ = tx.try_send(line);
+        }
+        None => {
+            let _ = writeln!(std::io::stderr(), "{line}");
+        }
     }
 }
 
@@ -115,14 +120,28 @@ fn start_log_forwarding(dev: bool) {
         #[cfg(target_os = "linux")]
         {
             use tokio::io::AsyncWriteExt;
+            use tokio::time::{timeout, Instant};
+            // Every connect and write has a deadline, so a parent that stops
+            // reading can't wedge the forwarder; while the parent is away,
+            // lines are dropped and a reconnect is tried every few seconds.
+            let pause = Duration::from_secs(5);
             let mut conn: Option<tokio_vsock::VsockStream> = None;
+            let mut retry_at = Instant::now();
             while let Some(line) = rx.recv().await {
-                if conn.is_none() {
-                    conn = crate::net::vsock_connect(LOG_VSOCK_PORT).await.ok();
+                if conn.is_none() && Instant::now() >= retry_at {
+                    conn = match timeout(pause, crate::net::vsock_connect(LOG_VSOCK_PORT)).await {
+                        Ok(Ok(c)) => Some(c),
+                        _ => {
+                            retry_at = Instant::now() + pause;
+                            None
+                        }
+                    };
                 }
                 if let Some(c) = conn.as_mut() {
-                    if c.write_all(format!("{line}\n").as_bytes()).await.is_err() {
+                    let sent = timeout(pause, c.write_all(format!("{line}\n").as_bytes())).await;
+                    if !matches!(sent, Ok(Ok(()))) {
                         conn = None;
+                        retry_at = Instant::now() + pause;
                     }
                 }
             }
@@ -195,12 +214,15 @@ fn main() -> Result<()> {
 }
 
 async fn service() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    start_log_forwarding(args.dev);
     match cgroups::init() {
         Ok(()) => log("cgroups ready for jailed runs"),
         Err(e) => log(&format!("cgroups unavailable, so jailed agents can't run: {e:#}")),
     }
-    start_log_forwarding(args.dev);
+    // Zero would queue every run forever; past 16 the per-run limits no
+    // longer fit the enclave.
+    args.concurrency = args.concurrency.clamp(1, 16);
     let attester = nsm::Attester::new(args.dev)?;
     let cfg = read_host_config(&args).await?;
     log(&format!(
@@ -307,7 +329,7 @@ async fn service() -> Result<()> {
         }),
         email_limiter: notify::Limiter::default(),
         public_name: domain.clone().or(cfg.public_ip.clone()),
-        max_code_bytes: cfg.max_code_mib.unwrap_or(1024) << 20,
+        max_code_bytes: cfg.max_code_mib.unwrap_or(1024).clamp(1, 4096) << 20,
         blobs: blobs::BlobClient::new(args.dev, args.dev_blobs.clone()),
         // Fixed in the image: a host-chosen size would let the host shape
         // which reads miss and reach it.
@@ -321,6 +343,9 @@ async fn service() -> Result<()> {
     let app = Arc::new(App {
         ctx: ctx.clone(),
         attester,
+        conns: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
+        concurrency: args.concurrency,
+        tls: tls.clone(),
     });
     tokio::spawn(measure_blob_store(ctx.blobs.clone()));
     if !args.dev {
@@ -349,7 +374,17 @@ async fn service() -> Result<()> {
     ));
 
     if let (Some(t), Some(d)) = (&tls, &cert_name) {
-        tokio::spawn(acme::run(net, t.clone(), d.clone(), acme_dir));
+        // Supervised: if renewal ever panics, start it again.
+        let (t, d) = (t.clone(), d.clone());
+        tokio::spawn(async move {
+            loop {
+                let task = tokio::spawn(acme::run(net.clone(), t.clone(), d.clone(), acme_dir.clone()));
+                if let Err(e) = task.await {
+                    log(&format!("acme: renewal task died ({e}); restarting in a minute"));
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
     }
     serve(args, app, tls).await
 }
@@ -408,6 +443,29 @@ async fn measure_blob_store(store: blobs::BlobClient) {
 struct App {
     ctx: Arc<Ctx>,
     attester: nsm::Attester,
+    /// Open client connections (TLS handshakes included), bounded.
+    conns: Arc<tokio::sync::Semaphore>,
+    concurrency: usize,
+    tls: Option<Arc<tls::ServerIdentity>>,
+}
+
+/// Client connections served at once; more are closed on arrival.
+const MAX_CONNECTIONS: usize = 1024;
+/// Long polls waiting at once; past this a poll answers immediately.
+const MAX_WAITERS: usize = 512;
+/// A connection's whole life, uploads included.
+const CONNECTION_LIFETIME: Duration = Duration::from_secs(65 * 60);
+
+/// Log an accept error, at most once every ten seconds, and pause briefly:
+/// running out of descriptors would otherwise make the loop spin.
+async fn accept_failed(e: std::io::Error) {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = now_ms();
+    if now.saturating_sub(LAST.load(std::sync::atomic::Ordering::Relaxed)) > 10_000 {
+        LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+        log(&format!("accept failed: {e}; continuing"));
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
 }
 
 async fn serve(args: Args, app: Arc<App>, tls: Option<Arc<tls::ServerIdentity>>) -> Result<()> {
@@ -415,29 +473,47 @@ async fn serve(args: Args, app: Arc<App>, tls: Option<Arc<tls::ServerIdentity>>)
         let l = tokio::net::TcpListener::bind(&args.dev_listen).await?;
         log(&format!("dev: http://{}/", args.dev_listen));
         loop {
-            let (s, _) = l.accept().await?;
+            let s = match l.accept().await {
+                Ok((s, _)) => s,
+                Err(e) => {
+                    accept_failed(e).await;
+                    continue;
+                }
+            };
+            let Ok(permit) = app.conns.clone().try_acquire_owned() else {
+                continue;
+            };
             let app = app.clone();
-            tokio::spawn(async move { serve_http(app, s).await });
+            tokio::spawn(async move {
+                let _permit = permit;
+                serve_http(app, s).await
+            });
         }
     }
     #[cfg(target_os = "linux")]
     {
         let tls = tls.ok_or_else(|| anyhow!("no TLS identity"))?;
         let acceptor = tokio_rustls::TlsAcceptor::from(tls.server_config());
-        let l = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(
-            tokio_vsock::VMADDR_CID_ANY,
-            LISTEN_VSOCK_PORT,
-        ))
-        .context("binding vsock")?;
+        let l = crate::net::VsockAcceptor::bind(LISTEN_VSOCK_PORT).context("binding vsock")?;
         log(&format!(
             "listening on vsock port {LISTEN_VSOCK_PORT} (TLS)"
         ));
         loop {
-            let (s, _) = l.accept().await?;
-            // The vsock crate accepts without SOCK_CLOEXEC; see net::vsock_connect.
-            crate::net::cloexec(std::os::fd::AsRawFd::as_raw_fd(&s));
+            // An accept error (say, out of descriptors) must not end the
+            // service: pause and keep accepting.
+            let s = match l.accept().await {
+                Ok(s) => s,
+                Err(e) => {
+                    accept_failed(e).await;
+                    continue;
+                }
+            };
+            let Ok(permit) = app.conns.clone().try_acquire_owned() else {
+                continue; // at capacity: close this one
+            };
             let (app, acceptor) = (app.clone(), acceptor.clone());
             tokio::spawn(async move {
+                let _permit = permit;
                 let Ok(Ok(stream)) =
                     tokio::time::timeout(Duration::from_secs(20), acceptor.accept(s)).await
                 else {
@@ -466,9 +542,13 @@ async fn serve_http<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Se
         let app = app.clone();
         async move { Ok::<_, std::convert::Infallible>(handle(app, req).await) }
     });
-    let _ = hyper::server::conn::http1::Builder::new()
-        .serve_connection(TokioIo::new(s), svc)
-        .await;
+    // A timer makes hyper enforce the header read timeout (slow or idle
+    // clients); the whole connection also has a lifetime.
+    let conn = hyper::server::conn::http1::Builder::new()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(Duration::from_secs(30))
+        .serve_connection(TokioIo::new(s), svc);
+    let _ = tokio::time::timeout(CONNECTION_LIFETIME, conn).await;
 }
 
 // ------------------------------------------------------------------ HTTP
@@ -521,16 +601,19 @@ fn query(req: &Request<hyper::body::Incoming>) -> HashMap<String, String> {
 }
 
 async fn body_json(req: Request<hyper::body::Incoming>) -> Result<Value, ApiError> {
-    let b = http_body_util::Limited::new(req.into_body(), 1 << 20)
-        .collect()
-        .await
-        .map_err(|_| {
-            ApiError(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "request body too large".into(),
-            )
-        })?
-        .to_bytes();
+    let b = tokio::time::timeout(
+        Duration::from_secs(60),
+        http_body_util::Limited::new(req.into_body(), 1 << 20).collect(),
+    )
+    .await
+    .map_err(|_| ApiError(StatusCode::REQUEST_TIMEOUT, "request body too slow".into()))?
+    .map_err(|_| {
+        ApiError(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body too large".into(),
+        )
+    })?
+    .to_bytes();
     if b.is_empty() {
         return Ok(Value::Null);
     }
@@ -554,6 +637,7 @@ async fn handle(app: Arc<App>, req: Request<hyper::body::Incoming>) -> Resp {
             AGENTS_MD,
         )),
         ("GET", ["healthz"]) => Ok(json_resp(StatusCode::OK, &json!({"ok": true}))),
+        ("GET", ["api", "health"]) => Ok(json_resp(StatusCode::OK, &health(&app))),
         ("GET", ["api", "attestation"]) => attestation(&app, &query(&req)),
         ("GET", ["api", "info"]) => Ok(json_resp(
             StatusCode::OK,
@@ -567,6 +651,31 @@ async fn handle(app: Arc<App>, req: Request<hyper::body::Incoming>) -> Resp {
         )),
     };
     r.unwrap_or_else(|ApiError(s, m)| json_resp(s, &json!({"error": m})))
+}
+
+/// Service health for operators and watchdogs: nothing about any session.
+fn health(app: &App) -> Value {
+    let now = (now_ms() / 1000) as i64;
+    let cert = app.tls.as_ref().map(|t| t.current());
+    let expires_in = cert.as_ref().and_then(|c| c.not_after).map(|n| n - now);
+    let ctx = &app.ctx;
+    let python = ctx.sandbox.get().is_some();
+    let jail = !ctx.dev && cgroups::init().is_ok();
+    // Unhealthy: a CA-issued certificate within a day of expiring, or
+    // nearly every connection slot taken.
+    let conns_open = MAX_CONNECTIONS - app.conns.available_permits();
+    let ok = expires_in.is_none_or(|s| s > 24 * 3600) && conns_open < MAX_CONNECTIONS * 9 / 10;
+    json!({
+        "ok": ok,
+        "boot_id": ctx.info.boot_id,
+        "uptime_s": now - (ctx.info.booted_at_ms / 1000) as i64,
+        "certificate": cert.map(|c| json!({"issuer": c.issuer, "not_after": c.not_after, "expires_in_s": expires_in})),
+        "python_sandbox": python,
+        "jail_limits": jail,
+        "run_slots": {"total": app.concurrency, "busy": app.concurrency - ctx.slots.available_permits().min(app.concurrency)},
+        "upload_slots_busy": 2 - ctx.upload_slots.available_permits().min(2),
+        "connections": {"open": conns_open, "max": MAX_CONNECTIONS},
+    })
 }
 
 fn attestation(app: &App, q: &HashMap<String, String>) -> Result<Resp, ApiError> {
@@ -653,26 +762,41 @@ async fn ingest_upload(
             max,
         )
     });
+    // Deadlines: a frame at least every minute, and the whole upload within
+    // an hour. On any error the parser is still awaited before returning,
+    // so it never outlives the upload slot.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3600);
     let mut received = 0u64;
-    while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|e| anyhow!("upload interrupted: {e}"))?;
-        if let Ok(data) = frame.into_data() {
-            received += data.len() as u64;
-            // The tar has headers and padding on top of file contents.
-            if received > max + max / 8 + (16 << 20) {
-                return Err(ApiError(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    format!("the archive is larger than {} MiB", max >> 20),
-                ));
-            }
-            if tx.send(data).await.is_err() {
-                break; // the parser stopped early (error); its result says why
+    let fed: Result<(), ApiError> = async {
+        loop {
+            let next = tokio::time::timeout_at(
+                deadline.min(tokio::time::Instant::now() + Duration::from_secs(60)),
+                body.frame(),
+            )
+            .await
+            .map_err(|_| ApiError(StatusCode::REQUEST_TIMEOUT, "upload too slow or stalled".into()))?;
+            let Some(frame) = next else { return Ok(()) };
+            let frame = frame.map_err(|e| anyhow!("upload interrupted: {e}"))?;
+            if let Ok(data) = frame.into_data() {
+                received += data.len() as u64;
+                // The tar has headers and padding on top of file contents.
+                if received > max + max / 8 + (16 << 20) {
+                    return Err(ApiError(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        format!("the archive is larger than {} MiB", max >> 20),
+                    ));
+                }
+                if tx.send(data).await.is_err() {
+                    return Ok(()); // the parser stopped early (error); its result says why
+                }
             }
         }
     }
+    .await;
     drop(tx);
-    let b = job.await.map_err(|_| anyhow!("upload parser crashed"))??;
-    Ok(b)
+    let parsed = job.await.map_err(|_| anyhow!("upload parser crashed"));
+    fed?;
+    Ok(parsed??)
 }
 
 struct ChannelReader {
@@ -733,7 +857,12 @@ async fn session_route(
                     .and_then(|w| w.parse::<u64>().ok())
                     .unwrap_or(0)
                     .min(30);
-                if wait > 0 {
+                // Bounded: past MAX_WAITERS a poll answers at once.
+                static WAITERS: std::sync::OnceLock<tokio::sync::Semaphore> =
+                    std::sync::OnceLock::new();
+                let waiters =
+                    WAITERS.get_or_init(|| tokio::sync::Semaphore::new(MAX_WAITERS));
+                if let (true, Ok(_w)) = (wait > 0, waiters.try_acquire()) {
                     sessions::wait_for_change(&s, role, v, Duration::from_secs(wait)).await;
                 }
             }
@@ -748,12 +877,20 @@ async fn session_route(
             if role != attest_core::Role::Auditee {
                 return Err(anyhow!("only the auditee uploads code").into());
             }
-            let _slot = ctx
-                .upload_slots
-                .acquire()
-                .await
-                .map_err(|_| anyhow!("shutting down"))?;
-            let bundle = ingest_upload(ctx, &s.id, req.into_body()).await?;
+            // The upload runs in its own task, which holds the upload slot
+            // until the parser has exited, even if this client disconnects.
+            let (ctx2, sid, body) = (ctx.clone(), s.id.clone(), req.into_body());
+            let bundle = tokio::spawn(async move {
+                let _slot = tokio::time::timeout(Duration::from_secs(30), ctx2.upload_slots.acquire())
+                    .await
+                    .map_err(|_| {
+                        ApiError(StatusCode::SERVICE_UNAVAILABLE, "the server is busy with other uploads; try again shortly".into())
+                    })?
+                    .map_err(|_| anyhow!("shutting down"))?;
+                ingest_upload(&ctx2, &sid, body).await
+            })
+            .await
+            .map_err(|_| anyhow!("upload failed"))??;
             ok(s.set_code(ctx, role, bundle)?)
         }
         ("POST", ["affidavit"]) => ok(s.confirm_affidavit(ctx, role, &body_json(req).await?)?),

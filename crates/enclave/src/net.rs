@@ -317,26 +317,137 @@ impl rustls::client::danger::ServerCertVerifier for Capture {
     }
 }
 
-/// Connect to the parent over vsock with the socket marked close-on-exec.
-/// tokio-vsock 0.7 tries to set that with F_SETFL, which ignores it, so a
-/// jailed agent started while the connection is open would inherit it and
-/// could write straight to the parent. (The jail also marks everything it
-/// inherits close-on-exec before starting the agent; this is the first line.)
+/// Connect to the parent over vsock. The socket is created close-on-exec
+/// and nonblocking in one call (tokio-vsock 0.7 sets close-on-exec with
+/// F_SETFL, which ignores it), so a jail executor started at any moment
+/// can't inherit it and write straight to the parent.
 #[cfg(target_os = "linux")]
 pub async fn vsock_connect(port: u32) -> std::io::Result<tokio_vsock::VsockStream> {
-    let s = tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(
-        tokio_vsock::VMADDR_CID_HOST,
-        port,
-    ))
-    .await?;
-    cloexec(std::os::fd::AsRawFd::as_raw_fd(&s));
-    Ok(s)
+    use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+    use tokio::io::unix::AsyncFd;
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_VSOCK,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let addr = vsock_addr(libc::VMADDR_CID_HOST, port);
+    let r = unsafe {
+        libc::connect(
+            std::os::fd::AsRawFd::as_raw_fd(&fd),
+            &addr as *const libc::sockaddr_vm as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+        )
+    };
+    if r < 0 {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EINPROGRESS) {
+            return Err(e);
+        }
+    }
+    // Safety: `fd` is an open socket this function owns.
+    let afd = unsafe { AsyncFd::register(fd) }?;
+    loop {
+        let mut guard = afd.writable().await?;
+        let mut err: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let r = unsafe {
+            libc::getsockopt(
+                std::os::fd::AsRawFd::as_raw_fd(afd.get_ref()),
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                &mut err as *mut libc::c_int as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if r < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        match err {
+            0 => break,
+            libc::EINPROGRESS | libc::EAGAIN => guard.clear_ready(),
+            e => return Err(std::io::Error::from_raw_os_error(e)),
+        }
+    }
+    let raw = afd.into_inner().into_raw_fd();
+    tokio_vsock::VsockStream::new(unsafe { vsock::VsockStream::from_raw_fd(raw) })
 }
 
-/// Mark a descriptor close-on-exec.
 #[cfg(target_os = "linux")]
-pub fn cloexec(fd: std::os::fd::RawFd) {
-    unsafe {
-        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+fn vsock_addr(cid: u32, port: u32) -> libc::sockaddr_vm {
+    let mut a: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
+    a.svm_family = libc::AF_VSOCK as libc::sa_family_t;
+    a.svm_cid = cid;
+    a.svm_port = port;
+    a
+}
+
+/// A vsock listener whose accepted sockets are close-on-exec from the
+/// start (accept4), unlike the vsock crate's, which uses plain accept.
+#[cfg(target_os = "linux")]
+pub struct VsockAcceptor {
+    fd: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+}
+
+#[cfg(target_os = "linux")]
+impl VsockAcceptor {
+    pub fn bind(port: u32) -> std::io::Result<Self> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_VSOCK,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                0,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let addr = vsock_addr(libc::VMADDR_CID_ANY, port);
+        let ok = unsafe {
+            libc::bind(
+                fd.as_raw_fd(),
+                &addr as *const libc::sockaddr_vm as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+            ) == 0
+                && libc::listen(fd.as_raw_fd(), 1024) == 0
+        };
+        if !ok {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            // Safety: `fd` is an open socket we own.
+            fd: unsafe { tokio::io::unix::AsyncFd::register(fd) }?,
+        })
+    }
+
+    pub async fn accept(&self) -> std::io::Result<tokio_vsock::VsockStream> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        loop {
+            let mut guard = self.fd.readable().await?;
+            let r = unsafe {
+                libc::accept4(
+                    self.fd.get_ref().as_raw_fd(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                )
+            };
+            if r >= 0 {
+                return tokio_vsock::VsockStream::new(unsafe { vsock::VsockStream::from_raw_fd(r) });
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                guard.clear_ready();
+                continue;
+            }
+            return Err(e);
+        }
     }
 }

@@ -19,6 +19,9 @@ pub struct CertSnapshot {
     pub cert_pem: String,
     pub cert_sha256: String,
     pub issuer: &'static str,
+    /// When the CA-issued certificate expires (unix seconds); None while
+    /// self-signed.
+    pub not_after: Option<i64>,
 }
 
 pub struct ServerIdentity {
@@ -94,6 +97,7 @@ impl ServerIdentity {
             cert_pem: cert.pem(),
             cert_sha256: attest_core::sha256_hex(cert.der()),
             issuer: "self-signed",
+            not_after: None,
         };
         let ck = Arc::new(CertifiedKey::new(
             vec![cert.der().clone()],
@@ -170,8 +174,8 @@ impl ServerIdentity {
         let certs: Vec<CertificateDer<'static>> = rustls_pemfile_certs(chain_pem)?;
         let leaf = certs.first().ok_or_else(|| anyhow!("empty chain"))?.clone();
         // The chain must be for our key.
-        let (_, parsed) = x509_leaf_spki(&leaf)?;
-        if parsed != self.spki_der {
+        let (spki, not_after) = leaf_spki_and_expiry(&leaf)?;
+        if spki != self.spki_der {
             anyhow::bail!("issued certificate is not for the enclave key");
         }
         let leaf_pem = pem_encode("CERTIFICATE", &leaf);
@@ -180,6 +184,7 @@ impl ServerIdentity {
             cert_der: leaf.to_vec(),
             cert_pem: leaf_pem,
             issuer: "acme",
+            not_after: Some(not_after),
         };
         let ck = Arc::new(CertifiedKey::new(certs, self.signing_key.clone()));
         *self.resolver.main.write().unwrap() = (ck, snapshot);
@@ -219,46 +224,15 @@ fn pem_encode(label: &str, der: &[u8]) -> String {
     s
 }
 
-/// Extract the SubjectPublicKeyInfo DER from a certificate. Minimal DER walk:
-/// Certificate -> TBSCertificate -> [version] serial sigalg issuer validity
-/// subject subjectPublicKeyInfo.
-fn x509_leaf_spki(cert: &[u8]) -> Result<(usize, Vec<u8>)> {
-    fn tlv(buf: &[u8], pos: usize) -> Result<(u8, usize, usize)> {
-        let tag = *buf.get(pos).ok_or_else(|| anyhow!("der eof"))?;
-        let mut p = pos + 1;
-        let first = *buf.get(p).ok_or_else(|| anyhow!("der eof"))?;
-        p += 1;
-        let len = if first & 0x80 == 0 {
-            first as usize
-        } else {
-            let n = (first & 0x7f) as usize;
-            let mut l = 0usize;
-            for _ in 0..n {
-                l = (l << 8) | *buf.get(p).ok_or_else(|| anyhow!("der eof"))? as usize;
-                p += 1;
-            }
-            l
-        };
-        Ok((tag, p, len))
-    }
-    let (_, tbs_start, _) = tlv(cert, 0)?; // Certificate SEQUENCE
-    let (_, mut p, tbs_len) = tlv(cert, tbs_start)?; // TBSCertificate
-    let end = p + tbs_len;
-    // optional version [0]
-    let (tag, cs, cl) = tlv(cert, p)?;
-    if tag == 0xa0 {
-        p = cs + cl;
-    }
-    for _ in 0..5 {
-        // serial, sigalg, issuer, validity, subject
-        let (_, cs, cl) = tlv(cert, p)?;
-        p = cs + cl;
-    }
-    let (tag, cs, cl) = tlv(cert, p)?;
-    if tag != 0x30 || cs + cl > end {
-        anyhow::bail!("unexpected der layout");
-    }
-    Ok((p, cert[p..cs + cl].to_vec()))
+/// A certificate's SubjectPublicKeyInfo (DER) and expiry (unix seconds).
+/// Errors, never panics, on malformed input.
+fn leaf_spki_and_expiry(cert: &[u8]) -> Result<(Vec<u8>, i64)> {
+    let (_, c) = x509_parser::parse_x509_certificate(cert)
+        .map_err(|e| anyhow!("issued certificate does not parse: {e}"))?;
+    Ok((
+        c.public_key().raw.to_vec(),
+        c.validity().not_after.timestamp(),
+    ))
 }
 
 /// "1.2.3.4" -> "4.3.2.1.in-addr.arpa" (and the ip6.arpa form for IPv6).
@@ -280,6 +254,22 @@ fn reverse_dns(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn malformed_certificates_are_errors() {
+        // The DER the old hand-written walker sliced out of bounds.
+        let bad = hex::decode("30143012020002000200020002003006").unwrap();
+        assert!(super::leaf_spki_and_expiry(&bad).is_err());
+        assert!(super::leaf_spki_and_expiry(&[]).is_err());
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["a.example".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let (spki, exp) = super::leaf_spki_and_expiry(cert.der()).unwrap();
+        assert_eq!(spki, rcgen::PublicKeyData::subject_public_key_info(&key));
+        assert!(exp > 0);
+    }
+
     #[test]
     fn ip_names_become_ip_sans() {
         let p = rcgen::CertificateParams::new(vec![

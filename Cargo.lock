@@ -252,9 +252,11 @@ dependencies = [
  "tokio-rustls",
  "tokio-vsock",
  "url",
+ "vsock",
  "wasi-common",
  "wasmtime",
  "webpki-roots",
+ "x509-parser",
 ]
 
 [[package]]
