@@ -34,8 +34,8 @@ fi
 NAME=attest
 LOG=$HOME/attest-host.log
 
-# Hold the watchdog off while we replace things.
-sudo systemctl stop attest-watchdog.timer 2>/dev/null || true
+# Hold the watchdog (and a pair's failover check) off while we replace things.
+sudo systemctl stop attest-watchdog.timer attest-pair.timer 2>/dev/null || true
 # An older run.sh started the daemon by hand.
 sudo pkill -f "attest-host --enclave-cid" || true
 
@@ -97,4 +97,6 @@ nitro-cli run-enclave --enclave-name "$NAME" --eif-path "$EIF" --cpu-count "$CPU
 
 echo 0 | sudo tee /run/attest-watchdog.fails >/dev/null
 sudo systemctl enable --now attest-watchdog.timer >/dev/null 2>&1
+# A machine of a failover pair also runs deploy/pair.sh.
+"$SRC/deploy/pair-install.sh"
 echo "host log: $LOG"

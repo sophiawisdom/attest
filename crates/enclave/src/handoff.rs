@@ -293,7 +293,7 @@ impl Giver {
     }
 
     /// A copy for a standby: the same payload, but this enclave keeps
-    /// serving, and the standby then follows its writes (replica.rs).
+    /// serving, and the standby then checks it's alive (replica.rs).
     async fn give_copy(
         &self,
         ctx: &Arc<crate::sessions::Ctx>,
@@ -323,7 +323,6 @@ impl Giver {
                 .map_err(|_| anyhow!("requests that change sessions are still under way; try again shortly"))?;
             ctx.store.write_all(&ctx.persist).await.context("writing state for a standby")?
         };
-        ctx.repl.publish(sessions.clone());
         let (resp, key) = seal_payload(ctx, att, sessions, r_pub, n_r)?;
         ctx.repl.add(*r_pub, *n_r, channel_key(&key), resp.clone());
         crate::log("replica: a standby took a copy of this lineage");

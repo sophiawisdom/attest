@@ -299,12 +299,20 @@ async fn tunnel_server(args: Args) -> Result<()> {
     }
 }
 
+/// The config file is read again for every enclave boot, so a change (a
+/// machine joining a pair, see deploy/pair.sh) applies at the next start
+/// without restarting this daemon. If it becomes unreadable, the last good
+/// one is served.
 async fn config_server(args: Args) -> Result<()> {
-    let body = match &args.config {
-        Some(p) => std::fs::read(p).with_context(|| format!("reading {p}"))?,
-        None => b"{}".to_vec(),
+    let read = |p: &Option<String>| -> Result<Vec<u8>> {
+        let body = match p {
+            Some(p) => std::fs::read(p).with_context(|| format!("reading {p}"))?,
+            None => b"{}".to_vec(),
+        };
+        serde_json_check(&body)?;
+        Ok(body)
     };
-    serde_json_check(&body)?;
+    let mut body = read(&args.config)?;
     #[cfg(target_os = "linux")]
     {
         let l = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(
@@ -318,6 +326,10 @@ async fn config_server(args: Args) -> Result<()> {
             let Ok(permit) = slots.clone().try_acquire_owned() else {
                 continue;
             };
+            match read(&args.config) {
+                Ok(b) => body = b,
+                Err(e) => log(&format!("config: {e:#}; serving the last good one")),
+            }
             let body = body.clone();
             tokio::spawn(async move {
                 let _permit = permit;

@@ -91,6 +91,8 @@ pub struct Store {
     /// must match. Retried in the background, and passed on in any later
     /// handoff, so the set of sessions never quietly shrinks.
     pub(crate) pending: Mutex<Vec<(String, String)>>,
+    /// The session ids last written to the lineage's index (durable.rs).
+    index_written: Mutex<Option<Vec<String>>>,
 }
 
 pub struct Session {

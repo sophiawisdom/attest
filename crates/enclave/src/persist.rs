@@ -146,6 +146,16 @@ impl Persist {
         self.keys.open(sid, name, &sealed)
     }
 
+    /// Fetch one record with no expected version: whatever the parent has,
+    /// if it opens, and the hash of what was stored.
+    pub async fn get_any(&self, sid: &str, name: &str) -> Result<Option<(Vec<u8>, String)>> {
+        let Some(sealed) = self.blobs.get(&self.keys.id(sid, name)).await? else {
+            return Ok(None);
+        };
+        let hash = attest_core::sha256_hex(&sealed);
+        Ok(Some((self.keys.open(sid, name, &sealed)?, hash)))
+    }
+
     /// A record of any size, as parts `prefix/0`, `prefix/1`, ...
     pub async fn put_large(&self, sid: &str, prefix: &str, plain: &[u8]) -> Result<Vec<String>> {
         let mut hashes = Vec::new();

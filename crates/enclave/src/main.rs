@@ -308,7 +308,7 @@ async fn service() -> Result<()> {
             let r = take_over(&net, &attester, args.dev, &peer, cfg.handoff_token.as_deref().unwrap_or(""), cfg.standby).await?;
             let p = r.payload;
             let heads = if cfg.standby {
-                follower = Some(Arc::new(replica::Follower::new(&peer, args.dev, r.id, r.channel, p.sessions)));
+                follower = Some(Arc::new(replica::Follower::new(&peer, args.dev, r.id, r.channel)));
                 Vec::new()
             } else {
                 p.sessions
@@ -815,12 +815,7 @@ async fn handle(app: Arc<App>, req: Request<hyper::body::Incoming>) -> Resp {
             format!("not found: {method} {path} (see /agents.md)"),
         )),
     };
-    let resp = r.unwrap_or_else(|ApiError(s, m)| json_resp(s, &json!({"error": m})));
-    // A change to a session is answered once a standby has it too.
-    if is_session && method != "GET" && resp.status().is_success() {
-        app.ctx.repl.confirm(&app.ctx).await;
-    }
-    resp
+    r.unwrap_or_else(|ApiError(s, m)| json_resp(s, &json!({"error": m})))
 }
 
 async fn replica_sync(app: &App, req: Request<hyper::body::Incoming>) -> Result<Resp, ApiError> {
@@ -828,7 +823,7 @@ async fn replica_sync(app: &App, req: Request<hyper::body::Incoming>) -> Result<
     if app.ctx.standby.load(std::sync::atomic::Ordering::SeqCst) || app.ctx.moved.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "this enclave isn't serving sessions".into()));
     }
-    match app.ctx.repl.sync(&body).await {
+    match app.ctx.repl.sync(&body, &app.ctx.info.boot_id) {
         Ok(v) => Ok(json_resp(StatusCode::OK, &v)),
         Err(e) => Err(ApiError(StatusCode::FORBIDDEN, format!("{e:#}"))),
     }

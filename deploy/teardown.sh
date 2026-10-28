@@ -23,6 +23,23 @@ source "$STATE"
 # Region-scoped AWS CLI. (Not `command aws` in conditions: macOS bash 3.2
 # exits under set -e when a `command` builtin fails inside `if !`.)
 awsr() { aws --region "$REGION" "$@"; }
+if [ -n "${STANDBY_FOR:-}" ]; then
+  # A standby: only its instance is its own (the Elastic IP, group, role,
+  # key and bucket belong to the primary). The primary stops naming it.
+  echo "This deletes standby instance $INSTANCE of $STANDBY_FOR."
+  P_IP=$( ( source "$STATE_DIR/$STANDBY_FOR.env"; printf %s "${IP:-}" ) )
+  ssh -i "$STATE_DIR/$STANDBY_FOR-key.pem" -o UserKnownHostsFile="$STATE_DIR/$STANDBY_FOR.known_hosts" -o ConnectTimeout=10 -o BatchMode=yes "ec2-user@$P_IP" \
+    "sudo python3 -c 'import json; c=json.load(open(\"/etc/attest/host.json\")); c.pop(\"peer\",None); c.pop(\"standby\",None); open(\"/etc/attest/host.json\",\"w\").write(json.dumps(c))' && sudo rm -f /etc/attest/pair.env && attest-src/deploy/pair-install.sh" \
+    || echo "couldn't unpair $STANDBY_FOR at $P_IP; remove peer/standby from its /etc/attest/host.json and /etc/attest/pair.env by hand" >&2
+  awsr ec2 terminate-instances --instance-ids "$INSTANCE" >/dev/null
+  awsr ec2 wait instance-terminated --instance-ids "$INSTANCE"
+  echo "terminated $INSTANCE"
+  rm -f "$STATE" "$STATE_DIR/$NAME.known_hosts"
+  exit 0
+fi
+if [ -f "$STATE_DIR/$NAME-standby.env" ]; then
+  "$0" --name "$NAME-standby"
+fi
 
 echo "This deletes instance $INSTANCE, Elastic IP $IP and security group $SG in $REGION."
 if [ -n "${INSTANCE:-}" ]; then
@@ -45,6 +62,7 @@ if aws iam get-instance-profile --instance-profile-name "$ROLE" >/dev/null 2>&1;
   aws iam delete-instance-profile --instance-profile-name "$ROLE" || true
   aws iam delete-role-policy --role-name "$ROLE" --policy-name ses || true
   aws iam delete-role-policy --role-name "$ROLE" --policy-name s3 >/dev/null 2>&1 || true
+  aws iam delete-role-policy --role-name "$ROLE" --policy-name eip >/dev/null 2>&1 || true
   aws iam delete-role --role-name "$ROLE" && echo "deleted IAM role $ROLE"
 fi
 if [ -n "${BUCKET:-}" ]; then

@@ -7,19 +7,29 @@
 //!                     the hashes of its parts
 //!   snap/{s}/{i}      the snapshot
 //!   Head and snapshot rotate through SLOTS slots, so the last few versions
-//!   stay readable: a write cut short never damages the current one, and a
-//!   standby a few writes behind (replica.rs) can still read the version it
-//!   knows. A head is referred to as "SLOT:HASH".
+//!   stay readable and a write cut short never damages the current one. A
+//!   head is referred to as "SLOT:HASH".
 //!   code/{id}/{i}     an upload's index and sealing key (written once)
 //!   trace/{run}/{k}   a run's trace, in append-only chunks
 //! Every record but the head is named by hash from the record before it, and
 //! a handoff carries each head's hash, so the successor gets exactly the
 //! state the giver last wrote.
+//!
+//! The lineage also keeps an index of its sessions (INDEX_SID/INDEX), so a
+//! promoted standby (replica.rs), which was given no heads, finds every
+//! session and reads the newest head of each that opens. Nothing proves
+//! those are the latest: the parent could serve older ones and hide recent
+//! changes, but not invent any.
 
 use super::*;
+use anyhow::Context as _;
 
 /// Head and snapshot slots per session.
 const SLOTS: u64 = 4;
+
+/// The lineage's session index: a record outside any session.
+const INDEX_SID: &str = "~lineage";
+const INDEX: &str = "sessions";
 
 /// How often changed sessions are written.
 pub const WRITE_INTERVAL: Duration = Duration::from_secs(2);
@@ -266,6 +276,9 @@ impl Store {
                 failed += 1;
             }
         }
+        if self.write_index(p, false).await.is_err() {
+            failed += 1;
+        }
         if failed > 0 {
             static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let now = now_ms();
@@ -292,17 +305,63 @@ impl Store {
             }
         }
         heads.extend(lock(&self.pending).iter().cloned());
+        self.write_index(p, true).await.context("writing the session index")?;
         Ok(heads)
     }
 
-    /// Each session's latest written head, for a standby to follow.
-    pub fn heads_now(&self) -> Vec<(String, String)> {
-        let mut heads: Vec<(String, String)> = lock(&self.sessions)
+    /// Write the session index if the set of sessions changed: those
+    /// written at least once, and those still pending. Sessions are written
+    /// before the index, so every session it lists has a head.
+    async fn write_index(&self, p: &crate::persist::Persist, force: bool) -> Result<()> {
+        let mut ids: Vec<String> = lock(&self.sessions)
             .values()
-            .filter_map(|s| lock(&s.written).1.clone().map(|h| (s.id.clone(), h)))
+            .filter(|s| lock(&s.written).1.is_some())
+            .map(|s| s.id.clone())
+            .chain(lock(&self.pending).iter().map(|(sid, _)| sid.clone()))
             .collect();
-        heads.extend(lock(&self.pending).iter().cloned());
-        heads
+        ids.sort();
+        ids.dedup();
+        if !force && lock(&self.index_written).as_ref() == Some(&ids) {
+            return Ok(());
+        }
+        p.put(INDEX_SID, INDEX, &serde_json::to_vec(&ids)?).await?;
+        *lock(&self.index_written) = Some(ids);
+        Ok(())
+    }
+
+    /// For a promoted standby: every session in the index, each from its
+    /// newest head that reads back. One that doesn't read yet waits in
+    /// `pending`. Returns (sessions listed, sessions restored).
+    pub async fn restore_latest(&self, ctx: &Arc<Ctx>) -> Result<(usize, usize)> {
+        let ids: Vec<String> = match ctx.persist.get_any(INDEX_SID, INDEX).await? {
+            Some((plain, _)) => serde_json::from_slice(&plain).context("the session index is malformed")?,
+            None => Vec::new(),
+        };
+        let mut n = 0;
+        for sid in &ids {
+            match restore_newest(ctx, sid).await {
+                Ok(s) => {
+                    self.index_text(&s);
+                    lock(&self.sessions).insert(sid.clone(), s);
+                    n += 1;
+                }
+                Err(e) => {
+                    crate::log(&format!("state: couldn't restore a session yet: {e:#}"));
+                    lock(&self.pending).push((sid.clone(), String::new()));
+                }
+            }
+        }
+        Ok((ids.len(), n))
+    }
+
+    fn index_text(&self, s: &Session) {
+        let st = lock(&s.st);
+        let mut idx = lock(&self.text_index);
+        for r in &st.runs {
+            if let Some(q) = st.questions.iter().find(|q| q.version == r.question_version) {
+                idx.entry(sha256_hex(q.text.as_bytes())).or_default().insert(s.id.clone());
+            }
+        }
     }
 
     /// Take over sessions from a predecessor, each from the head it named.
@@ -311,29 +370,17 @@ impl Store {
     pub async fn restore(&self, ctx: &Arc<Ctx>, heads: Vec<(String, String)>) -> usize {
         let mut n = 0;
         for (sid, head) in heads {
-            let mut r = restore_session(ctx, &sid, &head).await;
+            let mut r = restore_from(ctx, &sid, &head).await;
             for _ in 0..2 {
                 if r.is_ok() {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                r = restore_session(ctx, &sid, &head).await;
+                r = restore_from(ctx, &sid, &head).await;
             }
             match r {
                 Ok(s) => {
-                    {
-                        let st = lock(&s.st);
-                        let mut idx = lock(&self.text_index);
-                        for r in &st.runs {
-                            if let Some(q) =
-                                st.questions.iter().find(|q| q.version == r.question_version)
-                            {
-                                idx.entry(sha256_hex(q.text.as_bytes()))
-                                    .or_default()
-                                    .insert(sid.clone());
-                            }
-                        }
-                    }
+                    self.index_text(&s);
                     lock(&self.sessions).insert(sid, s);
                     n += 1;
                 }
@@ -352,9 +399,10 @@ impl Store {
         let pending = lock(&self.pending).clone();
         let mut n = 0;
         for (sid, head) in pending {
-            if let Ok(s) = restore_session(ctx, &sid, &head).await {
+            if let Ok(s) = restore_from(ctx, &sid, &head).await {
                 let mut p = lock(&self.pending);
                 p.retain(|(x, h)| !(x == &sid && h == &head));
+                self.index_text(&s);
                 lock(&self.sessions).insert(sid, s);
                 n += 1;
             }
@@ -378,11 +426,43 @@ pub async fn write_loop(ctx: Arc<Ctx>) {
             continue;
         }
         ctx.store.write_changed(&ctx.persist).await;
-        ctx.repl.publish(ctx.store.heads_now());
         if tick % 30 == 0 {
             ctx.store.retry_pending(&ctx).await;
         }
     }
+}
+
+/// A session from the head named, or with an empty head (a session from
+/// the index, whose newest head isn't known), the newest that reads back.
+async fn restore_from(ctx: &Arc<Ctx>, sid: &str, head: &str) -> Result<Arc<Session>> {
+    if head.is_empty() {
+        restore_newest(ctx, sid).await
+    } else {
+        restore_session(ctx, sid, head).await
+    }
+}
+
+/// A session from the newest of its heads that reads back.
+async fn restore_newest(ctx: &Arc<Ctx>, sid: &str) -> Result<Arc<Session>> {
+    let mut heads = Vec::new();
+    for slot in 0..SLOTS {
+        if let Ok(Some((plain, hash))) = ctx.persist.get_any(sid, &format!("head/{slot}")).await {
+            if let Ok(h) = serde_json::from_slice::<Head>(&plain) {
+                if h.slot == slot {
+                    heads.push((h.generation, format!("{slot}:{hash}")));
+                }
+            }
+        }
+    }
+    heads.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut last = anyhow!("no head record reads back");
+    for (_, r) in heads {
+        match restore_session(ctx, sid, &r).await {
+            Ok(s) => return Ok(s),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
 }
 
 async fn restore_session(ctx: &Arc<Ctx>, sid: &str, head_ref: &str) -> Result<Arc<Session>> {

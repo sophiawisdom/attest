@@ -1,13 +1,14 @@
-"""Standby test: a second dev enclave copies the lineage, follows the
-primary's writes, and takes over when the primary dies.
+"""Standby test: a second dev enclave takes the lineage's keys, checks the
+primary is alive, and takes over when the primary dies.
 
     python3 tests/replica_e2e.py     (builds and starts everything itself)
 
 Enclave A serves a session; B starts as A's standby and serves no
-sessions. A release on A is answered only once B has it, so killing A right
-after loses nothing: once A has been silent long enough, the operator
-promotes B, which serves the session with the release, a verifying
-certificate, and the uploaded code for a new run. Then C stands by for B.
+sessions. B copies no session data: once A has been silent long enough,
+the operator promotes B, which finds every session in the shared store
+(including one made after B started) and serves the release made just
+before A died, a verifying certificate, and the uploaded code for a new
+run. Then C stands by for B.
 """
 import hashlib
 import hmac
@@ -100,7 +101,7 @@ def run(work, enclave, enclaves):
     check(call(B, "POST", "/api/sessions", body={})[0] == 503, "B creates no sessions while standing by")
     check(call(A, "GET", f"/api/sessions/{sid}", ae)[0] == 200, "A keeps serving after B took its copy")
 
-    print("work on A, followed by B")
+    print("work on A")
     ok(A, "POST", f"/api/sessions/{sid}/question", ao, {"text": "Does trainer/train.py compute loss on chain-of-thought tokens?"})
     ok(A, "POST", f"/api/sessions/{sid}/question/decision", ae, {"version": 1, "accept": True})
     up = subprocess.run([os.path.join(BIN, "attest"), "upload", f"http://127.0.0.1:{A}/s/{sid}#{ae}", repo, "--org", "Example Lab", "--allow-dev"],
@@ -113,21 +114,25 @@ def run(work, enclave, enclaves):
 
     st, v = promote(B)
     check(st == 403 and "unreachable" in v.get("error", ""), "B refuses promotion while A answers")
+    late = ok(A, "POST", "/api/sessions", body={})
+    ok(A, "POST", f"/api/sessions/{late['session_id']}/question", late["auditor_token"], {"text": "Made after B started?"})
 
     t = time.time()
     ok(A, "POST", f"/api/sessions/{sid}/runs/{r1}/release", ae, {"release": True})
-    took = time.time() - t
-    # Killed the moment the release is answered: B must already have it.
+    check(time.time() - t < 2, "the release is answered without waiting on B")
+    # Killed once the release is written (every couple of seconds).
+    time.sleep(3)
     enclaves["A"].send_signal(signal.SIGKILL)
     enclaves["A"].wait()
-    check(took < 9, f"the release was answered once B confirmed it ({took:.2f}s)")
 
     print("A dies; the operator promotes B")
     st, v = promote(B, token="wrong-token-wrong-token")
     check(st == 403 and "token" in v.get("error", ""), "promotion needs the operator's token")
     time.sleep(22)
     st, v = promote(B)
-    check(st == 200 and v["restored"] == 1, f"B promoted after A went silent ({v})")
+    check(st == 200 and v["restored"] == 2, f"B promoted after A went silent, with both sessions ({v})")
+    lv = ok(B, "GET", f"/api/sessions/{late['session_id']}", late["auditee_token"])
+    check(lv["questions"][-1]["text"] == "Made after B started?", "B has the session made after it started")
     check(ok(B, "GET", "/api/health")["standby"] is False, "B now serves")
     va = ok(B, "GET", f"/api/sessions/{sid}", ao)
     run1 = next(r for r in va["runs"] if r["id"] == r1)
@@ -149,6 +154,7 @@ def run(work, enclave, enclaves):
     check(ok(C, "GET", "/api/health")["standby"] is True, "C stands by")
     check(call(C, "GET", f"/api/sessions/{sid}", ae)[0] == 503, "C serves no sessions")
     ok(B, "POST", f"/api/sessions/{sid}/runs/{r2}/release", ae, {"release": False})
+    time.sleep(3)
     enclaves["B"].send_signal(signal.SIGKILL)
     enclaves["B"].wait()
     time.sleep(22)

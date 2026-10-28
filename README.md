@@ -92,15 +92,19 @@ sandbox mode, so only confirmed addresses get mail. Agents poll instead. See
   second region): started with the running one as its peer, the new enclave
   proves its image and takes over the key, the signing key and the latest
   state; runs that were going are recorded as interrupted. A **standby**
-  (config `standby: true` with the primary as `peer`) takes a copy the same
-  way, while the primary keeps serving, and follows the hash of every
-  session's latest state. A request that changes a session is answered only
-  once the standby has the change (or after 10 s). If the primary's machine
-  dies, the operator promotes the standby (`POST /api/internal/replica/promote`
-  with a MAC under the handoff token), which it accepts only after 20 s
-  without contact with the primary. If the operator cuts two healthy
-  enclaves apart and promotes the standby, both serve: a party then sees only
-  one, which can hide recent changes from them but not invent any. If no
+  (config `standby: true` with the primary as `peer`) takes the same keys
+  the same way while the primary keeps serving, and copies no session data:
+  it only checks every few seconds that the primary is alive. Promoted
+  (`POST /api/internal/replica/promote` with a MAC under the handoff token,
+  accepted only after 20 s without contact), it reads the lineage's session
+  index and each session's newest state from the shared store.
+  `deploy/self-host.sh --standby-for NAME` sets up such a pair in two
+  availability zones; `deploy/pair.sh` on each machine promotes the standby
+  and moves the Elastic IP after a minute without the primary, and turns a
+  stale primary back into a standby. Changes written in the last couple of
+  seconds before the primary died can be lost. The parent could serve older
+  state at a promotion, or cut two healthy enclaves apart so both serve:
+  a party may then miss recent changes, but none can be invented. If no
   enclave of the lineage is running (both machines lost, or an image
   upgrade), the key is gone and so are the sessions. `/api/info` shows the lineage and
   which boot it came from; the boot id still makes restarts visible.
