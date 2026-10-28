@@ -348,11 +348,9 @@ impl Store {
         }
         for s in gone {
             let mut st = lock(&s.st);
-            // Runs still going hold their own reference to the code; it's
-            // discarded once they end (see RunJob).
-            if let Some(b) = st.code.take() {
-                tokio::spawn(async move { b.discard().await });
-            }
+            // Runs still going hold their own reference to the code; its
+            // stored files go once they end (Bundle's Drop).
+            drop(st.code.take());
             st.expired = true;
             let freed: usize = st.runs.iter().map(|r| r.trace_bytes).sum();
             TRACE_BYTES.fetch_sub(freed.min(TRACE_BYTES.load(std::sync::atomic::Ordering::Relaxed)), std::sync::atomic::Ordering::Relaxed);
@@ -671,12 +669,9 @@ impl Session {
         let bundle = Arc::new(bundle);
         let info = bundle.info.clone();
         let mut st = lock(&self.st);
-        if let Some(old) = st.code.replace(bundle) {
-            // Runs still holding it keep working; blobs go once nothing does.
-            if Arc::strong_count(&old) == 1 {
-                tokio::spawn(async move { old.discard().await });
-            }
-        }
+        // Runs still holding the old code keep working; its stored files go
+        // once nothing does (Bundle's Drop).
+        drop(st.code.replace(bundle));
         let had_affidavit = st.affidavit.take().is_some();
         // Shown to both sides, so only the commitment: size and tree hash
         // stay with the auditee until a release.

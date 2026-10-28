@@ -407,11 +407,27 @@ impl Bundle {
         }
         c
     }
+}
 
-    /// Remove this bundle's sealed files from the parent.
-    pub async fn discard(&self) {
+/// The stored files go when the last user of the code does (the session,
+/// a run, a disclosure). Deletion is retried for a while if the parent's
+/// store is unreachable.
+impl Drop for Bundle {
+    fn drop(&mut self) {
         self.cache.forget_session(&self.sealer.tag);
-        let _ = self.store.delete_session(&self.sealer.tag).await;
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (store, tag) = (self.store.clone(), self.sealer.tag);
+        rt.spawn(async move {
+            for attempt in 0..6u32 {
+                if store.delete_session(&tag).await.is_ok() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(15 << attempt)).await;
+            }
+            crate::log("couldn't delete a discarded upload's stored files from the parent");
+        });
     }
 }
 
@@ -686,20 +702,40 @@ impl<'a> Tools<'a> {
             (p, r)
         }))
         .buffered(8);
-        while let Some((p, bytes)) = fetched.next().await {
-            let bytes = bytes?;
-            let t = String::from_utf8_lossy(&bytes);
+        // Matching lines of one file, up to `room` of them, plus the count.
+        fn scan(re: &regex::Regex, p: &str, bytes: &[u8], room: usize) -> (usize, Vec<String>) {
+            let t = String::from_utf8_lossy(bytes);
             if !re.is_match(&t) {
-                continue;
+                return (0, vec![]);
             }
-            files_matched += 1;
+            let (mut n, mut hits) = (0, vec![]);
             for (i, l) in t.lines().enumerate() {
                 if re.is_match(l) {
-                    total += 1;
-                    if out.len() < max {
-                        out.push(format!("{p}:{}: {}", i + 1, truncate_line(l.trim(), 300)));
+                    n += 1;
+                    if hits.len() < room {
+                        hits.push(format!("{p}:{}: {}", i + 1, truncate_line(l.trim(), 300)));
                     }
                 }
+            }
+            (n, hits)
+        }
+        while let Some((p, bytes)) = fetched.next().await {
+            let bytes = bytes?;
+            let room = max - out.len();
+            // Big files are matched off the async workers, which the HTTP
+            // server shares.
+            let (n, hits) = if bytes.len() > 64 << 10 {
+                let re = re.clone();
+                tokio::task::spawn_blocking(move || scan(&re, &p, &bytes, room))
+                    .await
+                    .context("grep")?
+            } else {
+                scan(&re, &p, &bytes, room)
+            };
+            if n > 0 {
+                files_matched += 1;
+                total += n;
+                out.extend(hits);
             }
         }
         let mut s = if out.is_empty() {
@@ -836,6 +872,30 @@ mod tests {
         h.set_cksum();
         b.append(&h, &b"x"[..]).unwrap();
         assert!(ingest(b.into_inner().unwrap(), 1 << 30).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stored_files_go_with_the_last_user() {
+        let store = BlobClient::memory();
+        let rt = tokio::runtime::Handle::current();
+        let s2 = store.clone();
+        let t = tar_of(&[("a", b"x")]);
+        let b = Arc::new(
+            std::thread::spawn(move || {
+                Bundle::ingest(&t[..], "s", s2, Arc::new(Cache::new(1 << 20)), rt, 1 << 20)
+            })
+            .join()
+            .unwrap()
+            .unwrap(),
+        );
+        let blob = b.files["a"].blob;
+        let run = b.clone(); // a run still holding the code
+        drop(b);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(store.get(&blob).await.unwrap().is_some());
+        drop(run);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(store.get(&blob).await.unwrap().is_none());
     }
 
     #[test]

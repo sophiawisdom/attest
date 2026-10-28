@@ -378,6 +378,8 @@ impl RoDir {
     /// Charge host-side work: an open is 1, a directory listing 1 per 64
     /// entries. The 512 MiB memory limit covers only the guest's own
     /// memory, so this bounds the host allocations a script can cause.
+    // fetch_update: the image's Rust (1.97) predates its newer name.
+    #[allow(deprecated)]
     fn charge(&self, units: u64) -> Result<(), Error> {
         use std::sync::atomic::Ordering::Relaxed;
         self.budget
