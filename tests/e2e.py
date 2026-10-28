@@ -72,6 +72,11 @@ PY_URL = "https://github.com/brettcannon/cpython-wasi-build/releases/download/v3
 PY_SHA256 = "252e2e17fab9f51a51fbfc73d51e18805cb633e9f9200c9753b4b801c70ad32c"
 
 
+def blob_files(work):
+    """Sealed files the host stores (one directory per session)."""
+    return [os.path.join(d, f) for d, _, fs in os.walk(os.path.join(work, "blobs")) for f in fs]
+
+
 def python_wasi():
     """The pinned CPython WASI build the enclave image also uses."""
     import hashlib, zipfile
@@ -153,8 +158,8 @@ def run(work):
     check(set(v["code"]) == {"commitment_sha256", "uploaded_at_ms"} and v["affidavit"]["current"] and "tree_sha256" not in v["affidavit"], "auditor sees only the code commitment and the affidavit")
     check(v["code"]["commitment_sha256"] in v["affidavit"]["record"]["statement"], "affidavit names the commitment")
     check(auditee.view()["code"]["file_count"] == 2, "auditee sees code metadata")
-    blobs = os.listdir(os.path.join(work, "blobs"))
-    raw = b"".join(open(os.path.join(work, "blobs", b), "rb").read() for b in blobs)
+    blobs = blob_files(work)
+    raw = b"".join(open(b, "rb").read() for b in blobs)
     check(len(blobs) == 2 and b"NOTE TO AUDITOR" not in raw and b"include_cot" not in raw, "code is stored on the host only as ciphertext")
     check("NOTE TO AUDITOR" not in json.dumps(v), "auditor view has no code")
 
@@ -327,16 +332,14 @@ def run(work):
     out = subprocess.run([os.path.join(BIN, "attest"), "upload", link, big, "--allow-dev", "--allow-dirty"], capture_output=True, text=True)
     check(out.returncode == 0 and "leaving out huge.bin" in out.stderr, "CLI leaves out files over 64 MiB")
     check(auditee.view()["code"]["file_count"] == 1, "upload replaced the code with the smaller tree")
-    for b in os.listdir(os.path.join(work, "blobs")):
-        p = os.path.join(work, "blobs", b)
+    for p in blob_files(work):
         data = bytearray(open(p, "rb").read()); data[-1] ^= 1; open(p, "wb").write(bytes(data))
     s2 = ok("POST", "/api/sessions", body={})
     a2, o2 = Party(s2["session_id"], s2["auditee_token"]), Party(s2["session_id"], s2["auditor_token"])
     o2.post("/question", {"text": "Does trainer/train.py compute loss on chain-of-thought tokens?"})
     a2.post("/question/decision", {"version": 1, "accept": True})
     subprocess.run([os.path.join(BIN, "attest"), "upload", f"{BASE}/s/{s2['session_id']}#{s2['auditee_token']}", repo, "--org", "X", "--allow-dev"], check=True, capture_output=True)
-    for b in os.listdir(os.path.join(work, "blobs")):
-        p = os.path.join(work, "blobs", b)
+    for p in blob_files(work):
         if os.path.getmtime(p) > time.time() - 5:
             data = bytearray(open(p, "rb").read()); data[-1] ^= 1; open(p, "wb").write(bytes(data))
     a2.post("/models", {"provider": "mock", "model": "gpt-mock", "api_key": "test-key", "mock_endpoint": "127.0.0.1:19999"})

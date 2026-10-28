@@ -10,6 +10,11 @@
 //! Wire protocol (one request per connection):
 //!   request:  op u8 | id [24] | len u64le | data
 //!   response: status u8 (0 ok, 1 not found, 2 error) | len u64le | data
+//!
+//! Before its first request, each enclave boot sends OP_RESET: everything
+//! stored earlier is sealed under keys that died with the previous boot.
+//! The parent deletes stored blobs only then, never on its own restart, so
+//! restarting the parent's daemon doesn't lose live sessions' files.
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -24,8 +29,28 @@ pub const BLOB_VSOCK_PORT: u32 = 5005;
 pub const OP_PUT: u8 = 1;
 pub const OP_GET: u8 = 2;
 pub const OP_DELETE_PREFIX: u8 = 3;
+pub const OP_RESET: u8 = 4;
 /// Largest single file we store (plaintext).
 pub const MAX_FILE_BYTES: usize = 64 << 20;
+/// The parent's limit on one stored blob (crates/host: MAX_BLOB_BYTES).
+pub const HOST_MAX_BLOB_BYTES: usize = 80 << 20;
+
+/// Size of the largest sealed blob: an incompressible MAX_FILE_BYTES file
+/// after LZ4 (with its size prefix), padding (with its length prefix) and
+/// the nonce and tag.
+pub fn max_sealed_len() -> usize {
+    // LZ4's worst case for n bytes is n + n/255 + 16.
+    let lz4_bound = MAX_FILE_BYTES + MAX_FILE_BYTES / 255 + 16;
+    12 + 16 + bucket_for(lz4_bound + 4 + 4)
+}
+
+fn bucket_for(need: usize) -> usize {
+    let mut bucket = 1024usize;
+    while bucket < need {
+        bucket += bucket / 4;
+    }
+    bucket
+}
 
 /// 8-byte session tag + 16-byte file id.
 pub type BlobId = [u8; 24];
@@ -36,6 +61,8 @@ pub struct BlobClient {
     dev_addr: String,
     /// Tests only: keep blobs in this process.
     memory: Option<Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>>,
+    /// Set once this boot's OP_RESET has reached the parent.
+    reset: Arc<tokio::sync::OnceCell<()>>,
 }
 
 impl BlobClient {
@@ -44,6 +71,7 @@ impl BlobClient {
             dev,
             dev_addr,
             memory: None,
+            reset: Arc::default(),
         }
     }
 
@@ -53,6 +81,7 @@ impl BlobClient {
             dev: true,
             dev_addr: String::new(),
             memory: Some(Arc::default()),
+            reset: Arc::default(),
         }
     }
 
@@ -91,6 +120,16 @@ impl BlobClient {
                 }
             });
         }
+        if op != OP_RESET {
+            self.reset
+                .get_or_try_init(|| async { self.call_raw(OP_RESET, &[], &[]).await.map(|_| ()) })
+                .await
+                .context("telling the blob store about this boot")?;
+        }
+        self.call_raw(op, id, data).await
+    }
+
+    async fn call_raw(&self, op: u8, id: &[u8], data: &[u8]) -> Result<Option<Vec<u8>>> {
         let fut = async {
             let mut s = self.connect().await?;
             let mut head = Vec::with_capacity(33);
@@ -104,7 +143,7 @@ impl BlobClient {
             s.flush().await?;
             let status = s.read_u8().await?;
             let len = s.read_u64_le().await? as usize;
-            ensure!(len <= MAX_FILE_BYTES + 1024, "blob store reply too large");
+            ensure!(len <= max_sealed_len(), "blob store reply too large");
             let mut buf = vec![0u8; len];
             s.read_exact(&mut buf).await?;
             match status {
@@ -119,6 +158,7 @@ impl BlobClient {
     }
 
     pub async fn put(&self, id: &BlobId, data: &[u8]) -> Result<()> {
+        ensure!(data.len() <= HOST_MAX_BLOB_BYTES, "sealed file too large for the blob store");
         self.call(OP_PUT, id, data).await.map(|_| ())
     }
 
@@ -226,11 +266,7 @@ impl Sealer {
 
 /// `len || data || zeros`, up to the next size bucket.
 fn pad_blob(data: Vec<u8>) -> Vec<u8> {
-    let need = data.len() + 4;
-    let mut bucket = 1024usize;
-    while bucket < need {
-        bucket = bucket + bucket / 4;
-    }
+    let bucket = bucket_for(data.len() + 4);
     let mut out = Vec::with_capacity(bucket);
     out.extend_from_slice(&(data.len() as u32).to_le_bytes());
     out.extend_from_slice(&data);
@@ -303,6 +339,18 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn largest_blob_fits_both_ends() {
+        let n = max_sealed_len();
+        assert!(n <= HOST_MAX_BLOB_BYTES, "{n}");
+        let s = Sealer::new("s");
+        let big: Vec<u8> = (0..MAX_FILE_BYTES as u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        let sealed = s.seal("big", &attest_core::sha256(&big), &big).unwrap().1;
+        assert!(sealed.len() <= n, "{} > {n}", sealed.len());
+    }
 
     #[test]
     fn padding_hides_exact_size() {

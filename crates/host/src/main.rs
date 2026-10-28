@@ -14,7 +14,7 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use std::net::IpAddr;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 #[derive(Parser, Debug, Clone)]
@@ -41,7 +41,8 @@ struct Args {
     /// Dev only: address to accept tunnel requests on.
     #[arg(long, default_value = "127.0.0.1:5001")]
     dev_tunnel: String,
-    /// Where sealed files are kept. Wiped at startup: the keys died with the last enclave.
+    /// Where sealed files are kept. Kept across restarts of this daemon; wiped
+    /// when a new enclave boot says so (the old keys died with the old boot).
     #[arg(long, default_value = "/var/lib/attest/blobs")]
     blob_dir: String,
     /// Disk quota for sealed files.
@@ -62,29 +63,61 @@ fn log(m: &str) {
     eprintln!("[attest-host] {m}");
 }
 
+/// Simultaneous connections per service; more are closed on arrival.
+const MAX_FORWARDED: usize = 2048;
+const MAX_TUNNELS: usize = 512;
+const MAX_BLOB_REQUESTS: usize = 64;
+/// Largest stored blob (the enclave's blobs::HOST_MAX_BLOB_BYTES).
+const MAX_BLOB_BYTES: u64 = 80 << 20;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let blobs = std::sync::Arc::new(Blobs::open(&args).await?);
+    // Each service runs on its own and is restarted if it fails, so one
+    // failing listener doesn't take forwarding, tunnels and storage with it.
     let mut tasks = tokio::task::JoinSet::new();
     let a = args.clone();
-    tasks.spawn(async move { tunnel_server(a).await });
-    let a = args.clone();
-    tasks.spawn(async move { blob_server(a).await });
+    tasks.spawn(supervise("tunnel", move || tunnel_server(a.clone())));
+    let (a, b) = (args.clone(), blobs.clone());
+    tasks.spawn(supervise("blob store", move || blob_server(a.clone(), b.clone())));
     if !args.dev {
         let a = args.clone();
-        tasks.spawn(async move { config_server(a).await });
+        tasks.spawn(supervise("config", move || config_server(a.clone())));
         let a = args.clone();
-        tasks.spawn(async move { credentials_server(a).await });
-        tasks.spawn(async move { log_server().await });
+        tasks.spawn(supervise("credentials", move || credentials_server(a.clone())));
+        tasks.spawn(supervise("log", log_server));
     }
     if !args.no_forward {
         let a = args.clone();
-        tasks.spawn(async move { forward_server(a).await });
+        tasks.spawn(supervise("forwarding", move || forward_server(a.clone())));
     }
-    if let Some(r) = tasks.join_next().await {
-        r??;
-    }
+    while tasks.join_next().await.is_some() {}
     Ok(())
+}
+
+/// Run a service forever, restarting it with backoff when it returns.
+async fn supervise<F, Fut>(name: &'static str, start: F)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut backoff = std::time::Duration::from_secs(1);
+    loop {
+        let t = std::time::Instant::now();
+        if let Err(e) = start().await {
+            log(&format!("{name}: {e:#}; restarting in {backoff:?}"));
+        }
+        if t.elapsed() > std::time::Duration::from_secs(60) {
+            backoff = std::time::Duration::from_secs(1);
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
+    }
+}
+
+fn permits(n: usize) -> std::sync::Arc<tokio::sync::Semaphore> {
+    std::sync::Arc::new(tokio::sync::Semaphore::new(n))
 }
 
 async fn forward_server(args: Args) -> Result<()> {
@@ -92,17 +125,26 @@ async fn forward_server(args: Args) -> Result<()> {
         .await
         .with_context(|| format!("binding {}", args.listen))?;
     log(&format!("forwarding {} -> enclave", args.listen));
+    let slots = permits(MAX_FORWARDED);
     loop {
         let (mut client, peer) = l.accept().await?;
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            continue;
+        };
         let args = args.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             #[cfg(target_os = "linux")]
             {
-                match tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(
-                    args.enclave_cid,
-                    args.enclave_port,
-                ))
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(
+                        args.enclave_cid,
+                        args.enclave_port,
+                    )),
+                )
                 .await
+                .unwrap_or_else(|_| Err(std::io::Error::other("timed out")))
                 {
                     Ok(mut e) => {
                         let _ = tokio::io::copy_bidirectional(&mut client, &mut e).await;
@@ -141,7 +183,13 @@ fn public(ip: IpAddr) -> bool {
 async fn handle_tunnel<S: Io>(args: Args, s: S) -> Result<()> {
     let mut r = BufReader::new(s);
     let mut line = String::new();
-    r.read_line(&mut line).await?;
+    // A short, bounded request line, promptly.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        (&mut r).take(512).read_line(&mut line),
+    )
+    .await
+    .context("tunnel request timed out")??;
     let target = line
         .trim()
         .strip_prefix("CONNECT ")
@@ -149,10 +197,13 @@ async fn handle_tunnel<S: Io>(args: Args, s: S) -> Result<()> {
         .to_string();
     let (host, port) = target.rsplit_once(':').context("expected host:port")?;
     let port: u16 = port.parse()?;
-    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
-        .await
-        .map(|a| a.collect())
-        .unwrap_or_default();
+    let addrs: Vec<std::net::SocketAddr> =
+        tokio::time::timeout(std::time::Duration::from_secs(10), tokio::net::lookup_host((host, port)))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .map(|a| a.collect())
+            .unwrap_or_default();
     let ok_addr = addrs
         .into_iter()
         .find(|a| (port == 443 && public(a.ip())) || (args.dev && a.ip().is_loopback()));
@@ -162,7 +213,10 @@ async fn handle_tunnel<S: Io>(args: Args, s: S) -> Result<()> {
             .await?;
         bail!("refused tunnel to {target}");
     };
-    let mut up = match TcpStream::connect(addr).await {
+    let mut up = match tokio::time::timeout(std::time::Duration::from_secs(10), TcpStream::connect(addr))
+        .await
+        .unwrap_or_else(|_| Err(std::io::Error::other("connect timed out")))
+    {
         Ok(u) => u,
         Err(e) => {
             r.get_mut()
@@ -181,10 +235,15 @@ async fn tunnel_server(args: Args) -> Result<()> {
     if args.dev {
         let l = TcpListener::bind(&args.dev_tunnel).await?;
         log(&format!("dev tunnel on {}", args.dev_tunnel));
+        let slots = permits(MAX_TUNNELS);
         loop {
             let (s, _) = l.accept().await?;
+            let Ok(permit) = slots.clone().try_acquire_owned() else {
+                continue;
+            };
             let a = args.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Err(e) = handle_tunnel(a, s).await {
                     log(&format!("tunnel: {e:#}"));
                 }
@@ -198,10 +257,15 @@ async fn tunnel_server(args: Args) -> Result<()> {
             args.tunnel_port,
         ))?;
         log(&format!("tunnel on vsock {}", args.tunnel_port));
+        let slots = permits(MAX_TUNNELS);
         loop {
             let (s, _) = l.accept().await?;
+            let Ok(permit) = slots.clone().try_acquire_owned() else {
+                continue;
+            };
             let a = args.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Err(e) = handle_tunnel(a, s).await {
                     log(&format!("tunnel: {e:#}"));
                 }
@@ -227,10 +291,15 @@ async fn config_server(args: Args) -> Result<()> {
             args.config_port,
         ))?;
         log(&format!("config on vsock {}", args.config_port));
+        let slots = permits(16);
         loop {
             let (mut s, _) = l.accept().await?;
+            let Ok(permit) = slots.clone().try_acquire_owned() else {
+                continue;
+            };
             let body = body.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 use tokio::io::AsyncReadExt;
                 let _ = s.write_all(&body).await;
                 let _ = AsyncWriteExt::shutdown(&mut s).await;
@@ -259,27 +328,131 @@ fn serde_json_check(b: &[u8]) -> Result<()> {
 
 // ------------------------------------------------------------------ sealed file store
 
+/// Sealed files, one directory per session tag: `<dir>/<tag hex>/<id hex>`.
 struct Blobs {
     dir: std::path::PathBuf,
     quota: u64,
     used: std::sync::Mutex<u64>,
 }
 
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Total size of the regular files under `p`.
+fn dir_size(p: &std::path::Path) -> u64 {
+    let Ok(rd) = std::fs::read_dir(p) else { return 0 };
+    rd.flatten()
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => dir_size(&e.path()),
+            Ok(t) if t.is_file() => e.metadata().map(|m| m.len()).unwrap_or(0),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Remove everything under `p`, returning the bytes actually freed.
+fn remove_all_under(p: &std::path::Path) -> u64 {
+    let Ok(rd) = std::fs::read_dir(p) else { return 0 };
+    let mut freed = 0;
+    for e in rd.flatten() {
+        let path = e.path();
+        match e.file_type() {
+            Ok(t) if t.is_dir() => {
+                freed += remove_all_under(&path);
+                let _ = std::fs::remove_dir(&path);
+            }
+            _ => {
+                let n = e.metadata().map(|m| m.len()).unwrap_or(0);
+                if std::fs::remove_file(&path).is_ok() {
+                    freed += n;
+                }
+            }
+        }
+    }
+    freed
+}
+
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T> {
+    tokio::task::spawn_blocking(f).await.context("disk worker")
+}
+
 impl Blobs {
-    fn path(&self, id: &[u8]) -> std::path::PathBuf {
-        self.dir
-            .join(id.iter().map(|b| format!("{b:02x}")).collect::<String>())
+    /// Open the store, keeping what's there: this daemon may have restarted
+    /// under a running enclave whose sessions still need their files.
+    async fn open(args: &Args) -> Result<Self> {
+        let dir = std::path::PathBuf::from(&args.blob_dir);
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let d = dir.clone();
+        let used = blocking(move || dir_size(&d)).await?;
+        log(&format!("blob store at {}: {} MiB kept", dir.display(), used >> 20));
+        Ok(Self {
+            dir,
+            quota: args.blob_quota_gib << 30,
+            used: std::sync::Mutex::new(used),
+        })
+    }
+
+    fn path(&self, id: &[u8; 24]) -> std::path::PathBuf {
+        self.dir.join(hex(&id[..8])).join(hex(&id[8..]))
+    }
+
+    fn add(&self, delta: i64) {
+        let mut u = self.used.lock().unwrap_or_else(|p| p.into_inner());
+        *u = if delta >= 0 { u.saturating_add(delta as u64) } else { u.saturating_sub(delta.unsigned_abs()) };
+    }
+
+    /// Store a blob: reserve its size, write a temporary file and rename it
+    /// into place; replacing a blob credits the old one's size. On failure
+    /// the reservation is returned.
+    async fn put(self: &std::sync::Arc<Self>, id: [u8; 24], data: Vec<u8>) -> Result<(), String> {
+        let len = data.len() as u64;
+        {
+            let mut u = self.used.lock().unwrap_or_else(|p| p.into_inner());
+            if *u + len > self.quota {
+                return Err("blob store full".into());
+            }
+            *u += len;
+        }
+        let (b, path) = (self.clone(), self.path(&id));
+        let r = blocking(move || -> std::io::Result<u64> {
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            let old = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, &data)?;
+            std::fs::rename(&tmp, &path).inspect_err(|_| {
+                let _ = std::fs::remove_file(&tmp);
+            })?;
+            Ok(old)
+        })
+        .await;
+        match r {
+            Ok(Ok(old)) => {
+                b.add(-(old as i64));
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                b.add(-(len as i64));
+                Err(e.to_string())
+            }
+            Err(e) => {
+                b.add(-(len as i64));
+                Err(e.to_string())
+            }
+        }
     }
 }
 
 /// op u8 | id [24] | len u64le | data  ->  status u8 | len u64le | data
+///   1 put, 2 get, 3 delete everything with this id's 8-byte session tag,
+///   4 reset: a new enclave booted, so everything stored is unreadable now.
 async fn handle_blob<S: Io>(b: std::sync::Arc<Blobs>, mut s: S) -> Result<()> {
     use tokio::io::AsyncReadExt;
     let op = s.read_u8().await?;
     let mut id = [0u8; 24];
     s.read_exact(&mut id).await?;
     let len = s.read_u64_le().await?;
-    if len > (65 << 20) {
+    if len > MAX_BLOB_BYTES {
         bail!("blob too large");
     }
     let mut data = vec![0u8; len as usize];
@@ -291,35 +464,30 @@ async fn handle_blob<S: Io>(b: std::sync::Arc<Blobs>, mut s: S) -> Result<()> {
         out
     };
     let out = match op {
-        1 => {
-            let mut used = b.used.lock().unwrap();
-            if *used + len > b.quota {
-                reply(2, b"blob store full")
-            } else {
-                *used += len;
-                drop(used);
-                match std::fs::write(b.path(&id), &data) {
-                    Ok(()) => reply(0, b""),
-                    Err(e) => reply(2, e.to_string().as_bytes()),
-                }
-            }
-        }
-        2 => match std::fs::read(b.path(&id)) {
+        1 => match b.put(id, data).await {
+            Ok(()) => reply(0, b""),
+            Err(e) => reply(2, e.as_bytes()),
+        },
+        2 => match tokio::fs::read(b.path(&id)).await {
             Ok(d) => reply(0, &d),
             Err(_) => reply(1, b""),
         },
         3 => {
-            // Delete every blob whose id starts with the 8-byte session tag.
-            let prefix: String = id[..8].iter().map(|x| format!("{x:02x}")).collect();
-            let mut freed = 0;
-            for e in std::fs::read_dir(&b.dir)?.flatten() {
-                if e.file_name().to_string_lossy().starts_with(&prefix) {
-                    freed += e.metadata().map(|m| m.len()).unwrap_or(0);
-                    let _ = std::fs::remove_file(e.path());
-                }
-            }
-            let mut used = b.used.lock().unwrap();
-            *used = used.saturating_sub(freed);
+            let dir = b.dir.join(hex(&id[..8]));
+            let freed = blocking(move || {
+                let n = remove_all_under(&dir);
+                let _ = std::fs::remove_dir(&dir);
+                n
+            })
+            .await?;
+            b.add(-(freed as i64));
+            reply(0, b"")
+        }
+        4 => {
+            let dir = b.dir.clone();
+            let freed = blocking(move || remove_all_under(&dir)).await?;
+            b.add(-(freed as i64));
+            log(&format!("blob store: new enclave boot; cleared {} MiB", freed >> 20));
             reply(0, b"")
         }
         _ => reply(2, b"bad op"),
@@ -329,29 +497,28 @@ async fn handle_blob<S: Io>(b: std::sync::Arc<Blobs>, mut s: S) -> Result<()> {
     Ok(())
 }
 
-async fn blob_server(args: Args) -> Result<()> {
-    let dir = std::path::PathBuf::from(&args.blob_dir);
-    // Anything here is sealed under keys that died with the previous enclave.
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).with_context(|| format!("clearing {}", dir.display()))?;
-    }
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let b = std::sync::Arc::new(Blobs {
-        dir,
-        quota: args.blob_quota_gib << 30,
-        used: std::sync::Mutex::new(0),
-    });
+async fn blob_server(args: Args, b: std::sync::Arc<Blobs>) -> Result<()> {
+    let slots = permits(MAX_BLOB_REQUESTS);
+    let serve = |s: Box<dyn Io>, permit: tokio::sync::OwnedSemaphorePermit| {
+        let b = b.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            // The enclave gives each exchange two minutes; so does this side.
+            match tokio::time::timeout(std::time::Duration::from_secs(150), handle_blob(b, s)).await {
+                Ok(Err(e)) => log(&format!("blob: {e:#}")),
+                Err(_) => log("blob: request timed out"),
+                Ok(Ok(())) => {}
+            }
+        });
+    };
     if args.dev {
         let l = TcpListener::bind(&args.dev_blobs).await?;
         log(&format!("dev blob store on {}", args.dev_blobs));
         loop {
             let (s, _) = l.accept().await?;
-            let b = b.clone();
-            tokio::spawn(async move {
-                if let Err(e) = handle_blob(b, s).await {
-                    log(&format!("blob: {e:#}"));
-                }
-            });
+            if let Ok(p) = slots.clone().try_acquire_owned() {
+                serve(Box::new(s), p);
+            }
         }
     }
     #[cfg(target_os = "linux")]
@@ -363,12 +530,9 @@ async fn blob_server(args: Args) -> Result<()> {
         log("blob store on vsock 5005");
         loop {
             let (s, _) = l.accept().await?;
-            let b = b.clone();
-            tokio::spawn(async move {
-                if let Err(e) = handle_blob(b, s).await {
-                    log(&format!("blob: {e:#}"));
-                }
-            });
+            if let Ok(p) = slots.clone().try_acquire_owned() {
+                serve(Box::new(s), p);
+            }
         }
     }
     #[allow(unreachable_code)]
@@ -385,9 +549,14 @@ async fn log_server() -> Result<()> {
             tokio_vsock::VMADDR_CID_ANY,
             5004,
         ))?;
+        let slots = permits(16);
         loop {
             let (s, _) = l.accept().await?;
+            let Ok(permit) = slots.clone().try_acquire_owned() else {
+                continue;
+            };
             tokio::spawn(async move {
+                let _permit = permit;
                 let mut lines = BufReader::new(s).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     let line: String = line
@@ -482,9 +651,14 @@ async fn credentials_server(args: Args) -> Result<()> {
             args.credentials_port,
         ))?;
         log(&format!("credentials on vsock {}", args.credentials_port));
+        let slots = permits(16);
         loop {
             let (mut s, _) = l.accept().await?;
+            let Ok(permit) = slots.clone().try_acquire_owned() else {
+                continue;
+            };
             tokio::spawn(async move {
+                let _permit = permit;
                 match role_credentials().await {
                     Ok(c) => {
                         let _ = s.write_all(&c).await;
