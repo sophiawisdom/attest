@@ -51,10 +51,11 @@ pub async fn agent_loop(
             Err(e) => {
                 let msg = format!("{e:#}");
                 progress(vec![json!({"type": "error", "content": msg})]);
-                // Only the first line goes in the manifest: provider error
-                // bodies can echo request content.
-                let short: String = msg.lines().next().unwrap_or("").chars().take(300).collect();
-                outcome = Outcome::Error { message: short };
+                // The manifest gets no error text: provider error bodies can
+                // echo request content. The auditee's trace has the detail.
+                outcome = Outcome::Error {
+                    message: "a model request failed (details are in the auditee's trace)".into(),
+                };
                 break;
             }
         };

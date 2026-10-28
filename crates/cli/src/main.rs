@@ -504,10 +504,14 @@ async fn main() -> Result<()> {
                 m.affidavit.repo_url.as_deref().unwrap_or("-"),
                 m.affidavit.git_commit.as_deref().unwrap_or("-")
             );
-            println!(
-                "code      {} files, {} bytes, tree {}",
-                m.code.file_count, m.code.total_bytes, m.code.tree_sha256
-            );
+            if m.verdict_only() {
+                println!("code      commitment {} (not opened: verdict-only release)", m.code.commitment_sha256);
+            } else {
+                println!(
+                    "code      {} files, {} bytes, tree {}",
+                    m.code.file_count, m.code.total_bytes, m.code.tree_sha256
+                );
+            }
             println!(
                 "model     {} via {} (chosen by {:?}; reported {}; key owner {})",
                 m.model.requested_model,
@@ -520,13 +524,15 @@ async fn main() -> Result<()> {
                 },
                 m.model.key_owner.as_deref().unwrap_or("not reported")
             );
-            println!(
-                "activity  {} model calls, {} files read, {}+{} tokens",
-                m.activity.llm_calls,
-                m.activity.files_read,
-                m.activity.input_tokens,
-                m.activity.output_tokens
-            );
+            if !m.verdict_only() {
+                println!(
+                    "activity  {} model calls, {} files read, {}+{} tokens",
+                    m.activity.llm_calls,
+                    m.activity.files_read,
+                    m.activity.input_tokens,
+                    m.activity.output_tokens
+                );
+            }
             match &v.body.verdict {
                 Some(vd) => {
                     println!(

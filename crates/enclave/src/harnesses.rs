@@ -252,15 +252,18 @@ pub async fn run_agent(
                 };
                 match (parsed, exit) {
                     (Ok(v), _) => (Some(v), Outcome::Completed),
-                    (Err(why), 0) => (
-                        None,
-                        Outcome::Error {
-                            message: format!(
-                                "{} did not produce a valid verdict: {why}",
-                                agent.id()
-                            ),
-                        },
-                    ),
+                    (Err(why), 0) => {
+                        // `why` can quote what the model wrote, so it goes
+                        // only to the auditee's trace, never into the outcome.
+                        let why: String = why.chars().take(2000).collect();
+                        progress(vec![json!({"type": "error", "content": format!("invalid verdict: {why}")})]);
+                        (
+                            None,
+                            Outcome::Error {
+                                message: format!("{} did not produce a valid verdict", agent.id()),
+                            },
+                        )
+                    }
                     (Err(_), c) => (
                         None,
                         Outcome::Error {

@@ -484,7 +484,8 @@ function runHtml(v, r) {
     if (r.status === "running") main += `<div class="row"><i class="spin" style="color:var(--accent)"></i><span>The agent is working · ${r.steps} model call${r.steps === 1 ? "" : "s"}</span></div>`;
     else main += verdictHtml(r) + (r.flags?.length ? `<div class="stack" style="gap:6px"><h3>The auditor will see these flags</h3><ul class="flags">${r.flags.map(f => `<li>${esc(f)}</li>`).join("")}</ul></div>` : "") + facts(r.manifest);
     if (r.status === "awaiting_release") main += `<div class="stack" data-keep="rel-${r.id}" style="border-top:1px solid var(--line);padding-top:12px">
-      <p class="small muted">Read the answer and the transcript. Releasing sends the verdict, summary and certificate to the auditor. Declining tells them you declined.</p>
+      <p class="small muted">Read the answer and the transcript. Releasing sends the auditor a signed certificate with the verdict (and summary, if the format has one). Declining tells them you declined.</p>
+      <label class="check"><input type="checkbox" id="det-${r.id}"><span>Also release the run details<br><span class="faint small">Run times, the code's tree hash, size and file counts, activity counts (model calls, files read, tokens) and instruction-scan counts. Off: the certificate carries the verdict and the agreed setup only.</span></span></label>
       <label class="f">Note to the auditor (optional)<input type="text" id="note-${r.id}"></label>
       <div class="row"><button class="btn primary" data-act="release" data-run="${r.id}">Release to auditor</button><button class="btn danger" data-act="decline" data-run="${r.id}">Decline</button></div></div>`;
     if (r.status === "released" || r.status === "declined") main += `<p class="small faint">You ${r.status} this ${esc(ago(r.decided_at_ms))}${r.decision_note ? `: “${esc(r.decision_note)}”` : ""}.</p>`;
@@ -614,7 +615,7 @@ document.addEventListener("click", async (e) => {
     "propose-model": () => sapi("/models", { method: "POST", body: { provider: $("#mProv [aria-pressed=true]").dataset.p, model: val("mModel"), api_key: val("mKey"), openrouter_zdr: $("#mZdr")?.checked, openrouter_only: (val("mOnly") || "").split(",").map(s => s.trim()).filter(Boolean), mock_endpoint: val("mMock"), agent: val("mAgent") || "builtin" } }),
     "m-approve": () => sapi(`/models/${b.dataset.id}/decision`, { method: "POST", body: { approve: true, api_key: val("ak-" + b.dataset.id) || undefined, accept_auditor_account: $("#acc-" + b.dataset.id)?.checked || false } }),
     "m-reject": () => sapi(`/models/${b.dataset.id}/decision`, { method: "POST", body: { approve: false } }),
-    "release": () => sapi(`/runs/${b.dataset.run}/release`, { method: "POST", body: { release: true, note: val("note-" + b.dataset.run) } }),
+    "release": () => sapi(`/runs/${b.dataset.run}/release`, { method: "POST", body: { release: true, details: !!$("#det-" + b.dataset.run)?.checked, note: val("note-" + b.dataset.run) } }),
     "decline": () => sapi(`/runs/${b.dataset.run}/release`, { method: "POST", body: { release: false, note: val("note-" + b.dataset.run) } }),
     "followup": () => sapi(`/runs/${b.dataset.run}/followup`, { method: "POST", body: { text: val("fu-" + b.dataset.run), blinded: $("#fub-" + b.dataset.run)?.checked } }),
     "notify": () => sapi("/notify", { method: "POST", body: { email: val("nEmail") } }),

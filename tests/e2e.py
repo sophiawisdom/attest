@@ -273,7 +273,7 @@ def run(work):
     check(out.returncode != 0, "a tampered disclosure is rejected")
 
     print("answer formats")
-    def one_run(text, fmt):
+    def one_run(text, fmt, details=False):
         s = ok("POST", "/api/sessions", body={})
         a, o = Party(s["session_id"], s["auditee_token"]), Party(s["session_id"], s["auditor_token"])
         o.post("/question", {"text": text, "answer_format": fmt})
@@ -287,13 +287,19 @@ def run(work):
         hidden = hidden and not any(e["kind"] == "run_finished" for e in ov["events"]) and ov["last_event_seq"] == max([0] + [e["seq"] for e in ov["events"]])
         st, err = call("POST", f"/api/sessions/{s['session_id']}/runs/{v['runs'][-1]['id']}/followup", o.token, {"text": "x"})
         hidden = hidden and st != 200 and "wait until the current run" in json.dumps(err)
-        a.post(f"/runs/{v['runs'][-1]['id']}/release", {"release": True})
+        a.post(f"/runs/{v['runs'][-1]['id']}/release", {"release": True, "details": details})
         return o.view()["runs"][-1], hidden
     r, hidden = one_run("Does trainer/train.py compute loss on chain-of-thought tokens?", {"kind": "yes_no"})
     check(r["verdict"]["answer"] == "yes" and r["verdict"]["summary"] == "" and r["verdict"]["confidence"] == 0, "yes/no format: the auditor gets only the answer")
     check(hidden, "yes/no format: the auditor can't see when the run finished (status, events, follow-up errors)")
+    m = r["manifest"]
+    check(m["detail"] == "verdict_only" and m["activity"]["llm_calls"] == 0 and m["code"]["tree_sha256"] == "" and m["code"]["file_count"] == 0
+          and m["started_at_ms"] == 0 and m["finished_at_ms"] == 0 and m["instruction_scan"]["whole_bundle"]["files_with_matches"] == 0
+          and m["code"]["commitment_salt"] == "" and "code_tree_sha256" not in r and r["finished_at_ms"] is None, "verdict-only release: no times, code size or hash, activity or scan counts")
+    r, _ = one_run("Does trainer/train.py compute loss on chain-of-thought tokens?", {"kind": "yes_no"}, details=True)
     a = r["manifest"]["activity"]
-    check(all(n == 0 or (n & (n - 1)) == 0 for n in [a["llm_calls"], a["tool_calls"], a["files_read"]]) and a["files_read_commitment"] == "", "yes/no format: activity is coarsened")
+    check(r["manifest"]["detail"] == "full" and r["manifest"]["code"]["file_count"] > 0 and r["code_tree_sha256"], "release with details opens the code commitment")
+    check(all(n == 0 or (n & (n - 1)) == 0 for n in [a["llm_calls"], a["tool_calls"], a["files_read"]]) and a["files_read_commitment"] == "" and r["finished_at_ms"] is None, "yes/no format with details: activity is coarsened, finish time still hidden")
     r, _ = one_run("CHOICE: which option?", {"kind": "choice", "options": ["option a", "option b"]})
     check(r["verdict"]["choice"] == "option b" and r["verdict"]["summary"] == "", "choice format: the auditor gets only the option")
     r, _ = one_run("Does trainer/train.py compute loss on chain-of-thought tokens?", {"kind": "text", "max_bytes": 20})

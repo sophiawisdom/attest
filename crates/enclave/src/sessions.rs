@@ -165,6 +165,10 @@ struct RunState {
     steps: u32,
     trace: Vec<Value>,
     turns: Option<Vec<Turn>>,
+    /// Everything about the finished run, for the auditee. Nothing from it
+    /// reaches the auditor except through `certificate`.
+    full: Option<CertificateBody>,
+    /// Signed at release, with what the auditee chose to release.
     certificate: Option<Certificate>,
     verdict: Option<Verdict>,
     outcome: Option<Outcome>,
@@ -771,7 +775,9 @@ impl Session {
             .as_bool()
             .ok_or_else(|| anyhow!("release (true/false) is required"))?;
         let note = clean(v["note"].as_str());
+        let details = v["details"].as_bool().unwrap_or(false);
         let mut st = self.st.lock().unwrap();
+        let strict = st.questions.last().map(|q| q.answer_format.is_strict());
         let r = st
             .runs
             .iter_mut()
@@ -783,6 +789,12 @@ impl Session {
             r.number,
             r.status
         );
+        if release {
+            let full = r.full.as_ref().ok_or_else(|| anyhow!("run {} has no result", r.number))?;
+            let strict = strict.unwrap_or(false) || full.manifest.question.answer_format.is_strict();
+            let body = public_body(full, details, strict);
+            r.certificate = Some(sign_certificate(ctx, &body)?);
+        }
         r.status = if release { "released" } else { "declined" };
         r.decided_at_ms = Some(now_ms());
         r.decision_note = note.clone();
@@ -898,7 +910,14 @@ impl Session {
     /// in place, and a model is approved, unless that combination already ran.
     fn maybe_start(self: &Arc<Self>, ctx: &Arc<Ctx>, st: &mut State) {
         let Some(q) = st.questions.last() else { return };
-        if q.status != "accepted" || st.runs.iter().any(|r| r.status == "running") {
+        // Not while a run awaits the auditee's decision either: a new run
+        // starting would tell the auditor when the earlier one finished.
+        if q.status != "accepted"
+            || st
+                .runs
+                .iter()
+                .any(|r| r.status == "running" || r.status == "awaiting_release")
+        {
             return;
         }
         let Some(code) = &st.code else { return };
@@ -1034,6 +1053,7 @@ impl Session {
         let history = History {
             prior_runs_in_session: st.runs.len() as u32,
             prior_question_versions: q.version - 1,
+            distinct_prior_code_trees: prior_trees.iter().filter(|t| *t != &bundle.info.tree_sha256).count() as u32,
             prior_code_trees_in_session: prior_trees,
             same_question_text_other_sessions: ctx.store.note_text_run(&text_sha, &self.id),
         };
@@ -1052,6 +1072,7 @@ impl Session {
             steps: 0,
             trace,
             turns: None,
+            full: None,
             certificate: None,
             verdict: None,
             outcome: None,
@@ -1405,7 +1426,7 @@ impl Session {
             .ok_or_else(|| anyhow!("disclosure {number} is a draft; publish it first"))
     }
 
-    pub fn certificate(&self, role: Role, run_id: &str) -> Result<Certificate> {
+    pub fn certificate(&self, ctx: &Ctx, role: Role, run_id: &str) -> Result<Certificate> {
         let st = self.st.lock().unwrap();
         let r = st
             .runs
@@ -1417,10 +1438,21 @@ impl Session {
                 r.status == "released",
                 "the auditee has not released this run"
             );
+            return r
+                .certificate
+                .clone()
+                .ok_or_else(|| anyhow!("run {} has no certificate", r.number));
         }
-        r.certificate
-            .clone()
-            .ok_or_else(|| anyhow!("run {} has not finished", r.number))
+        // The auditee gets what was released, or before that (or after a
+        // decline) a certificate of everything, theirs to keep or share.
+        if let Some(c) = &r.certificate {
+            return Ok(c.clone());
+        }
+        let full = r
+            .full
+            .as_ref()
+            .ok_or_else(|| anyhow!("run {} has not finished", r.number))?;
+        sign_certificate(ctx, full)
     }
 }
 
@@ -1580,21 +1612,12 @@ impl RunJob {
             },
             history: self.history.clone(),
             outcome: out.outcome.clone(),
+            detail: "full".into(),
         };
-        let mut manifest = manifest;
-        if self.question.answer_format.is_strict() {
-            minimize_for_strict_format(&mut manifest);
-        }
         let body = CertificateBody {
             manifest,
             verdict: out.verdict.clone(),
         };
-        let certificate =
-            sign::sign(&self.ctx.signing, DOMAIN_CERTIFICATE, &body).map(|signed| Certificate {
-                enclave_info_json: self.ctx.info_json.clone(),
-                boot_document_b64: self.ctx.boot_doc_b64.clone(),
-                signed,
-            });
 
         let mut st = self.session.st.lock().unwrap();
         let Some(r) = st.runs.iter_mut().find(|r| r.id == self.run_id) else {
@@ -1605,10 +1628,7 @@ impl RunJob {
         r.turns = Some(out.turns);
         r.verdict = out.verdict.clone();
         r.outcome = Some(out.outcome.clone());
-        match certificate {
-            Ok(c) => r.certificate = Some(c),
-            Err(e) => crate::log(&format!("run {}: signing failed: {e:#}", self.run_id)),
-        }
+        r.full = Some(body);
         let n = self.number;
         // The outcome (verdict, step limit, failure) is model-controlled, so
         // it stays out of the event text, which can go out by email.
@@ -1658,6 +1678,51 @@ fn minimize_for_strict_format(m: &mut Manifest) {
     }
 }
 
+/// What the auditor gets. By default only the verdict: everything else the
+/// code or the model could have shaped (run times, the code's tree hash and
+/// size, activity and instruction-scan counts, earlier code trees, error
+/// text) is left out. With `details` the auditee releases the full record,
+/// coarsened as before for strict answer formats.
+fn public_body(full: &CertificateBody, details: bool, strict: bool) -> CertificateBody {
+    let mut b = full.clone();
+    let m = &mut b.manifest;
+    if details {
+        m.detail = "full".into();
+        if strict {
+            minimize_for_strict_format(m);
+        }
+        return b;
+    }
+    m.detail = "verdict_only".into();
+    m.started_at_ms = 0;
+    m.finished_at_ms = 0;
+    m.code = CodeInfo {
+        tree_sha256: String::new(),
+        file_count: 0,
+        text_file_count: 0,
+        total_bytes: 0,
+        uploaded_at_ms: 0,
+        commitment_sha256: m.code.commitment_sha256.clone(),
+        commitment_salt: String::new(),
+    };
+    m.activity = Activity::default();
+    m.instruction_scan = InstructionScan::default();
+    m.history.prior_code_trees_in_session.clear();
+    m.history.same_question_text_other_sessions = 0;
+    if let Outcome::Error { message } = &mut m.outcome {
+        *message = "details withheld".into();
+    }
+    b
+}
+
+fn sign_certificate(ctx: &Ctx, body: &CertificateBody) -> Result<Certificate> {
+    Ok(Certificate {
+        enclave_info_json: ctx.info_json.clone(),
+        boot_document_b64: ctx.boot_doc_b64.clone(),
+        signed: sign::sign(&ctx.signing, DOMAIN_CERTIFICATE, body)?,
+    })
+}
+
 /// Whether the auditor may see that a run finished (as opposed to its
 /// result, which is always gated on release). With strict formats they may
 /// not: how long a run takes is model-controlled and would be a side channel.
@@ -1688,19 +1753,40 @@ fn run_view(r: &RunState, role: Role, st: &State) -> Value {
         "started_at_ms": r.started_at_ms, "finished_at_ms": r.finished_at_ms, "decided_at_ms": r.decided_at_ms,
         "decision_note": r.decision_note,
     });
-    if role == Role::Auditor && r.status == "awaiting_release" && !auditor_sees_finish(st, r) {
-        v["status"] = json!("running");
+    if role == Role::Auditor {
+        // Run duration is model-controlled: the auditor never sees when a
+        // run finished, only the auditee's decision.
         v["finished_at_ms"] = Value::Null;
+        if r.status == "awaiting_release" && !auditor_sees_finish(st, r) {
+            v["status"] = json!("running");
+        }
     }
-    let visible_result = role == Role::Auditee || r.status == "released";
-    if visible_result {
+    if role == Role::Auditee {
         v["code_tree_sha256"] = json!(r.tree);
         v["verdict"] = json!(r.verdict);
         v["outcome"] = json!(r.outcome);
+        v["has_certificate"] = json!(r.full.is_some());
+        if let Some(body) = &r.full {
+            v["flags"] = json!(attest_core::verify::manifest_warnings(&body.manifest));
+            v["manifest"] = json!(body.manifest);
+        }
+        if let Some(c) = &r.certificate {
+            if let Ok(body) = serde_json::from_str::<CertificateBody>(&c.signed.body) {
+                v["released_detail"] = json!(body.manifest.detail);
+            }
+        }
+    } else if r.status == "released" {
+        // Everything the auditor sees about the result comes from the
+        // signed certificate the auditee released, and nothing else.
         v["has_certificate"] = json!(r.certificate.is_some());
         if let Some(c) = &r.certificate {
             if let Ok(body) = serde_json::from_str::<CertificateBody>(&c.signed.body) {
+                v["verdict"] = json!(body.verdict);
+                v["outcome"] = json!(body.manifest.outcome);
                 v["flags"] = json!(attest_core::verify::manifest_warnings(&body.manifest));
+                if !body.manifest.verdict_only() {
+                    v["code_tree_sha256"] = json!(body.manifest.code.tree_sha256);
+                }
                 v["manifest"] = json!(body.manifest);
             }
         }

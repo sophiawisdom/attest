@@ -24,9 +24,12 @@ endpoints), the visibility rules above, and that the analysed code matches the
 tree hash in the affidavit.
 
 Disclosed in the signed certificate: who chose the model and key, the key's
-organization as the provider reports it, which model answered, earlier runs,
-question revisions and code changes in the session, blinded messages (by
-hash), and counts of instruction-like text in the code.
+organization as the provider reports it, which model answered and which
+host served it, earlier runs, question revisions and whether the code
+changed in the session, and blinded messages (by hash). By default that and
+the verdict are all: nothing else the code or the model could have shaped
+(run times, the code's hash and size, activity and instruction-scan counts,
+error text). The auditee can choose to release those details too.
 
 ## Layout
 

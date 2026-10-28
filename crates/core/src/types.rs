@@ -250,6 +250,24 @@ pub struct Manifest {
     pub instruction_scan: InstructionScan,
     pub history: History,
     pub outcome: Outcome,
+    /// What the auditee released: "verdict_only" (the default) or "full".
+    /// A verdict-only certificate leaves out everything the code or the
+    /// model could have shaped besides the verdict: run times, the code's
+    /// tree hash, size and file counts (the commitment stays unopened),
+    /// activity counts, instruction-scan counts, earlier code trees and
+    /// error details. Those fields are then zero or empty.
+    #[serde(default = "full_detail")]
+    pub detail: String,
+}
+
+fn full_detail() -> String {
+    "full".into()
+}
+
+impl Manifest {
+    pub fn verdict_only(&self) -> bool {
+        self.detail == "verdict_only"
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -500,6 +518,12 @@ pub struct History {
     /// Runs of identical question text in other sessions on this enclave
     /// boot (a cheap probe-from-another-session signal).
     pub same_question_text_other_sessions: u32,
+    /// How many different code versions, other than this run's, earlier
+    /// runs in this session used: more than zero means the code changed
+    /// between attempts. Kept in verdict-only certificates, which leave
+    /// out the tree hashes themselves.
+    #[serde(default)]
+    pub distinct_prior_code_trees: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

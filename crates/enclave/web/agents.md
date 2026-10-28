@@ -48,7 +48,8 @@ is written for an agent to follow, and takes one script.
    response includes `tree_sha256`, a hash of every (path, content) pair, and
    `commitment_sha256`, a salted hash of the tree. Before a result is
    released the auditor sees only the commitment, not the tree hash, file
-   count or size; each released certificate reveals the salt and tree.
+   count or size. A certificate opens it only if the auditee releases the
+   run details (step 8).
 4. The auditee confirms the affidavit: `POST /api/sessions/ID/affidavit`
    `{"organization": "...", "repo_url": "...", "git_commit": "...", "tree_sha256": "..."}`.
    The statement says the upload is the production code at that commit, and
@@ -89,9 +90,17 @@ is written for an agent to follow, and takes one script.
 7. The run ends with a verdict: `yes`, `no`, `inconclusive`, or
    `needs_clarification` (with a `clarification_request` for the auditor).
 8. The auditee decides: `POST /api/sessions/ID/runs/RUN_ID/release`
-   `{"release": true|false, "note": "optional"}`. On release the auditor sees
-   the verdict and can fetch the signed certificate. On decline the auditor
-   sees that it was declined, and the note.
+   `{"release": true|false, "details": false, "note": "optional"}`. On release
+   the auditor sees the verdict and can fetch the signed certificate. By
+   default it is verdict-only: the question, the affidavit, the agreed model
+   and harness, run and question counts, whether the code changed between
+   runs, and the verdict. Nothing else the code or the model could have
+   shaped: no run times, no tree hash or code size (the commitment stays
+   closed), no activity or instruction-scan counts, no error text. With
+   `"details": true` the auditee releases all of those too. On decline the
+   auditor sees that it was declined, and the note. A new run doesn't start
+   while one awaits this decision. The auditee can fetch a certificate of
+   the full record at any time from the same `certificate` route.
 9. After that decision, the auditor can send a follow-up message that
    continues the same conversation: `POST /api/sessions/ID/runs/RUN_ID/followup`
    `{"text": "...", "blinded": false}`. A blinded message is hidden from the
@@ -137,13 +146,13 @@ The auditee can follow a run live with `GET /api/sessions/ID/runs/RUN_ID/trace?a
 | | auditee | auditor |
 |---|---|---|
 | question and its versions, decisions, notes | yes | yes |
-| code | metadata only (it's theirs) | a salted commitment only; each released certificate opens it |
+| code | metadata only (it's theirs) | a salted commitment only, opened only if the auditee releases run details |
 | affidavit | yes | yes |
 | model proposals (provider, model, who proposed) | yes | yes |
 | API keys | never | never |
 | live agent trace | yes | no |
-| run status | yes, with step count | only "running" until the auditee decides |
-| verdict and certificate | always | only after release |
+| run status | yes, with step count | only "running" until the auditee decides; never when a run finished |
+| verdict and certificate | always, with every detail | only after release: verdict-only unless the auditee adds details |
 | follow-up message text | unless blinded | yes |
 
 The server operator's machine (the enclave's parent) stores uploaded files,

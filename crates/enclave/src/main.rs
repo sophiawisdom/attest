@@ -755,7 +755,7 @@ async fn session_route(
             ok(s.followup(ctx, role, rid, &body_json(req).await?)?)
         }
         ("GET", ["runs", rid, "certificate"]) => {
-            ok(serde_json::to_value(s.certificate(role, rid)?).map_err(anyhow::Error::from)?)
+            ok(serde_json::to_value(s.certificate(ctx, role, rid)?).map_err(anyhow::Error::from)?)
         }
         ("POST", ["disclosures"]) => ok(s
             .draft_disclosure(ctx, role, &body_json(req).await?)

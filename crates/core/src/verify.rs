@@ -128,7 +128,12 @@ pub fn verify_certificate(
     if m.boot_id != enclave.info.boot_id {
         bail!("manifest boot id does not match the enclave that signed it");
     }
-    if m.code.commitment_sha256 != code_commitment(&m.code.commitment_salt, &m.code.tree_sha256) {
+    if m.verdict_only() {
+        // The commitment stays closed: no tree or salt to check it against.
+        if !m.code.tree_sha256.is_empty() || !m.code.commitment_salt.is_empty() {
+            bail!("a verdict-only certificate must not open the code commitment");
+        }
+    } else if m.code.commitment_sha256 != code_commitment(&m.code.commitment_salt, &m.code.tree_sha256) {
         bail!("the code commitment shown before release does not open to this tree");
     }
     if crate::sha256_hex(m.question.text.as_bytes()) != m.question.text_sha256 {
@@ -207,6 +212,9 @@ fn categories(c: &ScanCounts) -> String {
 /// are what the parties chose or what happened.
 pub fn manifest_warnings(m: &Manifest) -> Vec<String> {
     let mut w = Vec::new();
+    if m.verdict_only() {
+        w.push("the auditee released the verdict only: no run times, code size or tree hash, activity, or instruction-scan counts".into());
+    }
     match &m.outcome {
         Outcome::Completed => {}
         Outcome::StepLimit => w.push("the agent hit its step limit before answering".into()),
@@ -275,7 +283,8 @@ pub fn manifest_warnings(m: &Manifest) -> Vec<String> {
         .prior_code_trees_in_session
         .iter()
         .filter(|c| *c != &m.code.tree_sha256)
-        .count();
+        .count()
+        .max(h.distinct_prior_code_trees as usize);
     if other_trees > 0 {
         w.push(format!("the code changed between runs: {other_trees} other version(s) were used earlier in this session"));
     }
@@ -293,7 +302,7 @@ pub fn manifest_warnings(m: &Manifest) -> Vec<String> {
             categories(s)
         ));
     }
-    if m.activity.files_read == 0 {
+    if m.activity.files_read == 0 && !m.verdict_only() {
         w.push("the agent read no files".into());
     }
     if m.affidavit.git_commit.is_none() {
