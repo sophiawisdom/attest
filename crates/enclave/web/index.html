@@ -218,27 +218,34 @@ async function loadInfo() {
   if (!i) { chip.innerHTML = `<i class="dot bad"></i><span class="t">Enclave unreachable</span>`; return; }
   const dev = i.mode === "dev";
   if (LOCAL && !dev) { chip.innerHTML = `<i class="dot ok"></i><span class="t">Checked by attest open · PCR0 ${esc((LOCAL.pcr0 || "").slice(0, 8))}</span>`; return; }
-  chip.innerHTML = `<i class="dot warn"></i><span class="t">${dev ? "Dev mode · not attested" : `Nitro enclave · ${esc(i.source_commit.slice(0, 7))} · not checked by this browser`}</span>`;
+  chip.innerHTML = `<i class="dot${dev ? " warn" : ""}"></i><span class="t">${dev ? "Dev mode · not attested" : `Nitro enclave · ${esc(i.source_commit.slice(0, 7))} · <u>verify</u>`}</span>`;
 }
 function verifyPanel() {
   const i = S.info; if (!i) return "";
-  const host = new URL(ORIGIN).host;
-  const how = LOCAL && i.mode !== "dev"
-    ? `<div class="callout info"><span class="ic">✓</span><span>You opened this through <code>attest open</code>. It checked the attestation (measurements ${esc(LOCAL.measurements || "as given")}), and every API call goes over a TLS session it checked ends inside this enclave.</span></div>`
-    : `<p class="small muted">A browser can't check which server it's really talking to: whoever controls this address could get their own TLS certificate and serve a different page that copies your link, code or keys. Before uploading code or entering a key, open the session through the local client, which checks the enclave first:</p>
-    <div class="linkbox"><input type="text" readonly value="${esc(openCmd())}"><button class="btn" data-copy="${esc(openCmd())}">Copy</button></div>`;
+  const host = new URL(ORIGIN).host, commit = i.source_commit || "";
+  const install = "cargo install --git https://github.com/sophiawisdom/attest attest-cli";
+  const check = `attest verify-service https://${host}`;
+  const line = (cmd) => `<div class="linkbox"><input type="text" readonly value="${esc(cmd)}"><button class="btn" data-copy="${esc(cmd)}">Copy</button></div>`;
+  const how = i.mode === "dev" ? `<div class="callout warn"><span class="ic">!</span><span>Dev mode: nothing is attested. For testing only.</span></div>`
+    : LOCAL ? `<div class="callout info"><span class="ic">✓</span><span>Verified. You opened this through <code>attest open</code>, which checked the enclave against the measurements ${esc(LOCAL.measurements || "you gave it")}. Every request from this page goes over a connection it checked ends inside the enclave.</span></div>`
+    : `<p class="small muted">This server runs in an AWS Nitro enclave: a sealed machine that can prove which software it runs. Nobody can see inside it, including whoever operates it. You can check that proof yourself:</p>
+    <ol class="steps small">
+      <li>Install the client (needs <a href="https://rustup.rs" target="_blank" rel="noopener">Rust</a>):${line(install)}</li>
+      <li>Check the server. This confirms it runs exactly the published source at commit <code>${esc(commit.slice(0, 7))}</code>, and that connections to it end inside the enclave:${line(check)}</li>
+      <li>Before connecting anything sensitive, open your session through the client. It checks the enclave first and then serves this page locally:${line(openCmd())}</li>
+    </ol>
+    <p class="small faint">Why not just trust this page? A browser checks the address, not the software behind it: whoever controls the address could serve a lookalike page.</p>`;
   return `<div class="panel pad stack" id="verify">
     <h3>Verify this service</h3>
-    ${i.mode === "dev" ? `<div class="callout warn"><span class="ic">!</span><span>Dev mode: nothing is attested. For testing only.</span></div>` : ""}
     ${how}
     <dl class="kv">
-      <dt>source</dt><dd><a href="${esc(i.source_repo)}/tree/${esc(i.source_commit)}" target="_blank" rel="noopener">${esc(i.source_commit.slice(0, 12))}</a></dd>
+      <dt>source</dt><dd><a href="${esc(i.source_repo)}/tree/${esc(commit)}" target="_blank" rel="noopener">${esc(commit.slice(0, 12))}</a></dd>
+      <dt>measurements</dt><dd><a href="${esc(i.source_repo)}/blob/main/measurements/${esc(commit)}.pcrs.json" target="_blank" rel="noopener">published</a></dd>
       <dt>boot</dt><dd>${hash(i.boot_id, 8)} · ${esc(ago(i.booted_at_ms))}</dd>
       <dt>TLS key</dt><dd>${i.tls_spki_sha256 ? hash(i.tls_spki_sha256) : "—"}</dd>
       <dt>harness</dt><dd>${esc(i.harness.version)}</dd>
     </dl>
-    <div class="small">Agents: <a href="/agents.md">/agents.md</a> explains the protocol and how to check the attestation.</div>
-    <div class="linkbox"><input type="text" readonly value="attest verify-service https://${esc(host)} --pcrs pcrs.json"><button class="btn" data-copy="attest verify-service https://${esc(host)} --pcrs pcrs.json">Copy</button></div>
+    <div class="small faint">Agents: <a href="/agents.md">/agents.md</a> explains the protocol and how to check the attestation yourself.</div>
   </div>`;
 }
 
@@ -246,12 +253,13 @@ function verifyPanel() {
 function landing() {
   $("#who").innerHTML = "";
   $("#app").innerHTML = `<div class="hero">
-    <h1>Answer questions about your code without showing it.</h1>
-    <p class="lead">An auditor asks a question. A model reads your code inside an attested AWS Nitro enclave and answers. You watch everything it does and decide whether the auditor sees the answer. Neither side sees the other's API key. Apart from you, only the model provider you approve receives the code.</p>
+    <h1>Prove it without showing it.</h1>
+    <p class="lead">You want to prove something to someone without handing over your information. Give an AI agent access to all of it (code, Slack, email, bank accounts, any API) inside a sealed, verifiable machine. They ask it questions. Every answer comes to you first, and goes out only if you release it.</p>
+    <p class="lead" style="font-size:15px">Nobody else sees your information: not the other party, and not whoever runs this server. Only the model provider you approve receives what the agent reads.</p>
     <div class="steps3">
       <div class="panel s"><b>1. Start a session</b><span class="muted small">Either side can start. Your session page shows a link to send the other party over a channel you already trust, such as Signal.</span></div>
-      <div class="panel s"><b>2. Agree on the question</b><span class="muted small">The auditor asks; the auditee accepts, connects what the agent may look at (code, Slack, email, bank data, any API), and approves the model.</span></div>
-      <div class="panel s"><b>3. Release or decline</b><span class="muted small">You read the result and the full transcript first. The auditor gets a signed certificate if you release it.</span></div>
+      <div class="panel s"><b>2. Connect and ask</b><span class="muted small">The auditee connects what the agent may look at. The auditor asks a question; the auditee accepts it and approves the model.</span></div>
+      <div class="panel s"><b>3. Release or decline</b><span class="muted small">The auditee reads each answer and everything the agent did first. Released answers come with a signed certificate; declined ones never leave.</span></div>
     </div>
     <div id="created">${S.info && S.info.open === false
       ? `<div class="stack"><p class="small muted">This server is private: only its operator starts sessions. Anyone the operator sends a session link to can take part.</p>
@@ -265,7 +273,7 @@ function landing() {
 function startButtons() {
   return `<div class="stack" style="gap:8px"><b>Start a session as</b>
     <div class="row"><button class="btn primary big" data-act="create" data-role="auditor">The auditor</button><button class="btn primary big" data-act="create" data-role="auditee">The auditee</button></div>
-    <span class="faint small">The auditor asks the question. The auditee owns the code and decides what the auditor sees.</span></div>`;
+    <span class="faint small">The auditor asks the questions. The auditee connects the information and decides which answers go out.</span></div>`;
 }
 async function createSession(btn) {
   await busy(btn, async () => {
@@ -342,7 +350,7 @@ function renderQuestion(v) {
   const q = v.questions[v.questions.length - 1];
   const older = v.questions.slice(0, -1).reverse();
   let body = "";
-  if (!q) body += `<p class="muted">${isAuditee() ? "Waiting for the auditor to ask a question." : "Ask something the code can answer. Be specific about what counts as yes."}</p>`;
+  if (!q) body += `<p class="muted">${isAuditee() ? "Waiting for the auditor to ask a question." : "Ask something the connected information can answer. Be specific about what counts as yes."}</p>`;
   else body += `<div class="stack" style="gap:8px"><div class="row">${statusPill(q.status)}<span class="faint small">version ${q.version} · ${esc(ago(q.asked_at_ms))} · step limit ${q.max_steps}${q.allow_fine_tuned ? " · fine-tuned models allowed" : ""}</span></div>
     <p class="qtext">${esc(q.text)}</p><div class="pills"><span class="pill">answer: <b>${esc(formatLabel(q.answer_format))}</b></span></div>${q.note ? `<div class="callout ${q.status === "rejected" ? "bad" : "info"}"><span class="ic">“</span><span>${esc(q.note)}</span></div>` : ""}</div>`;
   if (isAuditee() && q?.status === "proposed") {
@@ -548,7 +556,7 @@ function renderModel(v) {
       ${isAuditee() && m.status === "pending" ? `<div class="row"><button class="btn danger" data-act="m-reject" data-id="${m.id}">Reject</button></div>` : ""}
     </div>${m.note ? `<div class="small faint">“${esc(m.note)}”</div>` : ""}
     ${isAuditee() && m.status === "pending" ? `<div class="stack" data-keep="approve-${m.id}" style="gap:8px;padding:10px 12px;background:var(--sunken);border-radius:8px">
-      ${m.has_key ? `<div class="callout warn small"><span class="ic">!</span><span>This uses <b>the auditor's own provider account</b>. Their account can log everything the model sees, including your code. Safer: use your own key.</span></div>` : `<p class="small muted">The auditor proposed this model without a key. Approve it with your own API key.</p>`}
+      ${m.has_key ? `<div class="callout warn small"><span class="ic">!</span><span>This uses <b>the auditor's own provider account</b>. Their account can log everything the model sees, including everything the agent reads. Safer: use your own key.</span></div>` : `<p class="small muted">The auditor proposed this model without a key. Approve it with your own API key.</p>`}
       <label class="f">Your API key${m.has_key ? " (optional, replaces theirs)" : ""}${m.provider === "vertex" ? " (service-account key file, JSON)" : ""}<input type="password" id="ak-${m.id}" autocomplete="off" placeholder="sk-…"></label>
       ${["bedrock", "vertex", "azure"].includes(m.provider) ? `<p class="faint small">With your own key, also give your own ${m.provider === "bedrock" ? "region" : m.provider === "vertex" ? "project and location" : "resource"}: on a cloud it decides whose account the requests reach. Proposed: ${esc(m.endpoint || "")}</p>${cloudFields("a" + m.id, m.provider, m.params)}` : ""}
       ${m.has_key ? `<label class="check"><input type="checkbox" id="acc-${m.id}"><span>Use the auditor's key anyway; I accept their account may see my code</span></label>` : ""}

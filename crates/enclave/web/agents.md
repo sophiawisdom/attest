@@ -311,7 +311,7 @@ Do this before uploading code or trusting a result.
    reproducible, so you get the same `pcrs.json`. Published values are in
    `measurements/` in the repository.
 
-The CLI does all of this: `attest verify-service https://HOST --pcrs pcrs.json`.
+The CLI does all of this: `attest verify-service https://HOST` (it fetches the measurements published for the commit the server names; `--pcrs FILE` uses your own).
 
 **If a person will use the web app,** checking the service yourself doesn't
 protect them: their browser makes its own TLS connection, and whoever

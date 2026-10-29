@@ -37,6 +37,37 @@ struct State {
     local_host: String,
 }
 
+/// The policy to check a server with. Without --pcrs, the measurements
+/// published in `measurements_repo` for the commit the server names. (The
+/// server's claim only picks which file to fetch; the attestation is what
+/// gets checked against it.) Also says where the measurements came from.
+pub async fn expected_policy(conn: &mut Conn, measurements_repo: &str, args: &PolicyArgs) -> Result<(EnclavePolicy, String)> {
+    let mut policy = args.policy()?;
+    let mut source = match &args.pcrs {
+        Some(p) => format!("from {}", p.display()),
+        None => String::new(),
+    };
+    if policy.expected.is_none() && !policy.skip_measurement && !args.allow_dev {
+        let info = conn.call("GET", "/api/info", None, None).await?;
+        let commit = info["source_commit"].as_str().unwrap_or("");
+        if info["mode"] == "dev" {
+            bail!("this is a dev-mode server: nothing is attested (pass --allow-dev to accept it anyway)");
+        }
+        if commit.len() != 40 || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!("the server reported no source commit; pass --pcrs");
+        }
+        let url = format!(
+            "https://raw.githubusercontent.com/{measurements_repo}/main/measurements/{commit}.pcrs.json"
+        );
+        let body = https_get(&url)
+            .await
+            .with_context(|| format!("fetching published measurements for {commit} (or pass --pcrs)"))?;
+        policy.expected = Some(ExpectedPcrs::from_json(std::str::from_utf8(&body)?)?);
+        source = format!("published in github.com/{measurements_repo} for commit {}", &commit[..12]);
+    }
+    Ok((policy, source))
+}
+
 pub async fn open(
     link: &str,
     port: u16,
@@ -51,31 +82,7 @@ pub async fn open(
     base.set_fragment(None);
     let mut conn = Conn::open(&base).await?;
 
-    let mut policy = args.policy()?;
-    let mut source = match &args.pcrs {
-        Some(p) => format!("from {}", p.display()),
-        None => String::new(),
-    };
-    if policy.expected.is_none() && !policy.skip_measurement && !args.allow_dev {
-        // The server's claim about its commit only picks which published
-        // measurements to fetch; the attestation is what gets checked.
-        let info = conn.call("GET", "/api/info", None, None).await?;
-        let commit = info["source_commit"].as_str().unwrap_or("");
-        if info["mode"] == "dev" {
-            bail!("this is a dev-mode server: nothing is attested (pass --allow-dev to open it anyway)");
-        }
-        if commit.len() != 40 || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
-            bail!("the server reported no source commit; pass --pcrs");
-        }
-        let url = format!(
-            "https://raw.githubusercontent.com/{measurements_repo}/main/measurements/{commit}.pcrs.json"
-        );
-        let body = https_get(&url)
-            .await
-            .with_context(|| format!("fetching published measurements for {commit} (or pass --pcrs)"))?;
-        policy.expected = Some(ExpectedPcrs::from_json(std::str::from_utf8(&body)?)?);
-        source = format!("published in github.com/{measurements_repo} for commit {}", &commit[..12]);
-    }
+    let (policy, source) = expected_policy(&mut conn, measurements_repo, args).await?;
 
     let v = conn.attest(&policy).await?;
     crate::print_enclave(&v);

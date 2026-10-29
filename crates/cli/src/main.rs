@@ -66,6 +66,10 @@ enum Cmd {
     /// and that TLS to it terminates inside that enclave.
     VerifyService {
         url: String,
+        /// Where to fetch published measurements when --pcrs isn't given
+        /// (a GitHub owner/repo with a measurements/ directory).
+        #[arg(long, default_value = local::MEASUREMENTS_REPO)]
+        measurements_repo: String,
         #[command(flatten)]
         policy: PolicyArgs,
         #[arg(long)]
@@ -405,10 +409,11 @@ fn print_enclave(v: &VerifiedEnclave) {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::VerifyService { url, policy, json } => {
+        Cmd::VerifyService { url, measurements_repo, policy, json } => {
             let base = url::Url::parse(&url).context("URL")?;
             let mut c = Conn::open(&base).await?;
-            let v = c.attest(&policy.policy()?).await?;
+            let (expected, source) = local::expected_policy(&mut c, &measurements_repo, &policy).await?;
+            let v = c.attest(&expected).await?;
             if json {
                 println!(
                     "{}",
@@ -418,6 +423,9 @@ async fn main() -> Result<()> {
                 );
             } else {
                 print_enclave(&v);
+                if !source.is_empty() {
+                    println!("expected  measurements {source}");
+                }
             }
         }
 
