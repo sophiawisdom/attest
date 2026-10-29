@@ -787,8 +787,13 @@ async fn body_json(req: Request<hyper::body::Incoming>) -> Result<Value, ApiErro
 
 async fn handle(app: Arc<App>, req: Request<hyper::body::Incoming>) -> Resp {
     let path = req.uri().path().to_string();
-    let method = req.method().as_str().to_string();
+    let mut method = req.method().as_str().to_string();
     let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+    // HEAD on a page answers as GET would (hyper drops the body), for link
+    // checkers and `curl -I`. The API stays GET-only.
+    if method == "HEAD" && parts.first() != Some(&"api") {
+        method = "GET".into();
+    }
     // A request that may change session state holds the ownership lock
     // (shared) to the end, so a handoff waits for it, and checks `moved`
     // only once it holds it.
