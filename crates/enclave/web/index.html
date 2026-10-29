@@ -218,7 +218,8 @@ async function loadInfo() {
   if (!i) { chip.innerHTML = `<i class="dot bad"></i><span class="t">Enclave unreachable</span>`; return; }
   const dev = i.mode === "dev";
   if (LOCAL && !dev) { chip.innerHTML = `<i class="dot ok"></i><span class="t">Checked by attest open · PCR0 ${esc((LOCAL.pcr0 || "").slice(0, 8))}</span>`; return; }
-  chip.innerHTML = `<i class="dot${dev ? " warn" : ""}"></i><span class="t">${dev ? "Dev mode · not attested" : `Nitro enclave · ${esc(i.source_commit.slice(0, 7))} · <u>verify</u>`}</span>`;
+  if (!dev) { chip.hidden = true; return; }
+  chip.innerHTML = `<i class="dot warn"></i><span class="t">Dev mode · not attested</span>`;
 }
 function verifyPanel() {
   const i = S.info; if (!i) return "";
