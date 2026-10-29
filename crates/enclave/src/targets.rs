@@ -109,7 +109,9 @@ impl Target {
                 let (h, p) = mock
                     .and_then(|m| m.rsplit_once(':'))
                     .ok_or_else(|| anyhow!("mock endpoint must be host:port"))?;
-                Target { mock_port: Some(p.parse()?), ..t(h.to_string(), Wire::Openai) }
+                // A "claude…" model speaks Anthropic's API (for Claude Code in tests).
+                let wire = if m.starts_with("claude") { Wire::Anthropic } else { Wire::Openai };
+                Target { mock_port: Some(p.parse()?), ..t(h.to_string(), wire) }
             }
             Provider::Bedrock => {
                 let region = label(

@@ -186,6 +186,24 @@ is written for an agent to follow, and takes one script.
    `submit_verdict`. It has no shell and no network access. Its system prompt
    is fixed in the image (hash in `/api/info`). The jailed agents (step 4)
    get a shell instead.
+   Tool-call approval (optional, auditee): `POST /api/sessions/ID/tool-approval`
+   `{"enabled": true}` makes every tool call of later runs wait for the
+   auditee's decision, with any agent (built-in, Claude Code, Codex, pi). The
+   auditee's agent long-polls `GET /api/sessions/ID/tool-calls?wait=25`
+   (returns `{"pending": [{"id", "run_number", "agent", "tool", "input",
+   "deadline_ms"}, ...]}` as soon as something waits) and answers each with
+   `POST /api/sessions/ID/tool-calls/CALL_ID` `{"approve": true|false,
+   "reason": "..."}`; the reason is shown to the agent. A call without a
+   decision within 15 minutes is denied. The built-in agent asks before each
+   call; Claude Code and Codex ask from a pre-tool hook given on their command
+   line, pi from an extension. Codex runs with code mode and subagents off
+   (their inner calls skip hooks) and is told the model is `attest-model`
+   (the enclave sends the approved one). As a backstop, the enclave withholds
+   from the model the result of any call that ran without a decision. The
+   auditor's view shows `tool_approval: true`; certificates carry
+   `tool_approval` with counts of approved, denied and withheld calls, and the
+   verifier warns that denials can keep evidence from the agent.
+
 6. The run ends with a verdict: `yes`, `no`, `inconclusive`, or
    `needs_clarification` (with a `clarification_request` for the auditor).
 7. The auditee decides: `POST /api/sessions/ID/runs/RUN_ID/release`

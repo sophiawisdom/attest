@@ -62,6 +62,12 @@ struct Upstream {
     seen_items: Mutex<std::collections::HashMap<String, (usize, String)>>,
     /// One upstream request at a time.
     inflight: tokio::sync::Semaphore,
+    /// With tool-call approval on: where the harness's hook asks, and what
+    /// was decided (approvals.rs).
+    gate: Option<crate::approvals::Gate>,
+    /// A model name the harness may use for the approved model (see
+    /// harnesses::MODEL_ALIAS); replaced before anything goes upstream.
+    alias: Option<String>,
 }
 
 /// What a jailed harness may ask the provider for. Fail closed: unknown
@@ -413,6 +419,8 @@ impl ModelProxy {
         routing: Routing,
         socket_path: &str,
         record: Arc<dyn Fn(Value) + Send + Sync>,
+        gate: Option<crate::approvals::Gate>,
+        alias: Option<String>,
     ) -> Result<Self> {
         let _ = std::fs::remove_file(socket_path);
         let l = tokio::net::UnixListener::bind(socket_path)?;
@@ -432,6 +440,8 @@ impl ModelProxy {
             record,
             inflight: tokio::sync::Semaphore::new(1),
             seen_items: Mutex::new(Default::default()),
+            gate,
+            alias,
         });
         let task = tokio::spawn(async move {
             // Connections live in this set, so dropping the proxy (which
@@ -480,6 +490,23 @@ async fn handle(up: Arc<Upstream>, req: Request<hyper::body::Incoming>) -> Respo
         .unwrap_or("");
     if presented != up.token {
         return reply(StatusCode::UNAUTHORIZED, "wrong proxy token");
+    }
+    // The harness's pre-tool hook asking for a decision (not a model call).
+    if req.uri().path() == "/attest/tool-approval" && req.method() == hyper::Method::POST {
+        let Some(gate) = up.gate.clone() else {
+            return reply(StatusCode::NOT_FOUND, "tool-call approval is off");
+        };
+        let call: Value = match http_body_util::Limited::new(req.into_body(), 4 << 20).collect().await {
+            Ok(b) => serde_json::from_slice(&b.to_bytes()).unwrap_or(Value::Null),
+            Err(_) => return reply(StatusCode::PAYLOAD_TOO_LARGE, "too large"),
+        };
+        let tool: String = call["tool"].as_str().unwrap_or("?").chars().take(100).collect();
+        let d = gate.ask(&tool, &call["input"], call["id"].as_str()).await;
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(json!({"approve": d.approve, "reason": d.reason}).to_string())))
+            .unwrap();
     }
     // Each request is visible to the parent as a size and a time; cap how
     // many a run can make.
@@ -535,6 +562,21 @@ async fn handle(up: Arc<Upstream>, req: Request<hyper::body::Incoming>) -> Respo
         Ok(Ok(b)) => b.to_bytes().to_vec(),
         Ok(Err(_)) => return reply(StatusCode::PAYLOAD_TOO_LARGE, "request too large"),
         Err(_) => return reply(StatusCode::REQUEST_TIMEOUT, "request body too slow"),
+    };
+    // Backstop: the model never sees the result of a call that wasn't decided.
+    let raw = match up.gate.as_ref().and_then(|g| g.withhold_undecided(&raw)) {
+        Some(b) => b,
+        None => raw,
+    };
+    let raw = match &up.alias {
+        Some(a) => match serde_json::from_slice::<Value>(&raw) {
+            Ok(mut v) if v.get("model").and_then(|m| m.as_str()) == Some(a.as_str()) => {
+                v["model"] = json!(up.model);
+                serde_json::to_vec(&v).unwrap_or(raw)
+            }
+            _ => raw,
+        },
+        None => raw,
     };
     let body = match vet_request_routed(&up.target, &harness_path, &up.model, &raw, &up.routing) {
         Ok(b) => b,

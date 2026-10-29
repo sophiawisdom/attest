@@ -114,6 +114,8 @@ pub struct Session {
     written: Mutex<(u64, Option<String>)>,
     /// This session's share of budget::STATES.
     measured: std::sync::atomic::AtomicUsize,
+    /// Tool calls waiting for the auditee's decision (approvals.rs).
+    pub approvals: Arc<crate::approvals::Queue>,
 }
 
 #[derive(Default)]
@@ -135,6 +137,8 @@ struct State {
     disclosures_in_flight: usize,
     /// Services connected for the agent (connections.rs).
     connections: Vec<crate::connections::Connection>,
+    /// The auditee approves each tool call of runs started while this is on.
+    tool_approval: bool,
 }
 
 /// A status: one of a fixed set of strings. (An alias, so serde doesn't
@@ -571,6 +575,7 @@ impl Store {
             dirty: AtomicBool::new(true),
             written: Mutex::new((0, None)),
             measured: Default::default(),
+            approvals: Default::default(),
         });
         map.insert(s.id.clone(), s.clone());
         Ok((s, auditee, auditor))
@@ -903,6 +908,36 @@ impl Session {
         self.event(ctx, &mut st, "connection_added", msg, None, Some(role), false);
         self.maybe_start(ctx, &mut st);
         Ok(serde_json::to_value(&rec)?)
+    }
+
+    /// Turn tool-call approval on or off for runs started from now on.
+    pub fn set_tool_approval(self: &Arc<Self>, ctx: &Arc<Ctx>, role: Role, v: &Value) -> Result<Value> {
+        ensure!(role == Role::Auditee, "only the auditee approves tool calls");
+        let on = v["enabled"].as_bool().ok_or_else(|| anyhow!("enabled must be true or false"))?;
+        let mut st = lock(&self.st);
+        if st.tool_approval != on {
+            st.tool_approval = on;
+            let msg = if on {
+                "The auditee will approve or deny each of the agent's tool calls before it runs (from the next run). Certificates say so, with how many were denied."
+            } else {
+                "The auditee turned off tool-call approval (from the next run)."
+            };
+            self.event(ctx, &mut st, "tool_approval", msg.into(), None, Some(role), false);
+        }
+        Ok(json!({"tool_approval": on}))
+    }
+
+    pub fn tool_approval_on(&self) -> bool {
+        lock(&self.st).tool_approval
+    }
+
+    /// Approve or deny one pending tool call.
+    pub fn decide_tool_call(&self, role: Role, id: u64, v: &Value) -> Result<Value> {
+        ensure!(role == Role::Auditee, "only the auditee approves tool calls");
+        let approve = v["approve"].as_bool().ok_or_else(|| anyhow!("approve must be true or false"))?;
+        let reason: String = v["reason"].as_str().unwrap_or("").chars().take(1000).collect();
+        self.approvals.decide(id, crate::approvals::Decision { approve, reason })?;
+        Ok(json!({"id": id, "approve": approve}))
     }
 
     pub fn remove_connection(self: &Arc<Self>, ctx: &Arc<Ctx>, role: Role, id: u32) -> Result<Value> {
@@ -1482,6 +1517,7 @@ impl Session {
             code: bundle.info.clone(),
             has_code,
             connections: connections.iter().map(|c| c.rec.clone()).collect(),
+            tool_approval: st.tool_approval.then(ToolApproval::default),
             model: model_info.clone(),
             harness: ctx.info.harness.clone(),
             activity: Activity::default(),
@@ -1549,6 +1585,7 @@ impl Session {
         );
 
         let job = RunJob {
+            approval: st.tool_approval,
             session: self.clone(),
             ctx: ctx.clone(),
             run_id: id.clone(),
@@ -1591,6 +1628,11 @@ impl Session {
             })
             .collect();
         let runs: Vec<Value> = st.runs.iter().map(|r| run_view(r, role, &st)).collect();
+        let mut actions = next_actions(&st, role, &self.id);
+        if role == Role::Auditee && !self.approvals.list().is_empty() {
+            actions.insert(0, json!({"action": "decide_tool_calls", "method": "GET", "path": format!("/api/sessions/{}/tool-calls", self.id),
+                "description": "The agent is waiting: approve or deny each pending tool call (POST /api/sessions/ID/tool-calls/CALL_ID with {\"approve\": true|false, \"reason\": \"...\"})."}));
+        }
         json!({
             "session_id": self.id,
             "role": role,
@@ -1613,6 +1655,8 @@ impl Session {
                 a
             }),
             "connections": st.connections.iter().map(|c| &c.rec).collect::<Vec<_>>(),
+            "tool_approval": st.tool_approval,
+            "pending_tool_calls": if role == Role::Auditee { json!(self.approvals.list()) } else { Value::Null },
             "models": st.models.iter().map(|m| m.public()).collect::<Vec<_>>(),
             "runs": runs,
             "disclosures": st.disclosures.iter().filter(|d| role == Role::Auditee || d.status == "published").map(|d| {
@@ -1627,7 +1671,7 @@ impl Session {
             "notify": st.notify.get(&role).cloned().unwrap_or_default(),
             "email_available": ctx.email.is_some(),
             "status": status_line(&st, role),
-            "next_actions": next_actions(&st, role, &self.id),
+            "next_actions": actions,
         })
     }
 
@@ -1964,6 +2008,8 @@ struct RunJob {
         llm::Routing,
     )>,
     harness_prompt: String,
+    /// The auditee approves each tool call.
+    approval: bool,
 }
 
 impl RunJob {
@@ -2039,7 +2085,22 @@ impl RunJob {
         // margin for the jail's own shutdown), and a panic anywhere in them
         // ends the run as failed instead of leaving it "running" forever.
         let deadline = run_time_limit(self.question.max_steps) + Duration::from_secs(120);
-        let work = std::panic::AssertUnwindSafe(self.agent(progress.clone()));
+        let gate = self.approval.then(|| {
+            let s = self.session.clone();
+            let agent = self.harness_job.as_ref().map(|h| h.0.id()).unwrap_or("builtin");
+            crate::approvals::Gate::new(
+                self.session.approvals.clone(),
+                &self.run_id,
+                self.number,
+                agent,
+                Arc::new(move || {
+                    let mut st = lock(&s.st);
+                    s.changed_for(&mut st, Role::Auditee);
+                }),
+                progress.clone(),
+            )
+        });
+        let work = std::panic::AssertUnwindSafe(self.agent(progress.clone(), gate.clone()));
         let out = match tokio::time::timeout(deadline, futures_util::FutureExt::catch_unwind(work)).await {
             Ok(Ok(out)) => out,
             Ok(Err(_)) => failed_output("the run failed inside the enclave (an internal error)"),
@@ -2048,11 +2109,13 @@ impl RunJob {
                 deadline.as_secs() / 60
             )),
         };
-        self.finish(out, started_at_ms, ticker);
+        self.session.approvals.cancel_run(&self.run_id);
+        let counts = gate.map(|g| *g.counts.lock().unwrap());
+        self.finish(out, started_at_ms, ticker, counts);
     }
 
     /// Load the code and run the agent.
-    async fn agent(&self, progress: Arc<dyn Fn(Vec<Value>) + Send + Sync>) -> run::AgentOutput {
+    async fn agent(&self, progress: Arc<dyn Fn(Vec<Value>) + Send + Sync>, gate: Option<crate::approvals::Gate>) -> run::AgentOutput {
         // Load all the code into enclave memory first; from here on the
         // host sees no reads that depend on what the agent does.
         let pin = self.bundle.pin().await;
@@ -2085,6 +2148,7 @@ impl RunJob {
                     &self.question.answer_format,
                     timeout,
                     progress.clone(),
+                    gate,
                 )
                 .await
             }
@@ -2101,6 +2165,7 @@ impl RunJob {
                     self.question.max_steps,
                     &self.question.answer_format,
                     &*progress,
+                    gate.as_ref(),
                 )
                 .await
             }
@@ -2108,7 +2173,7 @@ impl RunJob {
     }
 
     /// Record the run's result and start whatever is queued next.
-    fn finish(self, out: run::AgentOutput, started_at_ms: u64, ticker: AbortOnDrop) {
+    fn finish(self, out: run::AgentOutput, started_at_ms: u64, ticker: AbortOnDrop, approvals: Option<crate::approvals::Counts>) {
         let mut model = self.model_info.clone();
         model.response_models = out.response_models.clone();
         model.upstream_providers = out.upstream_providers.clone();
@@ -2132,6 +2197,7 @@ impl RunJob {
             } else {
                 out.connections.clone()
             },
+            tool_approval: approvals.map(|c| ToolApproval { approved: c.approved, denied: c.denied, timed_out: c.timed_out, withheld: c.withheld }),
             model,
             harness: self.ctx.info.harness.clone(),
             activity: out.activity.clone(),

@@ -284,6 +284,10 @@ pub struct Manifest {
     /// bank data, custom APIs), with what the enclave confirmed about each.
     #[serde(default)]
     pub connections: Vec<ConnectionRecord>,
+    /// Set when the auditee approved or denied each of the agent's tool
+    /// calls before it ran. Denials can keep evidence from the agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_approval: Option<ToolApproval>,
     pub model: ModelInfo,
     pub harness: HarnessInfo,
     pub activity: Activity,
@@ -336,6 +340,18 @@ pub struct ConnectionRecord {
     /// An MCP server's tools the auditee let the agent call.
     #[serde(default)]
     pub tools: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct ToolApproval {
+    pub approved: u32,
+    /// Denied by the auditee, including `timed_out`.
+    pub denied: u32,
+    /// Denied because no decision came within the time limit.
+    pub timed_out: u32,
+    /// Calls the harness ran without asking, whose results the enclave
+    /// withheld from the model.
+    pub withheld: u32,
 }
 
 fn full_detail() -> String {

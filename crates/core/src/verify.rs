@@ -331,6 +331,14 @@ pub fn manifest_warnings(m: &Manifest) -> Vec<String> {
     } else if m.has_code && !m.affidavit.fetched_by_enclave {
         w.push("the code was uploaded: its repository and commit are the auditee's word, not checked by the enclave".into());
     }
+    if let Some(a) = &m.tool_approval {
+        w.push(format!(
+            "the auditee approved each of the agent's tool calls before it ran: {} approved, {} denied{}; a denial can keep evidence from the agent",
+            a.approved,
+            a.denied,
+            if a.timed_out > 0 { format!(" ({} for lack of a decision)", a.timed_out) } else { String::new() }
+        ));
+    }
     let blinded = m.auditor_messages.iter().filter(|x| x.blinded).count();
     if blinded > 0 {
         w.push(format!(

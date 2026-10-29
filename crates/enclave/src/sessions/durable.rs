@@ -82,6 +82,7 @@ struct SnapshotRef<'a> {
     event_counts: [u64; 2],
     disclosures: &'a Vec<DisclosureState>,
     connections: &'a Vec<crate::connections::Connection>,
+    tool_approval: bool,
 }
 
 /// ...and owned, to read it back.
@@ -105,6 +106,8 @@ struct Snapshot {
     disclosures: Vec<DisclosureState>,
     #[serde(default)]
     connections: Vec<crate::connections::Connection>,
+    #[serde(default)]
+    tool_approval: bool,
 }
 
 fn code_name(b: &Bundle) -> String {
@@ -257,6 +260,7 @@ impl Session {
                 event_counts: st.event_counts,
                 disclosures: &st.disclosures,
                 connections: &st.connections,
+                tool_approval: st.tool_approval,
             })?
         };
         let generation = lock(&self.written).0 + 1;
@@ -553,6 +557,7 @@ async fn restore_session(ctx: &Arc<Ctx>, sid: &str, head_ref: &str) -> Result<Ar
         event_counts: snap.event_counts,
         disclosures: snap.disclosures,
         connections: snap.connections,
+        tool_approval: snap.tool_approval,
         disclosures_in_flight: 0,
     };
     // Runs that were going when the state was written can't continue here:
@@ -594,6 +599,7 @@ async fn restore_session(ctx: &Arc<Ctx>, sid: &str, head_ref: &str) -> Result<Ar
         dirty: AtomicBool::new(false),
         written: Mutex::new((head.generation, Some(head_ref.to_string()))),
         measured: (bytes.len() * 2).into(),
+        approvals: Default::default(),
     });
     crate::budget::add(&crate::budget::STATES, bytes.len() * 2);
     {

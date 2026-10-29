@@ -11,6 +11,7 @@ mod acme;
 mod aws;
 mod blobs;
 mod budget;
+mod approvals;
 mod connections;
 mod imap;
 mod mcp;
@@ -1270,6 +1271,19 @@ async fn session_route(
             ok(serde_json::to_value(s.disclosure(role, n)?).map_err(anyhow::Error::from)?)
         }
         ("POST", ["notify"]) => ok(s.set_notify(ctx, role, &body_json(req).await?)?),
+        ("POST", ["tool-approval"]) => ok(s.set_tool_approval(ctx, role, &body_json(req).await?)?),
+        ("GET", ["tool-calls"]) => {
+            if role != attest_core::Role::Auditee {
+                return Err(anyhow!("only the auditee approves tool calls").into());
+            }
+            let wait = q.get("wait").and_then(|w| w.parse::<u64>().ok()).unwrap_or(0).min(55);
+            let pending = s.approvals.wait_list(Duration::from_secs(wait)).await;
+            ok(json!({"tool_approval": s.tool_approval_on(), "pending": pending}))
+        }
+        ("POST", ["tool-calls", cid]) => {
+            let id: u64 = cid.parse().map_err(|_| anyhow!("bad tool call id"))?;
+            ok(s.decide_tool_call(role, id, &body_json(req).await?)?)
+        }
         _ => Err(ApiError(
             StatusCode::NOT_FOUND,
             format!(

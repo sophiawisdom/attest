@@ -39,6 +39,7 @@ pub async fn agent_loop(
     max_steps: u32,
     format: &AnswerFormat,
     progress: &(dyn Fn(Vec<Value>) + Send + Sync),
+    gate: Option<&crate::approvals::Gate>,
 ) -> AgentOutput {
     let owned = tool_schemas(format, has_code, crate::connections::agent_tools(&connections));
     let schemas: Vec<(&str, &str, Value)> = owned.iter().map(|(a, b, c)| (a.as_str(), b.as_str(), c.clone())).collect();
@@ -123,6 +124,11 @@ pub async fn agent_loop(
                     }
                     Err(e) => format!("error: {e}"),
                 }
+            } else if let Some(d) = match gate {
+                Some(g) => Some(g.ask(&call.name, &call.args, Some(&call.id)).await).filter(|d| !d.approve),
+                None => None,
+            } {
+                format!("error: the auditee denied this tool call{}", if d.reason.is_empty() { String::new() } else { format!(": {}", d.reason) })
             } else if let Some(out) = crate::connections::dispatch(&mut conns, &call.name, &call.args).await {
                 out
             } else if !has_code {

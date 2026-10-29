@@ -21,6 +21,16 @@ pub const PI_VERSION: &str = "0.73.1";
 pub const IMAGE_ROOT: &str = "/opt/jailroot";
 /// Loopback port inside the jail's network namespace that reaches the proxy.
 const PROXY_PORT: u16 = 8080;
+/// With tool-call approval, Codex is given this name for the model (the
+/// proxy sends the approved one upstream). For models it knows, Codex's own
+/// metadata turns on code mode, whose nested tool calls run without hooks;
+/// for an unknown name it uses plain tools, each of which has one.
+#[cfg(target_os = "linux")]
+const MODEL_ALIAS: &str = "attest-model";
+/// A pre-tool hook's time limit. A hook that times out lets the call run,
+/// so this is well past the enclave's own decision deadline.
+#[cfg(target_os = "linux")]
+const HOOK_TIMEOUT_SECS: u64 = crate::approvals::DECISION_TIMEOUT.as_secs() + 900;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Agent {
@@ -162,6 +172,7 @@ pub async fn run_agent(
     format: &AnswerFormat,
     timeout: Duration,
     progress: Arc<dyn Fn(Vec<Value>) + Send + Sync>,
+    gate: Option<crate::approvals::Gate>,
 ) -> AgentOutput {
     let fail = |msg: String| AgentOutput {
         connections: vec![],
@@ -178,7 +189,7 @@ pub async fn run_agent(
     {
         let _ = (
             agent, net, run_id, bundle, target, model, api_key, routing, prompt, format, timeout,
-            progress,
+            progress, gate,
         );
         return fail("agent harnesses need a Linux enclave".into());
     }
@@ -210,6 +221,8 @@ pub async fn run_agent(
             routing,
             &socket,
             Arc::new(move |e| p2(vec![e])),
+            gate.clone(),
+            (gate.is_some() && agent == Agent::Codex).then(|| MODEL_ALIAS.to_string()),
         )
         .await
         {
@@ -222,7 +235,7 @@ pub async fn run_agent(
         if let Err(e) = crate::jail::materialize(bundle, &repo).await {
             return fail(format!("preparing the repository: {e:#}"));
         }
-        let (argv, env) = command(agent, &target, model, &proxy.token, prompt);
+        let (argv, env) = command(agent, &target, model, &proxy.token, prompt, gate.is_some());
         let spec = crate::jail::Spec {
             uid: next_uid(),
             cgroup_procs: cgroup.procs_files(),
@@ -324,6 +337,7 @@ fn command(
     model: &str,
     token: &str,
     prompt: String,
+    approval: bool,
 ) -> (Vec<String>, Vec<(String, String)>) {
     let base = format!("http://127.0.0.1:{PROXY_PORT}");
     let mut env: Vec<(String, String)> = vec![
@@ -339,17 +353,44 @@ fn command(
         Agent::Codex => {
             env.push(("CODEX_HOME".into(), "/work".into()));
             env.push(("ATTEST_PROXY_TOKEN".into(), token.into()));
-            vec![
+            let mut v = vec![
                 s("/usr/bin/codex"), s("exec"), s("--skip-git-repo-check"),
                 s("--dangerously-bypass-approvals-and-sandbox"), s("--color"), s("never"),
-                s("-m"), s(model),
+                s("-m"), s(if approval { MODEL_ALIAS } else { model }),
                 s("-c"), s("model_provider=\"attest\""),
                 s("-c"), format!("model_providers.attest={{ name = \"attest\", base_url = \"{base}/v1\", env_key = \"ATTEST_PROXY_TOKEN\", wire_api = \"responses\" }}"),
                 s("-c"), s("check_for_update_on_startup=false"),
                 s("-c"), s("project_doc_max_bytes=0"),
+                // The provider would run web search outside the enclave;
+                // the proxy refuses requests offering it, so don't offer it.
+                s("-c"), s("web_search=\"disabled\""),
                 s("--output-last-message"), s("/work/last-message.txt"),
-                prompt,
-            ]
+            ];
+            if approval {
+                // Codex runs hooks from config only once they're reviewed,
+                // and skips unreviewed ones silently: these come from the
+                // command line, so trust them. The features are forced on
+                // here because a config.toml the agent writes into
+                // CODEX_HOME could turn them off. A hook that times out lets
+                // the call run, so its timeout is well past the enclave's own
+                // decision deadline. Code mode (an `exec` tool running
+                // JavaScript that calls other tools), subagents and goals
+                // are off: code mode runs without a hook, and fewer tools
+                // leave less outside the hooks' view.
+                let cmd = crate::approvals::hook_command("codex", PROXY_PORT).replace('\\', "\\\\").replace('"', "\\\"");
+                v.extend([
+                    s("--dangerously-bypass-hook-trust"),
+                    s("-c"), s("features.hooks=true"),
+                    s("-c"), s("features.codex_hooks=true"),
+                    s("-c"), s("features.multi_agent=false"),
+                    s("-c"), s("features.goals=false"),
+                    s("-c"), s("features.code_mode=false"),
+                    s("-c"), s("features.code_mode_only=false"),
+                    s("-c"), format!("hooks.PreToolUse=[{{matcher=\"*\", hooks=[{{type=\"command\", command=\"{cmd}\", timeout={HOOK_TIMEOUT_SECS}}}]}}]"),
+                ]);
+            }
+            v.push(prompt);
+            v
         }
         Agent::ClaudeCode => {
             for (k, v) in [
@@ -372,9 +413,19 @@ fn command(
                 ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
                 ("DISABLE_AUTOUPDATER", "1"),
                 ("DISABLE_TELEMETRY", "1"),
+                ("ATTEST_PROXY_TOKEN", token),
             ] {
                 env.push((k.into(), v.into()));
             }
+            // With approval, the hook comes in the command-line settings, and
+            // no settings files are read: a user settings file the agent
+            // wrote under /work could otherwise switch all hooks off.
+            let (settings, sources) = if approval {
+                let hook = json!({"type": "command", "command": crate::approvals::hook_command("claude-code", PROXY_PORT), "timeout": HOOK_TIMEOUT_SECS});
+                (json!({"disableSkillShellExecution": true, "hooks": {"PreToolUse": [{"matcher": "*", "hooks": [hook]}]}}).to_string(), "")
+            } else {
+                (r#"{"disableAllHooks":true,"disableSkillShellExecution":true}"#.to_string(), "user")
+            };
             // stream-json goes to stderr, which becomes the live trace.
             vec![
                 s("/bin/sh"),
@@ -390,9 +441,9 @@ fn command(
                 s("--tools"),
                 s("Bash,Read,Edit,Write,Glob,Grep,Agent,TodoWrite"),
                 s("--settings"),
-                s(r#"{"disableAllHooks":true,"disableSkillShellExecution":true}"#),
+                settings,
                 s("--setting-sources"),
-                s("user"),
+                s(sources),
                 s("--strict-mcp-config"),
                 s("--no-session-persistence"),
                 s("--permission-mode"),
@@ -424,18 +475,30 @@ fn command(
                 env.push((k.into(), v.into()));
             }
             env.push(("ATTEST_PI_MODELS".into(), models.to_string()));
-            // pi reads its provider from a file; /work starts empty.
-            vec![
+            env.push(("ATTEST_PROXY_TOKEN".into(), token.into()));
+            // With approval, an extension asks before each tool call. pi
+            // loads it at startup, before the agent can touch /work.
+            let ext = if approval {
+                env.push(("ATTEST_PI_EXT".into(), crate::approvals::hook_script("pi").replace("PORT", &PROXY_PORT.to_string())));
+                " && printf '%s' \"$ATTEST_PI_EXT\" > \"$PI_CODING_AGENT_DIR/attest-approve.js\""
+            } else {
+                ""
+            };
+            let mut v = vec![
                 s("/bin/sh"), s("-c"),
-                s("mkdir -p \"$PI_CODING_AGENT_DIR\" && printf '%s' \"$ATTEST_PI_MODELS\" > \"$PI_CODING_AGENT_DIR/models.json\" && exec /usr/bin/pi \"$@\" 1>&2"),
+                format!("mkdir -p \"$PI_CODING_AGENT_DIR\" && printf '%s' \"$ATTEST_PI_MODELS\" > \"$PI_CODING_AGENT_DIR/models.json\"{ext} && exec /usr/bin/pi \"$@\" 1>&2"),
                 s("sh"),
                 // Text mode: pi's json mode repeats the whole message on every
                 // token. The proxy already records each request in the trace.
                 s("-p"), s("--provider"), s("attest"), s("--model"), s(model),
                 s("--no-session"), s("--no-context-files"), s("--no-extensions"), s("--no-skills"),
                 s("--no-prompt-templates"), s("--no-themes"), s("--offline"),
-                prompt,
-            ]
+            ];
+            if approval {
+                v.extend([s("-e"), s("/work/.pi/agent/attest-approve.js")]);
+            }
+            v.push(prompt);
+            v
         }
     };
     (argv, env)
