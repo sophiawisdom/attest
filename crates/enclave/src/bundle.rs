@@ -893,23 +893,20 @@ fn verdict_schema(format: &attest_core::AnswerFormat) -> serde_json::Value {
     }
 }
 
+/// The agent's tools: the code tools if there's code, then `extra` (the
+/// connected services' tools, connections::agent_tools), then submit_verdict.
 pub fn tool_schemas(
     format: &attest_core::AnswerFormat,
     has_code: bool,
-    connections: &[String],
-) -> Vec<(&'static str, &'static str, serde_json::Value)> {
-    let mut v = if has_code { base_tool_schemas() } else { Vec::new() };
-    if !connections.is_empty() {
-        v.push(("http_request", "Make one HTTP request to a connected service. The enclave adds the credentials; you never see them. Give the path (with any query in `query`), not a full URL. Responses over 40k characters are cut: use the API's paging and filters.",
-            serde_json::json!({"type":"object","properties":{
-                "connection":{"type":"string","enum":connections},
-                "method":{"type":"string","description":"GET, POST, ... (each connection allows some)"},
-                "path":{"type":"string","description":"e.g. /api/conversations.history"},
-                "query":{"type":"object","description":"Query parameters"},
-                "body":{"description":"A JSON object, or a form-encoded string"}
-            },"required":["connection","method","path"]})));
-    }
-    v.push(("submit_verdict", "Finish: record your verdict for the auditor (released only if the auditee approves). It must fit the agreed answer format.", verdict_schema(format)));
+    extra: Vec<(String, String, serde_json::Value)>,
+) -> Vec<(String, String, serde_json::Value)> {
+    let mut v: Vec<(String, String, serde_json::Value)> = if has_code {
+        base_tool_schemas().into_iter().map(|(a, b, c)| (a.to_string(), b.to_string(), c)).collect()
+    } else {
+        Vec::new()
+    };
+    v.extend(extra);
+    v.push(("submit_verdict".into(), "Finish: record your verdict for the auditor (released only if the auditee approves). It must fit the agreed answer format.".into(), verdict_schema(format)));
     v
 }
 

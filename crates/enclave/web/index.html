@@ -68,6 +68,9 @@ p { margin: 0; }
 @keyframes spin { to { transform: rotate(360deg); } }
 label.f { display: flex; flex-direction: column; gap: 6px; font-weight: 500; font-size: 13px; min-width: 0; }
 label.f .hint { font-weight: 400; color: var(--ink-3); font-size: 12.5px; }
+ol.steps { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 4px; }
+table.prov { border-collapse: collapse; font-size: 13px; width: 100%; }
+table.prov td { padding: 4px 8px 4px 0; vertical-align: top; border-top: 1px solid var(--line, #8883); }
 input[type=text], input[type=password], input[type=number], input[type=email], select, textarea {
   width: 100%; border: 1px solid var(--line-2); background: var(--panel); border-radius: 8px; padding: 8px 10px; outline: none; }
 ::placeholder { color: var(--ink-3); opacity: .85; }
@@ -382,11 +385,15 @@ function renderQuestion(v) {
 const TOOL_KINDS = [
   { id: "github", label: "GitHub repository" },
   { id: "slack", label: "Slack" },
-  { id: "gmail", label: "Gmail" },
-  { id: "plaid", label: "Plaid (bank data)" },
+  { id: "imap", label: "Email" },
+  { id: "plaid", label: "Bank (Plaid)" },
+  { id: "mcp", label: "MCP server" },
   { id: "http", label: "Any HTTPS API" },
+  { id: "gmail", label: "Gmail API" },
   { id: "upload", label: "Upload code" },
 ];
+const ext = (href, text) => `<a href="${href}" target="_blank" rel="noopener">${text || href.replace(/^https:\/\//, "")}</a>`;
+const steps = (...xs) => `<ol class="steps small">${xs.map(x => `<li>${x}</li>`).join("")}</ol>`;
 const field = (id, label, ph = "", type = "text", hint = "") =>
   `<label class="f">${label}<input type="${type}" id="${id}" placeholder="${esc(ph)}" autocomplete="off">${hint ? `<span class="hint">${hint}</span>` : ""}</label>`;
 const nameDesc = (k, ph) => `<div class="grid2">${field(`t_${k}_name`, "Name the agent uses", ph)}${field(`t_${k}_desc`, "What it is (shown to the agent, optional)", "")}</div>`;
@@ -399,21 +406,59 @@ function toolPanes() {
       ${field("ghToken", "Token", "github_pat_…", "password", `Make one at <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">github.com/settings/personal-access-tokens/new</a>: under Repository access pick only this repository; under Permissions set Contents to read-only. It's used for this one download and never stored.`)}
       <div class="row"><button class="btn primary" data-act="github">Import repository</button></div>`,
     slack: `<p class="small muted">The agent can read channels and messages through the Slack Web API. The enclave asks Slack which workspace the token belongs to, and the certificate says so.</p>
-      ${field("t_slack_token", "Token", "xoxb-… or xoxp-…", "password", `Create an app at <a href="https://api.slack.com/apps" target="_blank" rel="noopener">api.slack.com/apps</a>, give it only read scopes (for example channels:read, channels:history, users:read, and search:read for a user token), install it to your workspace and paste its token. The scopes are the hard limit; the agent is also told never to post or change anything.`)}
+      ${steps(`At ${ext("https://api.slack.com/apps")}, <b>Create New App</b> → From scratch, in your workspace.`,
+        `Under <b>OAuth &amp; Permissions</b> → User Token Scopes, add only read scopes: <code>channels:read</code>, <code>channels:history</code>, <code>groups:read</code>, <code>groups:history</code>, <code>users:read</code>, <code>search:read</code> (and <code>im:history</code>, <code>mpim:history</code> for direct messages).`,
+        `<b>Install to Workspace</b> (an admin may have to approve it), copy the <b>User OAuth Token</b> (<code>xoxp-…</code>) and paste it below. A bot token (<code>xoxb-…</code>) also works but sees only channels the bot was added to.`,
+        `Afterwards, uninstall the app or revoke the token.`)}
+      ${field("t_slack_token", "Token", "xoxp-… or xoxb-…", "password", `The scopes are the hard limit; the agent is also told never to post or change anything.`)}
       ${nameDesc("slack", "slack")}
       <div class="row"><button class="btn primary" data-act="connect" data-kind="slack">Connect Slack</button></div>`,
     gmail: `<p class="small muted">The agent can search and read mail through the Gmail API, read-only. The enclave asks Google which address the mailbox is, and the certificate says so.</p>
-      ${field("t_gmail_refresh_token", "Refresh token", "1//…", "password", `From an OAuth client of yours with the <code>gmail.readonly</code> scope. Or leave the three fields below empty and paste a one-hour access token (for example from <a href="https://developers.google.com/oauthplayground" target="_blank" rel="noopener">the OAuth Playground</a>).`)}
+      <p class="small muted">The <b>Email</b> tab with an app password is simpler. This way takes longer, but the token itself can only read.</p>
+      ${steps(`In the ${ext("https://console.cloud.google.com/", "Google Cloud console")}, create a project, enable the <b>Gmail API</b>, and create an <b>OAuth client</b> (Web application) with <code>https://developers.google.com/oauthplayground</code> as a redirect URI. Add yourself as a test user on the consent screen.`,
+        `In the ${ext("https://developers.google.com/oauthplayground", "OAuth Playground")}, open the gear, tick <b>Use your own OAuth credentials</b> and enter that client. Authorize the scope <code>https://www.googleapis.com/auth/gmail.readonly</code>, then <b>Exchange authorization code for tokens</b>.`,
+        `Paste the refresh token, client ID and client secret below. (While the consent screen is in testing, Google expires refresh tokens after 7 days.) Or paste only the one-hour access token.`)}
+      ${field("t_gmail_refresh_token", "Refresh token", "1//…", "password")}
       <div class="grid2">${field("t_gmail_client_id", "OAuth client ID", "….apps.googleusercontent.com")}${field("t_gmail_client_secret", "OAuth client secret", "", "password")}</div>
       ${field("t_gmail_access_token", "Or: access token", "ya29.…", "password")}
       ${nameDesc("gmail", "gmail")}
       <div class="row"><button class="btn primary" data-act="connect" data-kind="gmail">Connect Gmail</button></div>`,
-    plaid: `<p class="small muted">The agent can read accounts, balances and transactions through Plaid. The enclave asks Plaid which institution the item is at, and the certificate says so.</p>
+    plaid: `<p class="small muted">The agent can read accounts, balances and transactions through Plaid. The enclave asks Plaid which institution the item is at, and the certificate says so. You use your own Plaid account; its free Trial plan works with real banks (up to 10 connections).</p>
+      ${steps(`Sign up at ${ext("https://dashboard.plaid.com/signup")}.`,
+        `Under <b>Developers → Keys</b>, copy your client ID and your Production secret.`,
+        `On your computer, with the attest CLI, run <code>PLAID_CLIENT_ID=… PLAID_SECRET=… attest plaid-link</code>. It opens Plaid in your browser; sign in to your bank and choose the accounts. It prints an access token. (It talks only to Plaid, not to this server.)`,
+        `Paste the three values below. When you're done, rotate your secret under Developers → Keys: until then your keys and that token can read those accounts.`)}
       <div class="grid2">${field("t_plaid_client_id", "Client ID", "")}${field("t_plaid_secret", "Secret", "", "password")}</div>
       <div class="grid2">${field("t_plaid_access_token", "Access token", "access-production-…", "password")}<label class="f">Environment<select id="t_plaid_environment"><option>production</option><option>sandbox</option></select></label></div>
       ${nameDesc("plaid", "plaid")}
       <div class="row"><button class="btn primary" data-act="connect" data-kind="plaid">Connect Plaid</button></div>`,
+    imap: `<p class="small muted">The agent searches and reads mail over IMAP. The enclave opens folders read-only and never marks, moves or deletes anything, whatever the password would allow. The mail server accepting the login is what identifies the mailbox in the certificate.</p>
+      <table class="prov"><tbody>
+        <tr><td><b>Gmail, Google Workspace</b></td><td><code>imap.gmail.com</code></td><td>An ${ext("https://myaccount.google.com/apppasswords", "app password")} (needs 2-Step Verification; a Workspace admin can turn these off).</td></tr>
+        <tr><td><b>iCloud</b></td><td><code>imap.mail.me.com</code></td><td>An app-specific password from ${ext("https://account.apple.com")}.</td></tr>
+        <tr><td><b>Fastmail</b></td><td><code>imap.fastmail.com</code></td><td>An app password with IMAP access (Settings → Privacy &amp; Security).</td></tr>
+        <tr><td><b>Yahoo</b></td><td><code>imap.mail.yahoo.com</code></td><td>An app password (Account security).</td></tr>
+        <tr><td><b>Microsoft 365, Outlook.com</b></td><td colspan="2">Microsoft no longer allows passwords over IMAP. Use <b>Any HTTPS API</b> with <code>https://graph.microsoft.com</code> and a <code>Mail.Read</code> token from ${ext("https://developer.microsoft.com/graph/graph-explorer", "Graph Explorer")} (it lasts about an hour).</td></tr>
+      </tbody></table>
+      <div class="grid2">${field("t_imap_host", "IMAP server", "imap.gmail.com")}${field("t_imap_username", "Username", "you@example.com")}</div>
+      ${field("t_imap_password", "App password", "", "password", "Revoke it when the audit is done.")}
+      ${nameDesc("imap", "email")}
+      <div class="row"><button class="btn primary" data-act="connect" data-kind="imap">Connect mailbox</button></div>`,
+    mcp: `<p class="small muted">A remote MCP server that accepts a token (the Streamable HTTP transport). The enclave lists its tools, you choose which ones the agent may call, and the enclave refuses the rest. Tools the server labels read-only are preselected; that label is the server's word.</p>
+      <table class="prov"><tbody>
+        <tr><td><b>GitHub</b></td><td><code>https://api.githubcopilot.com/mcp/</code></td><td>A ${ext("https://github.com/settings/personal-access-tokens/new", "fine-grained token")} with read-only permissions.</td></tr>
+        <tr><td><b>Stripe</b></td><td><code>https://mcp.stripe.com</code></td><td>A ${ext("https://dashboard.stripe.com/apikeys", "restricted key")} with read access only.</td></tr>
+        <tr><td><b>Your own</b></td><td colspan="2">Any server you run on a public https address, e.g. in front of a database or an internal system.</td></tr>
+      </tbody></table>
+      <p class="small faint">Not possible here: servers that only accept a sign-in (many hosted ones), and local servers that run on your computer.</p>
+      ${field("t_mcp_url", "Server URL", "https://mcp.example.com/mcp")}
+      ${field("t_mcp_token", "Token", "", "password", "Sent as Authorization: Bearer …")}
+      <div class="row"><button class="btn" data-act="mcp-preview">List tools</button></div>
+      <div id="mcpTools" class="stack" style="gap:6px"></div>
+      ${nameDesc("mcp", "mcp")}
+      <div class="row"><button class="btn primary" data-act="connect" data-kind="mcp">Connect server</button></div>`,
     http: `<p class="small muted">Any HTTPS API: an internal service, a database's HTTP interface, another SaaS. The enclave adds the credential to every request to this host and nowhere else. It can't tell who runs the host, so the certificate shows only its name.</p>
+      <p class="small faint">For example: Microsoft Graph (<code>https://graph.microsoft.com</code>, header <code>Authorization</code>, value <code>Bearer</code> + a token from Graph Explorer), Stripe (<code>https://api.stripe.com</code>, <code>Bearer</code> + a restricted key), or an internal service behind a read-only API key.</p>
       ${field("t_http_base_url", "Base URL", "https://api.example.com")}
       <div class="grid2">${field("t_http_header_name", "Credential header (optional)", "Authorization")}${field("t_http_header_value", "Header value", "Bearer …", "password")}</div>
       <div class="f">Methods the agent may use<div class="row">${["GET", "POST", "PUT", "PATCH", "DELETE"].map(m => `<label class="check"><input type="checkbox" class="t_http_m" value="${m}" ${m === "GET" ? "checked" : ""}><span>${m}</span></label>`).join("")}</div><span class="hint">Most APIs read with GET. Allow others only if the API needs them to read (some query APIs use POST).</span></div>
@@ -439,9 +484,10 @@ function renderCode(v) {
         ${isAuditee() ? "" : `<span class="small muted">Size and tree hash stay hidden until a result is released; the certificate opens the commitment.</span>`}</div>`;
     }
     for (const k of conns) {
-      body += `<div class="panel pad stack" style="gap:6px"><div class="row"><b>${esc(k.name)}</b><span class="pill">${esc(k.kind)}</span><span class="pill">${esc(k.methods.join(", "))}</span><span class="faint small">${esc(ago(k.connected_at_ms))}</span>
+      body += `<div class="panel pad stack" style="gap:6px"><div class="row"><b>${esc(k.name)}</b><span class="pill">${esc(k.kind)}</span>${k.methods.length ? `<span class="pill">${esc(k.methods.join(", "))}</span>` : ""}<span class="faint small">${esc(ago(k.connected_at_ms))}</span>
         ${isAuditee() ? `<button class="btn" style="margin-left:auto" data-act="disconnect" data-id="${k.id}">Remove</button>` : ""}</div>
         <span class="small">${esc(k.hosts.join(", "))}${k.identity ? ` · <b>${esc(k.identity)}</b> <span class="faint">(confirmed by the service)</span>` : ` · <span class="faint">owner not verified</span>`}</span>
+        ${(k.tools || []).length ? `<span class="small">Tools: ${k.tools.map(t => `<code>${esc(t)}</code>`).join(" ")}</span>` : ""}
         ${k.description ? `<span class="small muted">${esc(k.description)}</span>` : ""}</div>`;
     }
     body += `</div>`;
@@ -450,6 +496,7 @@ function renderCode(v) {
     const panes = toolPanes(), tab = S.toolTab || "github";
     const checked = LOCAL || S.info?.mode === "dev";
     body += `<details data-keep="tools-add" ${c || conns.length ? "" : "open"}><summary>${c || conns.length ? "Connect something else" : "Connect what the agent may look at"}</summary><div class="stack" style="margin-top:10px">
+      <div class="callout info small"><span class="ic">i</span><span><b>Paste a token, not a sign-in.</b> “Sign in with Google”-style buttons need an app that each provider has registered and approved in the server operator's name, sending you back to one fixed address. An enclave that anyone can run and check can't depend on that. So for each tool you make a token or app password yourself, with read-only access where the tool allows it, and paste it here. Each tab says how. Revoke it when the audit is done.</span></div>
       <div class="seg" id="toolTabs">${TOOL_KINDS.map(k => `<button type="button" data-act="tool-tab" data-k="${k.id}" aria-pressed="${k.id === tab}">${esc(k.label)}</button>`).join("")}</div>
       ${TOOL_KINDS.map(k => `<div class="stack" data-pane="${k.id}" ${k.id === tab ? "" : "hidden"}>${panes[k.id]}</div>`).join("")}
       <p class="small faint">Credentials stay inside the enclave: the agent names a connection and the enclave adds them to each request. Neither the auditor nor the model sees them.</p>
@@ -686,6 +733,7 @@ document.addEventListener("click", async (e) => {
     if (!S.sid) { await loadInfo(); $("#landingVerify").innerHTML = verifyPanel(); return; }
     document.getElementById("verify")?.scrollIntoView({ behavior: "smooth" }); return;
   }
+  if (act === "mcp-preview") { await busy(b, mcpPreview); return; }
   if (act === "tool-tab") {
     S.toolTab = b.dataset.k;
     $$("#toolTabs button").forEach(x => x.setAttribute("aria-pressed", String(x === b)));
@@ -736,6 +784,7 @@ document.addEventListener("click", async (e) => {
         if (x) body[f === "desc" ? "description" : f] = x;
       }
       if (k === "http") body.methods = $$(".t_http_m").filter(x => x.checked).map(x => x.value);
+      if (k === "mcp") body.tools = $$(".t_mcp_tool").filter(x => x.checked).map(x => x.value);
       return sapi("/connections", { method: "POST", timeout: 60000, body });
     },
     "disconnect": () => sapi(`/connections/${b.dataset.id}`, { method: "DELETE" }),
@@ -756,6 +805,15 @@ document.addEventListener("click", async (e) => {
     toast("Done"); await refresh();
   });
 });
+async function mcpPreview() {
+  const box = $("#mcpTools");
+  box.innerHTML = `<span class="small muted">Asking the server…</span>`;
+  try {
+    const p = await sapi("/connections/preview", { method: "POST", timeout: 60000, body: { kind: "mcp", url: val("t_mcp_url").trim(), token: val("t_mcp_token").trim() } });
+    box.innerHTML = `<span class="small"><b>${esc(p.server)}</b> has ${p.tools.length} tool(s). Choose what the agent may call:</span>` +
+      p.tools.map(t => `<label class="check"><input type="checkbox" class="t_mcp_tool" value="${esc(t.name)}" ${t.read_only ? "checked" : ""}><span><code>${esc(t.name)}</code> ${t.read_only ? `<span class="pill">read-only</span>` : `<span class="pill warn">may change things</span>`} <span class="faint small">${esc(t.description.slice(0, 200))}</span></span></label>`).join("");
+  } catch (e) { box.innerHTML = ""; throw e; }
+}
 function syncFormatFields() {
   const k = val("qFormat") || "text";
   $$("#qFormatExtra [data-for]").forEach(el => el.hidden = el.dataset.for !== k);

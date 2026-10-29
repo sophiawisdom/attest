@@ -17,6 +17,8 @@ pub type Stream = Box<dyn Io>;
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub const TUNNEL_VSOCK_PORT: u32 = 5001;
+/// IMAP over TLS, for connected mailboxes (imap.rs). The host allows it too.
+pub const IMAPS_PORT: u16 = 993;
 
 #[derive(Clone)]
 pub struct Net {
@@ -108,7 +110,7 @@ impl Net {
 
     async fn tunnel(&self, host: &str, port: u16) -> Result<Stream> {
         if !self.dev
-            && (port != 443
+            && (!(port == 443 || port == IMAPS_PORT)
                 || !(self
                     .allowed
                     .read()
@@ -138,6 +140,50 @@ impl Net {
             bail!("parent refused tunnel to {host}:{port}: {line}");
         }
         Ok(s)
+    }
+
+    /// A raw stream to `host:port` (TLS verified against the Mozilla roots,
+    /// no ALPN), for protocols other than HTTP. Plaintext only in dev.
+    pub async fn stream(&self, host: &str, port: u16, tls: bool, timeout: Duration) -> Result<Stream> {
+        tokio::time::timeout(timeout, async {
+            let raw = self.tunnel(host, port).await?;
+            if !tls {
+                if !self.dev {
+                    bail!("plaintext connections are only allowed in dev mode");
+                }
+                return Ok(raw);
+            }
+            let mut cfg = (*self.tls).clone();
+            cfg.alpn_protocols.clear();
+            let name = rustls::pki_types::ServerName::try_from(host.to_string())?;
+            let s = tokio_rustls::TlsConnector::from(Arc::new(cfg))
+                .connect(name, raw)
+                .await
+                .with_context(|| format!("TLS to {host}"))?;
+            Ok(Box::new(s) as Stream)
+        })
+        .await
+        .map_err(|_| anyhow!("connecting to {host} timed out"))?
+    }
+
+    /// Any request over verified TLS (or plaintext in dev), returning as
+    /// soon as the headers arrive; the caller reads the body (an MCP
+    /// server's event stream).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_stream(
+        &self,
+        method: &str,
+        https: bool,
+        host: &str,
+        port: u16,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<hyper::Response<hyper::body::Incoming>> {
+        tokio::time::timeout(timeout, self.send(method, https, true, host, port, path, headers, body))
+            .await
+            .map_err(|_| anyhow!("request to {host} timed out"))?
     }
 
     /// TLS handshake with `host` without trusting its certificate, returning

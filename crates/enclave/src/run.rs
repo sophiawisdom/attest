@@ -40,8 +40,8 @@ pub async fn agent_loop(
     format: &AnswerFormat,
     progress: &(dyn Fn(Vec<Value>) + Send + Sync),
 ) -> AgentOutput {
-    let names: Vec<String> = connections.iter().map(|c| c.rec.name.clone()).collect();
-    let schemas = tool_schemas(format, has_code, &names);
+    let owned = tool_schemas(format, has_code, crate::connections::agent_tools(&connections));
+    let schemas: Vec<(&str, &str, Value)> = owned.iter().map(|(a, b, c)| (a.as_str(), b.as_str(), c.clone())).collect();
     let mut tools = Tools::new(bundle, sandbox);
     let mut conns: Vec<(crate::connections::Connection, crate::net::Net)> =
         connections.into_iter().map(|c| { let n = c.net(net); (c, n) }).collect();
@@ -123,14 +123,10 @@ pub async fn agent_loop(
                     }
                     Err(e) => format!("error: {e}"),
                 }
-            } else if call.name == "http_request" {
-                let name = call.args["connection"].as_str().unwrap_or("");
-                match conns.iter_mut().find(|(c, _)| c.rec.name == name) {
-                    Some((c, n)) => c.request(n, &call.args).await.unwrap_or_else(|e| format!("error: {e:#}")),
-                    None => format!("error: no connection named {name:?}; the connections are: {}", names.join(", ")),
-                }
+            } else if let Some(out) = crate::connections::dispatch(&mut conns, &call.name, &call.args).await {
+                out
             } else if !has_code {
-                "error: no code is connected in this session; use http_request".to_string()
+                format!("error: there is no tool named {:?}; use only the tools you were given", call.name)
             } else {
                 tools.call(&call.name, &call.args).await
             };

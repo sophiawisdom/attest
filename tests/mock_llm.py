@@ -41,6 +41,18 @@ def respond(messages):
             return "", [tool_call(f"{uid}_p", "python", {"code": code})]
         out = tools[0]["content"]
         return "", [tool_call(f"{uid}_v", "submit_verdict", {"answer": "yes" if "True" in out else "no", "confidence": 0.9, "summary": "python said: " + out.replace("\n", " | ")})]
+    if "MAILMCP" in question:
+        steps = [
+            ("email", {"connection": "mail", "action": "folders"}),
+            ("email", {"connection": "mail", "action": "search", "folder": "INBOX", "query": 'FROM "bank"'}),
+            ("email", {"connection": "mail", "action": "read", "folder": "INBOX", "uid": 2}),
+            ("crm__lookup_customer", {"id": 7}),
+            ("crm__delete_customer", {"id": 7}),
+        ]
+        if n < len(steps):
+            return "", [tool_call(f"{uid}_m{n}", *steps[n])]
+        out = " || ".join(t["content"] for t in tools)
+        return "", [tool_call(f"{uid}_v", "submit_verdict", {"answer": "yes" if "wire received" in out else "no", "confidence": 0.9, "summary": out.replace("\n", " ")[:3500]})]
     if "HTTPTOOL" in question:
         if n == 0:
             return "", [tool_call(f"{uid}_h", "http_request", {"connection": "ledger", "method": "GET", "path": "/records", "query": {"year": 2026}})]

@@ -69,6 +69,26 @@ is written for an agent to follow, and takes one script.
    - `{"kind": "http", "base_url": "https://api.example.com",
      "header_name": "Authorization", "header_value": "Bearer ...",
      "methods": ["GET"]}` (any HTTPS API)
+   - `{"kind": "imap", "host": "imap.gmail.com", "username": "...",
+     "password": "..."}` (a mailbox over IMAP with TLS on port 993; usually
+     an app password). The enclave sends only LOGIN, LIST, EXAMINE (which
+     opens a folder read-only), UID SEARCH, UID FETCH with BODY.PEEK (which
+     leaves mail unread) and LOGOUT. The agent's `email` tool lists
+     folders, searches and reads messages, decoded to text.
+   - `{"kind": "mcp", "url": "https://mcp.example.com/mcp", "token": "...",
+     "tools": ["search", "get_record"]}` (a remote MCP server, Streamable
+     HTTP transport; the token goes in `Authorization: Bearer`, or give
+     `header_name` and `header_value`). First call
+     `POST /api/sessions/ID/connections/preview` with the same body (no
+     `tools`) to get the server's tools and their `read_only` hints, then
+     connect with the tools the agent may call. The agent sees each as
+     `NAME__TOOL`; the enclave refuses any other tool. Only the server's
+     origin is recorded (some servers put a secret in the path).
+   Only pasted tokens work: sign-in flows ("Sign in with Google") need an
+   app each provider has approved in the operator's name, with a fixed
+   return address. For Plaid, `attest plaid-link` runs Plaid Link on the
+   auditee's own computer with their own Plaid keys and prints the access
+   token.
    The enclave first asks the service who the credentials belong to
    (`identity`, for example "Slack workspace Acme (T0123, ...)"; none for a
    custom API, where only the host is known) and refuses credentials the

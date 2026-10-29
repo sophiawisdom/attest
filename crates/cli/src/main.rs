@@ -4,6 +4,7 @@
 
 mod bundle;
 mod local;
+mod plaid;
 
 use anyhow::{anyhow, bail, Context, Result};
 use attest_core::nitro::ExpectedPcrs;
@@ -89,6 +90,30 @@ enum Cmd {
         allow_dirty: bool,
         #[command(flatten)]
         policy: PolicyArgs,
+    },
+    /// Auditee: get a Plaid access token for your bank account, to paste
+    /// into a session's "Connect tools" → Plaid. Uses your own Plaid keys
+    /// (a free Trial account works with real banks), runs Plaid Link on
+    /// 127.0.0.1, and prints the token. Nothing is sent to attest.
+    PlaidLink {
+        #[arg(long, env = "PLAID_CLIENT_ID")]
+        client_id: String,
+        /// Your Plaid secret for the environment (best set in PLAID_SECRET).
+        #[arg(long, env = "PLAID_SECRET", hide_env_values = true)]
+        secret: String,
+        /// production (real banks; the Trial plan's keys) or sandbox.
+        #[arg(long, default_value = "production")]
+        environment: String,
+        /// Plaid products to request, comma-separated.
+        #[arg(long, default_value = "transactions")]
+        products: String,
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        #[arg(long)]
+        no_browser: bool,
+        /// Testing only: Plaid's API at another address.
+        #[arg(long, hide = true)]
+        plaid_url: Option<String>,
     },
     /// Open a session in your browser through a local client: it checks the
     /// enclave's attestation, serves the web app on 127.0.0.1, and sends every
@@ -462,6 +487,9 @@ async fn main() -> Result<()> {
             println!("uploaded: tree {tree} ({} files)", files.len());
         }
 
+        Cmd::PlaidLink { client_id, secret, environment, products, port, no_browser, plaid_url } => {
+            plaid::link(&client_id, &secret, &environment, &products, port, no_browser, plaid_url).await?
+        }
         Cmd::Open {
             link,
             port,

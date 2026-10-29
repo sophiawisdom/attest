@@ -8,8 +8,8 @@
 //!   vsock 5004            <- the enclave's operational log lines (printed here)
 //!   vsock 5005            <-> sealed file store (ciphertext only; the enclave holds the keys)
 //!
-//! Outbound tunnels may go to any public address on port 443 (webhooks can
-//! point anywhere); the enclave decides where it connects.
+//! Outbound tunnels may go to any public address on port 443 or 993 (IMAP;
+//! webhooks and connected services can be anywhere); the enclave decides where it connects.
 
 mod s3;
 
@@ -236,7 +236,7 @@ async fn handle_tunnel<S: Io>(args: Args, s: S) -> Result<()> {
     // (a failover pair talks over the private network; deploy/pair.sh).
     let peer = configured_peer(&args).filter(|p| *p == target);
     let ok_addr = addrs.into_iter().find(|a| {
-        (port == 443 && (public(a.ip()) || peer.is_some())) || (args.dev && a.ip().is_loopback())
+        ((port == 443 || port == 993) && public(a.ip())) || (port == 443 && peer.is_some()) || (args.dev && a.ip().is_loopback())
     });
     let Some(addr) = ok_addr else {
         r.get_mut()

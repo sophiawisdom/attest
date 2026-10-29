@@ -314,7 +314,8 @@ fn yes() -> bool {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ConnectionRecord {
     pub id: u32,
-    /// "slack", "gmail", "plaid", "github_api" or "http" (a custom API).
+    /// "slack", "gmail", "plaid", "github_api", "http" (a custom API),
+    /// "imap" (a mailbox, read-only) or "mcp" (a remote MCP server).
     pub kind: String,
     /// The name the agent calls it by.
     pub name: String,
@@ -332,6 +333,9 @@ pub struct ConnectionRecord {
     /// certificate).
     #[serde(default)]
     pub calls: u32,
+    /// An MCP server's tools the auditee let the agent call.
+    #[serde(default)]
+    pub tools: Vec<String>,
 }
 
 fn full_detail() -> String {

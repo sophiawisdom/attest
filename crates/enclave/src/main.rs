@@ -12,6 +12,8 @@ mod aws;
 mod blobs;
 mod budget;
 mod connections;
+mod imap;
+mod mcp;
 mod bundle;
 mod cgroups;
 mod handoff;
@@ -1227,6 +1229,12 @@ async fn session_route(
             // session lock: it makes requests).
             let c = connections::connect(&ctx.net, 0, &v).await?;
             ok(s.add_connection(ctx, role, c)?)
+        }
+        ("POST", ["connections", "preview"]) => {
+            if role != attest_core::Role::Auditee {
+                return Err(anyhow!("only the auditee connects services").into());
+            }
+            ok(connections::preview(&ctx.net, &body_json(req).await?).await?)
         }
         ("DELETE", ["connections", cid]) => {
             let id: u32 = cid.parse().map_err(|_| anyhow!("bad connection id"))?;

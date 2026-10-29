@@ -317,6 +317,10 @@ pub fn manifest_warnings(m: &Manifest) -> Vec<String> {
         w.push("the agent read no files".into());
     }
     for c in &m.connections {
+        if c.kind == "mcp" {
+            w.push(format!("the agent could call {} tool(s) of an MCP server the auditee chose, {} ({}): {}; the enclave knows only its address", c.tools.len(), c.name, c.hosts.join(", "), c.tools.join(", ")));
+            continue;
+        }
         match &c.identity {
             Some(i) => w.push(format!("the agent could reach {} ({}), whose data the auditee controls; the service identified the account as {i}", c.name, c.hosts.join(", "))),
             None => w.push(format!("the agent could reach {} ({}), an API the auditee chose; the enclave knows only its host name", c.name, c.hosts.join(", "))),
