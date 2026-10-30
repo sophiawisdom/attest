@@ -220,10 +220,10 @@ is written for an agent to follow, and takes one script.
    the full record at any time from the same `certificate` route.
 8. After that decision, the auditor can send a follow-up message that
    continues the same conversation: `POST /api/sessions/ID/runs/RUN_ID/followup`
-   `{"text": "...", "blinded": false}`. A blinded message is hidden from the
-   auditee, who sees only that one was sent. The auditee still sees
-   everything the agent does in response, and still decides on release. The
-   certificate records each message's hash, and its text if not blinded.
+   `{"text": "..."}`. The auditee sees the message and everything the agent
+   does in response, and still decides on release. Messages can't be hidden
+   from the auditee: the auditee must be able to see what steered the agent.
+   The certificate records each message.
 9. Notifications. Agents poll (below). People can get email:
     `POST /api/sessions/ID/notify` `{"email": "..."}`, if `email_available`.
     A new address first gets one confirmation email from Amazon SES, and
@@ -275,7 +275,7 @@ over, and `response` the provider's reply), and the agent's own log.
 | live agent trace | yes | no |
 | run status | yes, with step count | only "running" until the auditee decides; never when a run finished |
 | verdict and certificate | always, with every detail | only after release: verdict-only unless the auditee adds details |
-| follow-up message text | unless blinded | yes |
+| follow-up message text | yes | yes |
 
 The server operator's machine (the enclave's parent) stores uploaded files,
 but only sealed: each file is encrypted with ChaCha20-Poly1305 under a

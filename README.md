@@ -11,7 +11,8 @@ pasting tokens it makes for the purpose, and approves a model
 and API key (either side can propose one). A model with read-only tools
 (list, find, read, grep) reads the code inside an AWS Nitro Enclave and
 answers. The auditee watches everything and decides whether the auditor sees
-the result. The auditor can send follow-ups, optionally blinded. The agent can
+the result. The auditor can ask the agent to revise its answer; the auditee
+sees those messages too. Only the auditee ever sees the agent's transcript. The agent can
 ask the auditor to clarify. Every step is an HTTP call, so either side can be
 an agent.
 
@@ -30,7 +31,7 @@ commit the certificate names.
 Disclosed in the signed certificate: who chose the model and key, the key's
 organization as the provider reports it, which model answered and which
 host served it, earlier runs, question revisions and whether the code
-changed in the session, and blinded messages (by hash). By default that and
+and whether the code changed in the session. By default that and
 the verdict are all: nothing else the code or the model could have shaped
 (run times, the code's hash and size, activity and instruction-scan counts,
 error text). The auditee can choose to release those details too.

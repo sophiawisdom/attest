@@ -139,9 +139,9 @@ struct State {
     connections: Vec<crate::connections::Connection>,
     /// The auditee approves each tool call of runs started while this is on.
     tool_approval: bool,
-    /// What the auditor may watch of the agent's work, as it happens:
-    /// "" (nothing), "steps" (each tool call and its input, not the results) or "full" (everything
-    /// the auditee sees). The auditee chooses; it covers every run.
+    /// Retired (the auditor never sees the agent's work); kept so stored
+    /// state still loads.
+    #[allow(dead_code)]
     auditor_watch: String,
 }
 
@@ -180,7 +180,7 @@ fn exchange_turn(e: &Value) -> Value {
     let mut chat_calls: std::collections::BTreeMap<i64, (Value, String, String)> = Default::default();
     let mut chat_text = String::new();
     let parse_args = |s: &str| serde_json::from_str::<Value>(s).unwrap_or_else(|_| if s.is_empty() { json!({}) } else { json!(s) });
-    let mut whole = |v: &Value, text: &mut Vec<String>, calls: &mut Vec<Value>| {
+    let whole = |v: &Value, text: &mut Vec<String>, calls: &mut Vec<Value>| {
         // A complete response (non-streaming), or a finished Responses item.
         for b in v["content"].as_array().into_iter().flatten() {
             match b["type"].as_str() {
@@ -263,21 +263,6 @@ fn exchange_turn(e: &Value) -> Value {
         }
     }
     json!({"results": results, "text": text, "calls": calls})
-}
-
-/// Long strings cut short, for the steps view: what the agent looked at,
-/// not what it wrote.
-fn clip(v: &Value, n: usize) -> Value {
-    match v {
-        Value::String(s) if s.len() > n => {
-            let mut k = n;
-            while !s.is_char_boundary(k) { k -= 1; }
-            json!(format!("{}…", &s[..k]))
-        }
-        Value::Array(a) => Value::Array(a.iter().map(|x| clip(x, n)).collect()),
-        Value::Object(o) => Value::Object(o.iter().map(|(k, x)| (k.clone(), clip(x, n))).collect()),
-        x => x.clone(),
-    }
 }
 
 /// A status: one of a fixed set of strings. (An alias, so serde doesn't
@@ -1057,27 +1042,6 @@ impl Session {
     }
 
     /// Let the auditor watch the agent's work: nothing, its steps, or all of it.
-    pub fn set_auditor_watch(self: &Arc<Self>, ctx: &Arc<Ctx>, role: Role, v: &Value) -> Result<Value> {
-        ensure!(role == Role::Auditee, "only the auditee decides what the auditor sees");
-        let mode = match v["mode"].as_str().unwrap_or("") {
-            "" | "off" => "",
-            "steps" => "steps",
-            "full" => "full",
-            m => bail!("mode must be off, steps or full (got {m})"),
-        };
-        let mut st = lock(&self.st);
-        if st.auditor_watch != mode {
-            st.auditor_watch = mode.into();
-            let msg = match mode {
-                "steps" => "The auditee lets the auditor watch which tools the agent uses, as it works (not what it reads).",
-                "full" => "The auditee lets the auditor watch everything the agent does, including what it reads.",
-                _ => "The auditor can no longer watch the agent's work.",
-            };
-            self.event(ctx, &mut st, "auditor_watch", msg.into(), None, Some(role), true);
-        }
-        Ok(json!({"auditor_watch": if mode.is_empty() { "off" } else { mode }}))
-    }
-
     pub fn tool_approval_on(&self) -> bool {
         lock(&self.st).tool_approval
     }
@@ -1359,7 +1323,9 @@ impl Session {
             text.chars().count() <= MAX_MESSAGE_CHARS,
             "message is too long"
         );
-        let blinded = v["blinded"].as_bool().unwrap_or(false);
+        // Every message the auditor sends is visible to the auditee.
+        ensure!(!v["blinded"].as_bool().unwrap_or(false), "messages to the agent can't be hidden from the auditee");
+        let blinded = false;
         let mut st = lock(&self.st);
         ensure!(
             !busy_for(&st, role),
@@ -1815,7 +1781,6 @@ impl Session {
             }),
             "connections": st.connections.iter().map(|c| &c.rec).collect::<Vec<_>>(),
             "tool_approval": st.tool_approval,
-            "auditor_watch": if st.auditor_watch.is_empty() { "off" } else { st.auditor_watch.as_str() },
             "pending_tool_calls": if role == Role::Auditee { json!(self.approvals.list()) } else { Value::Null },
             "models": st.models.iter().map(|m| m.public()).collect::<Vec<_>>(),
             "runs": runs,
@@ -1837,11 +1802,9 @@ impl Session {
 
     pub fn trace(&self, role: Role, run_id: &str, after: usize) -> Result<Value> {
         let st = lock(&self.st);
-        let steps_only = match (role, st.auditor_watch.as_str()) {
-            (Role::Auditee, _) | (_, "full") => false,
-            (_, "steps") => true,
-            _ => bail!("only the auditee can see the agent's trace"),
-        };
+        // Only the auditee sees what the agent did: an auditor who could
+        // read the transcript could steer the agent into quoting anything.
+        ensure!(role == Role::Auditee, "only the auditee can see the agent's trace");
         let r = st
             .runs
             .iter()
@@ -1855,23 +1818,6 @@ impl Session {
                 for e in entries.iter_mut() {
                     if e["type"] == "model_exchange" {
                         e["turn"] = exchange_turn(e);
-                    }
-                }
-                if steps_only {
-                    // What the agent looked at (each tool and its input),
-                    // not what came back or what it said. Placeholders keep
-                    // positions, which the client pages by.
-                    for e in entries.iter_mut() {
-                        let calls: Vec<Value> = if e["type"] == "assistant" {
-                            e["tool_calls"].as_array().map(|c| c.iter().map(|c| json!({"id": c["id"], "name": c["name"], "input": clip(&c["args"], 400)})).collect()).unwrap_or_default()
-                        } else if e["type"] == "model_exchange" {
-                            e["turn"]["calls"].as_array().map(|c| c.iter().map(|c| json!({"id": c["id"], "name": c["name"], "input": clip(&c["input"], 400)})).collect()).unwrap_or_default()
-                        } else {
-                            *e = json!({"type": "hidden"});
-                            continue;
-                        };
-                        let tools: Vec<Value> = calls.iter().map(|c| c["name"].clone()).collect();
-                        *e = json!({"type": "step", "tools": tools, "calls": calls});
                     }
                 }
                 json!({"run_id": r.id, "status": r.status, "next": next, "more": next < r.trace.len(), "entries": entries})
@@ -2817,7 +2763,7 @@ fn next_actions(st: &State, role: Role, sid: &str) -> Vec<Value> {
                         "send_followup",
                         "POST",
                         format!("{base}/runs/{}/followup", r.id),
-                        "Send the agent a follow-up message (optionally blinded from the auditee).",
+                        "Ask the agent to revise its answer (the auditee sees your message).",
                     ));
                 }
                 if r.status == "released" {

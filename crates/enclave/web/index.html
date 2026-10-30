@@ -705,13 +705,10 @@ function traceHtml(entries) {
   }
   return out.join("") || note("Starting…");
 }
-const watching = (v) => !!v && (v.auditor_watch === "steps" || v.auditor_watch === "full");
 function approvalHtml(v) {
   if (!isAuditee()) {
     const notes = [];
     if (v.tool_approval) notes.push("The auditee approves or denies each of the agent's tool calls before it runs. A denial can keep evidence from the agent; certificates count them.");
-    if (v.auditor_watch === "steps") notes.push("The auditee lets you watch what the agent looks at as it works: each command, file and search, but not what comes back.");
-    if (v.auditor_watch === "full") notes.push("The auditee lets you watch everything the agent does as it works.");
     return notes.length ? `<div class="pad stack" style="gap:6px">${notes.map(n => `<div class="callout info small"><span class="ic">i</span><span>${n}</span></div>`).join("")}</div>` : "";
   }
   const pend = v.pending_tool_calls || [];
@@ -721,10 +718,7 @@ function approvalHtml(v) {
   const items = pend.map(c => `<div class="panel pad stack" style="gap:6px;border-color:var(--warn,#c80)"><div class="row" style="gap:8px"><b>${esc(c.tool)}</b><span class="pill">run ${c.run_number}</span><span class="pill">${esc(c.agent)}</span><span class="faint small">waiting ${esc(ago(c.asked_at_ms))}</span></div>
       <pre class="out" style="max-height:220px">${esc(JSON.stringify(c.input, null, 1))}</pre>
       <div class="row"><input type="text" id="tcr-${c.id}" placeholder="Reason (shown to the agent, optional)" style="flex:1"><button class="btn primary" data-act="tc-decide" data-id="${c.id}" data-ok="1">Approve</button><button class="btn danger" data-act="tc-decide" data-id="${c.id}" data-ok="">Deny</button></div></div>`).join("");
-  const w = v.auditor_watch || "off";
-  const watch = `<div class="row" style="justify-content:space-between"><span class="small"><b>What the auditor can watch</b><br><span class="faint">${w === "full" ? "Everything the agent does, including what it reads." : w === "steps" ? "What the agent looks at, live: each command, file and search. Not what comes back or what it says." : "Nothing until you release a result."} Covers every run, earlier ones too.</span></span>
-    <div class="row" style="gap:4px" role="group">${[["off", "Nothing"], ["steps", "Steps"], ["full", "Everything"]].map(([m, l]) => `<button class="btn ${w === m ? "primary" : ""}" data-act="watch" data-mode="${m}" aria-pressed="${w === m}">${l}</button>`).join("")}</div></div>`;
-  return `<div class="pad stack" style="gap:10px;border-bottom:1px solid var(--line,#8883)">${head}${items}${watch}</div>`;
+  return `<div class="pad stack" style="gap:10px;border-bottom:1px solid var(--line,#8883)">${head}${items}</div>`;
 }
 function renderRuns(v) {
   const runs = [...v.runs].reverse();
@@ -732,7 +726,7 @@ function renderRuns(v) {
   if (!runs.length) body += `<div class="pad"><p class="muted">The agent starts automatically once the question is accepted, something is connected, and a model is approved.</p></div>`;
   else body += runs.map(r => runHtml(v, r)).join("");
   patch("cRuns", head(4, "Agent runs", runs.some(r => r.status === "released"), `<span class="faint small">${runs.length || ""}</span>`) + body);
-  for (const r of runs) if (isAuditee() || watching(v)) patch("tx-" + r.id, traceHtml(S.traces[r.id]?.entries || []));
+  for (const r of runs) if (isAuditee()) patch("tx-" + r.id, traceHtml(S.traces[r.id]?.entries || []));
 }
 function runHtml(v, r) {
   const parent = r.parent_run_id ? v.runs.find(x => x.id === r.parent_run_id) : null;
@@ -750,11 +744,9 @@ function runHtml(v, r) {
       <label class="f">Note to the auditor (optional)<input type="text" id="note-${r.id}"></label>
       <div class="row"><button class="btn primary" data-act="release" data-run="${r.id}">Release to auditor</button><button class="btn danger" data-act="decline" data-run="${r.id}">Decline</button></div></div>`;
     if (r.status === "released" || r.status === "declined") main += `<p class="small faint">You ${r.status} this ${esc(ago(r.decided_at_ms))}${r.decision_note ? `: “${esc(r.decision_note)}”` : ""}.</p>`;
-    main += `<details ${r.status === "running" ? "open" : ""} data-keep="txd-${r.id}-${r.status === "running" ? "live" : "done"}-${v.auditor_watch || "off"}"><summary>Transcript ${v.auditor_watch === "full" ? "(the auditor can watch it too)" : v.auditor_watch === "steps" ? "(the auditor sees the steps, not the results)" : "(only you can see this)"}</summary><div class="tx cc" id="tx-${r.id}"></div></details>`;
+    main += `<details ${r.status === "running" ? "open" : ""} data-keep="txd-${r.id}-${r.status === "running" ? "live" : "done"}"><summary>Transcript (only you can see this)</summary><div class="tx cc" id="tx-${r.id}"></div></details>`;
   } else {
-    if (watching(v)) main += `<details ${r.status === "running" ? "open" : ""} data-keep="txd-${r.id}-${r.status === "running" ? "live" : "done"}"><summary>${r.status === "running" ? `<i class="spin" style="color:var(--accent)"></i> The agent is working: watch it` : "What the agent did"}</summary><div class="tx cc" id="tx-${r.id}"></div></details>`;
-    if (r.status === "running" && watching(v)) {}
-    else if (r.status === "running") main += `<div class="row"><i class="spin" style="color:var(--accent)"></i><span class="muted">The agent is working. You can't see its progress; you'll see the result if the auditee releases it.</span></div>`;
+    if (r.status === "running") main += `<div class="row"><i class="spin" style="color:var(--accent)"></i><span class="muted">The agent is working. You can't see its progress; you'll see the result if the auditee releases it.</span></div>`;
     else if (r.status === "awaiting_release") main += `<p class="muted">The agent finished. Waiting for the auditee to release or decline the result.</p>`;
     else if (r.status === "declined") main += `<div class="callout bad"><span class="ic">×</span><span>The auditee declined to release this result${r.decision_note ? `: “${esc(r.decision_note)}”` : "."}</span></div>`;
     else if (r.status === "released") main += verdictHtml(r) + flagsHtml(r, "")
@@ -764,7 +756,6 @@ function runHtml(v, r) {
       main += `<details open data-keep="fu-${r.id}"><summary>Ask the agent to revise its answer</summary><div class="stack" style="margin-top:10px">
         <span class="faint small">The agent picks up where it left off with your message, investigates more if needed, and gives a new answer. The auditee sees your message and decides whether to release the new answer.</span>
         <textarea id="fu-${r.id}" placeholder="e.g. Also cover the scripts under synthetic/, and say which ones run on a schedule."></textarea>
-        ${(v.connections || []).length ? `<span class="faint small">Blinded messages aren't available here: the agent's requests to the connected services could carry the text to the auditee.</span>` : `<label class="check"><input type="checkbox" id="fub-${r.id}"><span>Blind this message from the auditee<br><span class="faint small">They see that you sent one and everything the agent does in response, but not your text. They still decide on release.</span></span></label>`}
         <div class="row"><button class="btn primary" data-act="followup" data-run="${r.id}">Send to the agent</button></div></div></details>`;
   }
   return `<div class="run pad stack" id="run-${esc(r.id)}">${meta}${msgHtml}${main}</div>`;
@@ -894,7 +885,6 @@ document.addEventListener("click", async (e) => {
       return sapi("/connections", { method: "POST", timeout: 60000, body });
     },
     "tool-approval": () => sapi("/tool-approval", { method: "POST", body: { enabled: !!b.dataset.on } }),
-    "watch": () => sapi("/auditor-watch", { method: "POST", body: { mode: b.dataset.mode } }),
     "tc-decide": () => sapi(`/tool-calls/${b.dataset.id}`, { method: "POST", body: { approve: !!b.dataset.ok, reason: val("tcr-" + b.dataset.id) } }),
     "disconnect": () => sapi(`/connections/${b.dataset.id}`, { method: "DELETE" }),
     "propose-model": () => sapi("/models", { method: "POST", body: { provider: $("#mProv [aria-pressed=true]").dataset.p, model: val("mModel"), api_key: val("mKey"), openrouter_zdr: $("#mZdr")?.checked, openrouter_only: (val("mOnly") || "").split(",").map(s => s.trim()).filter(Boolean), mock_endpoint: val("mMock"), agent: val("mAgent") || "builtin", ...cloudValues("m") } }),
@@ -902,7 +892,7 @@ document.addEventListener("click", async (e) => {
     "m-reject": () => sapi(`/models/${b.dataset.id}/decision`, { method: "POST", body: { approve: false } }),
     "release": () => sapi(`/runs/${b.dataset.run}/release`, { method: "POST", body: { release: true, details: !!$("#det-" + b.dataset.run)?.checked, note: val("note-" + b.dataset.run) } }),
     "decline": () => sapi(`/runs/${b.dataset.run}/release`, { method: "POST", body: { release: false, note: val("note-" + b.dataset.run) } }),
-    "followup": () => sapi(`/runs/${b.dataset.run}/followup`, { method: "POST", body: { text: val("fu-" + b.dataset.run), blinded: $("#fub-" + b.dataset.run)?.checked } }),
+    "followup": () => sapi(`/runs/${b.dataset.run}/followup`, { method: "POST", body: { text: val("fu-" + b.dataset.run) } }),
     "notify": () => sapi("/notify", { method: "POST", body: { email: val("nEmail") } }),
   };
   if (!actions[act]) return;
@@ -989,10 +979,8 @@ async function refresh(wait = false) {
   const q = wait && S.view ? `?version=${S.view.version}&wait=25` : "";
   const view = await sapi(q, { timeout: 35000 });
   if (!S.view || view.version >= S.view.version) S.view = view;
-  // The auditor's copy depends on what it may watch: refetch when that changes.
-  if (!isAuditee() && S.watchMode !== S.view.auditor_watch) { S.traces = {}; S.watchMode = S.view.auditor_watch; }
   for (const r of S.view.runs) {
-    if (!isAuditee() && !watching(S.view)) continue;
+    if (!isAuditee()) continue;
     const t = S.traces[r.id] || (S.traces[r.id] = { entries: [], next: 0, done: false });
     if (t.done) continue;
     // Pages of up to a few MiB; keep fetching while there's more.
@@ -1010,10 +998,7 @@ async function refresh(wait = false) {
 async function pollLoop() {
   if (S.polling) return; S.polling = true;
   for (;;) {
-    // A watching auditor isn't woken by the agent's progress (that would
-    // leak timing to auditors who can't watch), so it polls instead.
-    const live = !isAuditee() && watching(S.view) && S.view.runs.some(r => r.status === "running");
-    try { await refresh(!live); if (live) await new Promise(r => setTimeout(r, 2000)); } catch (e) { await new Promise(r => setTimeout(r, 5000)); }
+    try { await refresh(true); } catch (e) { await new Promise(r => setTimeout(r, 5000)); }
   }
 }
 
