@@ -71,9 +71,10 @@ label.f .hint { font-weight: 400; color: var(--ink-3); font-size: 12.5px; }
 ol.steps { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 4px; }
 table.prov { border-collapse: collapse; font-size: 13px; width: 100%; }
 table.prov td { padding: 4px 8px 4px 0; vertical-align: top; border-top: 1px solid var(--line, #8883); }
-input[type=text], input[type=password], input[type=number], input[type=email], select, textarea {
+input[type=text], input[type=number], input[type=email], select, textarea {
   width: 100%; border: 1px solid var(--line-2); background: var(--panel); border-radius: 8px; padding: 8px 10px; outline: none; }
 ::placeholder { color: var(--ink-3); opacity: .85; }
+.secret { -webkit-text-security: disc; text-security: disc; }
 textarea { resize: vertical; min-height: 96px; line-height: 1.5; }
 input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 .check { display: flex; gap: 10px; align-items: flex-start; cursor: pointer; font-size: 13.5px; }
@@ -264,7 +265,7 @@ function landing() {
     </div>
     <div id="created">${S.info && S.info.open === false
       ? `<div class="stack"><p class="small muted">This server is private: only its operator starts sessions. Anyone the operator sends a session link to can take part.</p>
-        <input type="password" id="opKey" placeholder="Operator key" autocomplete="off" style="max-width:320px">${startButtons()}</div>`
+        <input type="text" class="secret" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore id="opKey" placeholder="Operator key" autocomplete="off" style="max-width:320px">${startButtons()}</div>`
       : startButtons()}</div>
     ${S.info?.operator ? `<p class="small muted" id="notice">Operated by <b>${esc(S.info.operator)}</b>.</p>` : ""}
     <div class="foot"><a href="/agents.md">Guide for agents</a><a href="https://github.com/sophiawisdom/attest" target="_blank" rel="noopener">Source on GitHub</a><a href="#" data-act="show-verify">Verify this service</a></div>
@@ -558,7 +559,7 @@ function renderModel(v) {
     </div>${m.note ? `<div class="small faint">“${esc(m.note)}”</div>` : ""}
     ${isAuditee() && m.status === "pending" ? `<div class="stack" data-keep="approve-${m.id}" style="gap:8px;padding:10px 12px;background:var(--sunken);border-radius:8px">
       ${m.has_key ? `<div class="callout warn small"><span class="ic">!</span><span>This uses <b>the auditor's own provider account</b>. Their account can log everything the model sees, including everything the agent reads. Safer: use your own key.</span></div>` : `<p class="small muted">The auditor proposed this model without a key. Approve it with your own API key.</p>`}
-      <label class="f">Your API key${m.has_key ? " (optional, replaces theirs)" : ""}${m.provider === "vertex" ? " (service-account key file, JSON)" : ""}<input type="password" id="ak-${m.id}" autocomplete="off" placeholder="sk-…"></label>
+      <label class="f">Your API key${m.has_key ? " (optional, replaces theirs)" : ""}${m.provider === "vertex" ? " (service-account key file, JSON)" : ""}<input type="text" class="secret" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore id="ak-${m.id}" autocomplete="off" placeholder="sk-…"></label>
       ${["bedrock", "vertex", "azure"].includes(m.provider) ? `<p class="faint small">With your own key, also give your own ${m.provider === "bedrock" ? "region" : m.provider === "vertex" ? "project and location" : "resource"}: on a cloud it decides whose account the requests reach. Proposed: ${esc(m.endpoint || "")}</p>${cloudFields("a" + m.id, m.provider, m.params)}` : ""}
       ${m.has_key ? `<label class="check"><input type="checkbox" id="acc-${m.id}"><span>Use the auditor's key anyway; I accept their account may see my code</span></label>` : ""}
       <div class="row"><button class="btn primary" data-act="m-approve" data-id="${m.id}">Approve</button></div></div>` : ""}`).join("")}</div>`;
@@ -572,7 +573,7 @@ function renderModel(v) {
         <div class="seg" id="mProv">${providers.map((p, i) => `<button type="button" data-act="prov" data-p="${p.id}" aria-pressed="${i === 0}">${esc(p.label)}</button>`).join("")}</div>
         ${(S.info?.harness?.agents || []).length > 1 ? `<label class="f">Agent<select id="mAgent">${S.info.harness.agents.map(a => `<option value="${esc(a.split(" ")[0])}">${a === "builtin" ? "Built-in tools (read, grep, python sandbox)" : esc(a) + " (full shell in a jail; " + ({codex: "OpenAI-API models", "claude-code": "Anthropic-API models", pi: "any provider"}[a.split(" ")[0]] || "") + ")"}</option>`).join("")}</select></label>` : ""}
         <div class="grid2"><label class="f">Model<input type="text" id="mModel" placeholder="${esc(providers[0].ph)}"></label>
-          <label class="f">API key${isAuditee() ? "" : " (optional)"}<input type="password" id="mKey" autocomplete="off" placeholder="${isAuditee() ? "sk-…" : "leave empty: the auditee supplies theirs"}"></label></div>
+          <label class="f">API key${isAuditee() ? "" : " (optional)"}<input type="text" class="secret" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore id="mKey" autocomplete="off" placeholder="${isAuditee() ? "sk-…" : "leave empty: the auditee supplies theirs"}"></label></div>
         <label class="check" id="mZdrRow" hidden><input type="checkbox" id="mZdr" checked><span>Zero-data-retention endpoints only</span></label>
         <label class="f" id="mOnlyRow" hidden>Upstream hosts (optional; OpenRouter slugs, comma-separated, e.g. google-vertex, amazon-bedrock, azure). Every request is pinned to these, with no fallback.<input id="mOnly" placeholder="any host" autocomplete="off"></label>
         <label class="f" id="mMockRow" hidden>Mock server<input type="text" id="mMock" value="127.0.0.1:19999"></label>
