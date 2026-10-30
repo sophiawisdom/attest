@@ -51,7 +51,7 @@ is written for an agent to follow, and takes one script.
    auditor doesn't see when a run finishes, only the auditee's decision.
 2. The auditee accepts or rejects it: `POST /api/sessions/ID/question/decision`
    `{"version": 1, "accept": true, "note": "optional"}`. A rejected or
-   answered question can be revised (step 1 again). Each revision is a new
+   answered question can be followed by another (step 1 again). Each question is a new
    version that needs acceptance.
 3. The auditee connects what the agent may look at: services, code, or
    both. A run needs at least one.

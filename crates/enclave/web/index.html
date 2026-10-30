@@ -349,44 +349,48 @@ function render() {
 
 // ---------------------------------------------------------------- question
 function renderQuestion(v) {
-  const q = v.questions[v.questions.length - 1];
-  const older = v.questions.slice(0, -1).reverse();
+  // Independent questions: each is accepted on its own and gets its own run.
+  const qs = v.questions, last = qs[qs.length - 1];
+  const runFor = (q) => v.runs.filter(r => !r.parent_run_id && r.question_version === q.version).slice(-1)[0];
   let body = "";
-  if (!q) body += `<p class="muted">${isAuditee() ? "Waiting for the auditor to ask a question." : "Ask something the connected information can answer. Be specific about what counts as yes."}</p>`;
-  else body += `<div class="stack" style="gap:8px"><div class="row">${statusPill(q.status)}<span class="faint small">version ${q.version} · ${esc(ago(q.asked_at_ms))} · step limit ${q.max_steps}${q.allow_fine_tuned ? " · fine-tuned models allowed" : ""}</span></div>
-    <p class="qtext">${esc(q.text)}</p><div class="pills"><span class="pill">answer: <b>${esc(formatLabel(q.answer_format))}</b></span></div>${q.note ? `<div class="callout ${q.status === "rejected" ? "bad" : "info"}"><span class="ic">“</span><span>${esc(q.note)}</span></div>` : ""}</div>`;
-  if (isAuditee() && q?.status === "proposed") {
-    body += `<div class="stack" data-keep="qdecide-${q.version}"><label class="f">Note to the auditor (optional)<input type="text" id="qNote" placeholder="e.g. please narrow this to the training service"></label>
-      <div class="row"><button class="btn primary" data-act="q-accept" data-v="${q.version}">Accept question</button><button class="btn danger" data-act="q-reject" data-v="${q.version}">Reject</button></div></div>`;
-  }
-  if (!isAuditee()) {
-    const canAsk = !q || q.status !== "proposed";
-    const clar = v.runs.find(r => r.verdict?.answer === "needs_clarification" && r.status === "released");
-    if (canAsk || q?.status === "proposed") {
-      const open = !q || q.status === "rejected" || !!clar;
-      body += `<details data-keep="qform" ${open ? "open" : ""}><summary>${q ? "Revise the question" : "Your question"}</summary>
-        <div class="stack" style="margin-top:10px">
-          ${clar ? `<div class="callout info"><span class="ic">?</span><span>The agent asked for clarification: ${esc(clar.verdict.clarification_request)}</span></div>` : ""}
-          <textarea id="qText" placeholder="Does the training pipeline compute loss on chain-of-thought tokens of model outputs?">${q ? esc(q.text) : ""}</textarea>
-          <label class="f">What you can receive back
-            <span class="hint">The enclave enforces this, so it caps what any answer can carry out. The auditee sees it before accepting.</span>
-            <select id="qFormat">
-              <option value="text" ${(q?.answer_format?.kind || "text") === "text" ? "selected" : ""}>A verdict and a short explanation</option>
-              <option value="yes_no" ${q?.answer_format?.kind === "yes_no" ? "selected" : ""}>Yes / no only</option>
-              <option value="choice" ${q?.answer_format?.kind === "choice" ? "selected" : ""}>One of my options</option>
-            </select></label>
-          <div class="grid2" id="qFormatExtra">
-            <label class="f" data-for="text">Explanation limit (bytes)<input type="number" id="qBytes" min="1" max="20000" value="${q?.answer_format?.max_bytes || 4000}"></label>
-            <label class="f" data-for="choice">Options, one per line<textarea id="qOptions" style="min-height:70px">${esc((q?.answer_format?.options || []).join("\n"))}</textarea></label>
-          </div>
-          <div class="grid2"><label class="f">Step limit<input type="number" id="qSteps" min="1" max="400" value="${q?.max_steps || 150}"></label>
-          <div class="f" style="justify-content:flex-end"><label class="check"><input type="checkbox" id="qFt" ${q?.allow_fine_tuned ? "checked" : ""}><span>Allow fine-tuned models<br><span class="faint small">A private fine-tune is the cheapest way to get a model that answers one question wrongly.</span></span></label></div></div>
-          <div class="row"><button class="btn primary" data-act="ask">${q ? "Send revised question" : "Send question"}</button><span class="faint small">The auditee must accept it.</span></div>
-        </div></details>`;
+  if (!qs.length) body += `<p class="muted">${isAuditee() ? "Waiting for the auditor to ask a question." : "Ask something the connected information can answer. Be specific about what counts as yes."}</p>`;
+  body += qs.slice().reverse().map(q => {
+    const r = runFor(q);
+    let h = `<div class="stack" style="gap:6px;padding:10px 0;border-top:1px solid var(--line)">
+      <div class="row"><b>Q${q.version}</b>${statusPill(q.status)}${r ? `<a href="#run-${esc(r.id)}" class="small">run ${r.number}</a> ${statusPill(r.status)}` : ""}
+        <span class="faint small">${esc(ago(q.asked_at_ms))} · ${esc(formatLabel(q.answer_format))} · step limit ${q.max_steps}${q.allow_fine_tuned ? " · fine-tuned models allowed" : ""}</span></div>
+      <p class="qtext">${esc(q.text)}</p>
+      ${q.note ? `<div class="callout ${q.status === "rejected" ? "bad" : "info"}"><span class="ic">“</span><span>${esc(q.note)}</span></div>` : ""}`;
+    if (isAuditee() && q.status === "proposed") {
+      h += `<div class="stack" data-keep="qdecide-${q.version}"><label class="f">Note to the auditor (optional)<input type="text" id="qNote-${q.version}" placeholder="e.g. please narrow this to the training service"></label>
+        <div class="row"><button class="btn primary" data-act="q-accept" data-v="${q.version}">Accept Q${q.version}</button><button class="btn danger" data-act="q-reject" data-v="${q.version}">Reject</button></div></div>`;
     }
+    return h + `</div>`;
+  }).join("");
+  if (!isAuditee()) {
+    const f = last?.answer_format;
+    const clar = v.runs.find(r => r.verdict?.answer === "needs_clarification" && r.status === "released");
+    body += `<details data-keep="qform" ${!qs.length ? "open" : ""}><summary>${qs.length ? "Ask another question" : "Your question"}</summary>
+      <div class="stack" style="margin-top:10px">
+        ${clar ? `<div class="callout info"><span class="ic">?</span><span>The agent asked for clarification: ${esc(clar.verdict.clarification_request)}</span></div>` : ""}
+        <textarea id="qText" placeholder="Does the training pipeline compute loss on chain-of-thought tokens of model outputs?"></textarea>
+        <label class="f">What you can receive back
+          <span class="hint">The enclave enforces this, so it caps what any answer can carry out. The auditee sees it before accepting.</span>
+          <select id="qFormat">
+            <option value="text" ${(f?.kind || "text") === "text" ? "selected" : ""}>A verdict and a short explanation</option>
+            <option value="yes_no" ${f?.kind === "yes_no" ? "selected" : ""}>Yes / no only</option>
+            <option value="choice" ${f?.kind === "choice" ? "selected" : ""}>One of my options</option>
+          </select></label>
+        <div class="grid2" id="qFormatExtra">
+          <label class="f" data-for="text">Explanation limit (bytes)<input type="number" id="qBytes" min="1" max="20000" value="${f?.max_bytes || 4000}"></label>
+          <label class="f" data-for="choice">Options, one per line<textarea id="qOptions" style="min-height:70px">${esc((f?.options || []).join("\n"))}</textarea></label>
+        </div>
+        <div class="grid2"><label class="f">Step limit<input type="number" id="qSteps" min="1" max="400" value="${last?.max_steps || 150}"></label>
+        <div class="f" style="justify-content:flex-end"><label class="check"><input type="checkbox" id="qFt" ${last?.allow_fine_tuned ? "checked" : ""}><span>Allow fine-tuned models<br><span class="faint small">A private fine-tune is the cheapest way to get a model that answers one question wrongly.</span></span></label></div></div>
+        <div class="row"><button class="btn primary" data-act="ask">Send question</button><span class="faint small">The auditee must accept it. Each question gets its own fresh run.</span></div>
+      </div></details>`;
   }
-  if (older.length) body += `<details><summary class="small">Earlier versions (${older.length})</summary><div class="stack" style="margin-top:8px">${older.map(o => `<div class="small"><span class="faint">v${o.version}</span> ${statusPill(o.status)} ${esc(o.text)}${o.note ? ` <span class="faint">— ${esc(o.note)}</span>` : ""}</div>`).join("")}</div></details>`;
-  patch("cQuestion", head(1, "Question", q?.status === "accepted") + `<div class="pad stack">${body}</div>`);
+  patch("cQuestion", head(1, "Questions", qs.some(q => q.status === "accepted")) + `<div class="pad stack" style="gap:0">${body}</div>`);
 }
 
 // ---------------------------------------------------------------- tools
@@ -538,7 +542,11 @@ function cloudFields(pre, only, p = {}) {
 }
 function showCloud(pre, id) {
   for (const c of ["bedrock", "vertex", "azure"]) { const e = $(`#${pre}-${c}`); if (e) e.hidden = c !== id; }
-  const k = $(`#${pre}Key`); if (k) k.placeholder = id === "vertex" ? "paste the service-account key file (JSON)" : id === "bedrock" ? "Bedrock API key" : k.placeholder;
+  const k = $(`#${pre}Key`); if (!k) return;
+  // The auditor's key is optional; keep that hint unless they pick a provider.
+  const keyPh = { anthropic: "sk-ant-…", openai: "sk-…", openrouter: "sk-or-v1-…", bedrock: "Bedrock API key", vertex: "paste the service-account key file (JSON)", azure: "Azure OpenAI key", mock: "test-key" };
+  k.dataset.ph ??= k.placeholder;
+  k.placeholder = (isAuditee() ? keyPh[id] : null) || (id === "vertex" || id === "bedrock" ? keyPh[id] : k.dataset.ph);
 }
 function cloudValues(pre) {
   const out = {};
@@ -633,12 +641,20 @@ function traceHtml(entries) {
     else if (e.type === "approval") out.push(`<div class="ev"><div class="who">You</div><div class="what small">${e.approved ? `<span class="pill ok">approved</span>` : `<span class="pill warn">denied</span>`} <b>${esc(e.tool)}</b>${e.reason ? ` <span class="faint">${esc(e.reason)}</span>` : ""}</div></div>`);
     else if (e.type === "harness") out.push(`<div class="ev"><div class="who">Harness</div><div class="what faint small">${esc(e.content)}</div></div>`);
     else if (e.type === "error") out.push(`<div class="ev"><div class="who">Error</div><div class="what"><div class="callout bad"><span>${esc(e.content)}</span></div></div></div>`);
+    else if (e.type === "step") out.push(`<div class="ev"><div class="who">Agent</div><div class="what">${(e.tools || []).length ? e.tools.map(t => `<span class="call"><b>${esc(t)}</b></span>`).join("") : `<span class="faint small">thinking</span>`}</div></div>`);
     else if (e.type === "files_read") out.push(`<div class="ev"><div class="who">Read</div><div class="what"><div class="pills">${(e.paths || []).map(p => `<span class="pill mono">${esc(p)}</span>`).join("") || `<span class="faint small">no files</span>`}</div></div></div>`);
   }
   return out.join("") || `<span class="faint small">Starting…</span>`;
 }
+const watching = (v) => !!v && (v.auditor_watch === "steps" || v.auditor_watch === "full");
 function approvalHtml(v) {
-  if (!isAuditee()) return v.tool_approval ? `<div class="pad"><div class="callout info small"><span class="ic">i</span><span>The auditee approves or denies each of the agent's tool calls before it runs. A denial can keep evidence from the agent; certificates count them.</span></div></div>` : "";
+  if (!isAuditee()) {
+    const notes = [];
+    if (v.tool_approval) notes.push("The auditee approves or denies each of the agent's tool calls before it runs. A denial can keep evidence from the agent; certificates count them.");
+    if (v.auditor_watch === "steps") notes.push("The auditee lets you watch which tools the agent uses as it works (not what it reads).");
+    if (v.auditor_watch === "full") notes.push("The auditee lets you watch everything the agent does as it works.");
+    return notes.length ? `<div class="pad stack" style="gap:6px">${notes.map(n => `<div class="callout info small"><span class="ic">i</span><span>${n}</span></div>`).join("")}</div>` : "";
+  }
   const pend = v.pending_tool_calls || [];
   const head = `<div class="row" style="justify-content:space-between"><span class="small"><b>Approve each tool call</b> ${v.tool_approval ? `<span class="pill ok">on</span>` : `<span class="pill">off</span>`}<br><span class="faint">Every command, file read or service request waits for your decision (denied after 15 minutes). The auditor sees that this is on, and certificates count the denials.</span></span>
     <button class="btn" data-act="tool-approval" data-on="${v.tool_approval ? "" : "1"}">${v.tool_approval ? "Turn off" : "Turn on"}</button></div>
@@ -646,7 +662,10 @@ function approvalHtml(v) {
   const items = pend.map(c => `<div class="panel pad stack" style="gap:6px;border-color:var(--warn,#c80)"><div class="row" style="gap:8px"><b>${esc(c.tool)}</b><span class="pill">run ${c.run_number}</span><span class="pill">${esc(c.agent)}</span><span class="faint small">waiting ${esc(ago(c.asked_at_ms))}</span></div>
       <pre class="out" style="max-height:220px">${esc(JSON.stringify(c.input, null, 1))}</pre>
       <div class="row"><input type="text" id="tcr-${c.id}" placeholder="Reason (shown to the agent, optional)" style="flex:1"><button class="btn primary" data-act="tc-decide" data-id="${c.id}" data-ok="1">Approve</button><button class="btn danger" data-act="tc-decide" data-id="${c.id}" data-ok="">Deny</button></div></div>`).join("");
-  return `<div class="pad stack" style="gap:10px;border-bottom:1px solid var(--line,#8883)">${head}${items}</div>`;
+  const w = v.auditor_watch || "off";
+  const watch = `<div class="row" style="justify-content:space-between"><span class="small"><b>What the auditor can watch</b><br><span class="faint">${w === "full" ? "Everything the agent does, including what it reads." : w === "steps" ? "Which tools the agent uses, live. Not what it reads or writes." : "Nothing until you release a result."} Covers every run, earlier ones too.</span></span>
+    <div class="row" style="gap:4px" role="group">${[["off", "Nothing"], ["steps", "Steps"], ["full", "Everything"]].map(([m, l]) => `<button class="btn ${w === m ? "primary" : ""}" data-act="watch" data-mode="${m}" aria-pressed="${w === m}">${l}</button>`).join("")}</div></div>`;
+  return `<div class="pad stack" style="gap:10px;border-bottom:1px solid var(--line,#8883)">${head}${items}${watch}</div>`;
 }
 function renderRuns(v) {
   const runs = [...v.runs].reverse();
@@ -654,11 +673,11 @@ function renderRuns(v) {
   if (!runs.length) body += `<div class="pad"><p class="muted">The agent starts automatically once the question is accepted, something is connected, and a model is approved.</p></div>`;
   else body += runs.map(r => runHtml(v, r)).join("");
   patch("cRuns", head(4, "Agent runs", runs.some(r => r.status === "released"), `<span class="faint small">${runs.length || ""}</span>`) + body);
-  for (const r of runs) if (isAuditee()) patch("tx-" + r.id, traceHtml(S.traces[r.id]?.entries || []));
+  for (const r of runs) if (isAuditee() || watching(v)) patch("tx-" + r.id, traceHtml(S.traces[r.id]?.entries || []));
 }
 function runHtml(v, r) {
   const parent = r.parent_run_id ? v.runs.find(x => x.id === r.parent_run_id) : null;
-  const meta = `<div class="row" style="justify-content:space-between"><div class="row" style="gap:8px"><b>Run ${r.number}</b>${statusPill(r.status)}${parent ? `<span class="faint small">follow-up to run ${parent.number}</span>` : `<span class="faint small">question v${r.question_version}</span>`}</div>
+  const meta = `<div class="row" style="justify-content:space-between"><div class="row" style="gap:8px"><b>Run ${r.number}</b>${statusPill(r.status)}${parent ? `<span class="faint small">follow-up to run ${parent.number}</span>` : `<span class="faint small">Q${r.question_version}</span>`}</div>
     <span class="faint small">${esc(r.model?.provider)} / ${esc(r.model?.model)} · ${esc(ago(r.started_at_ms))}</span></div>`;
   const msgs = (r.messages || []).filter((m, i, all) => !parent || i >= (parent.messages || []).length);
   const msgHtml = msgs.map(m => `<div class="callout info"><span class="ic">✉</span><span>${m.blinded ? "<b>Blinded</b> follow-up" : "Follow-up"} from the auditor${m.text ? `: ${esc(m.text)}` : (isAuditee() ? " (hidden from you)" : "")}</span></div>`).join("");
@@ -674,7 +693,9 @@ function runHtml(v, r) {
     if (r.status === "released" || r.status === "declined") main += `<p class="small faint">You ${r.status} this ${esc(ago(r.decided_at_ms))}${r.decision_note ? `: “${esc(r.decision_note)}”` : ""}.</p>`;
     main += `<details ${r.status === "running" ? "open" : ""} data-keep="txd-${r.id}"><summary>Transcript (only you can see this)</summary><div class="tx" id="tx-${r.id}"></div></details>`;
   } else {
-    if (r.status === "running") main += `<div class="row"><i class="spin" style="color:var(--accent)"></i><span class="muted">The agent is working. You can't see its progress; you'll see the result if the auditee releases it.</span></div>`;
+    if (watching(v)) main += `<details ${r.status === "running" ? "open" : ""} data-keep="txd-${r.id}"><summary>${r.status === "running" ? `<i class="spin" style="color:var(--accent)"></i> The agent is working: watch it` : "What the agent did"}</summary><div class="tx" id="tx-${r.id}"></div></details>`;
+    if (r.status === "running" && watching(v)) {}
+    else if (r.status === "running") main += `<div class="row"><i class="spin" style="color:var(--accent)"></i><span class="muted">The agent is working. You can't see its progress; you'll see the result if the auditee releases it.</span></div>`;
     else if (r.status === "awaiting_release") main += `<p class="muted">The agent finished. Waiting for the auditee to release or decline the result.</p>`;
     else if (r.status === "declined") main += `<div class="callout bad"><span class="ic">×</span><span>The auditee declined to release this result${r.decision_note ? `: “${esc(r.decision_note)}”` : "."}</span></div>`;
     else if (r.status === "released") main += verdictHtml(r) + (r.flags?.length ? `<div class="stack" style="gap:6px"><h3>Weigh these</h3><ul class="flags">${r.flags.map(f => `<li>${esc(f)}</li>`).join("")}</ul></div>` : "") + facts(r.manifest)
@@ -686,7 +707,7 @@ function runHtml(v, r) {
         ${(v.connections || []).length ? `<span class="faint small">Blinded messages aren't available here: the agent's requests to the connected services could carry the text to the auditee.</span>` : `<label class="check"><input type="checkbox" id="fub-${r.id}"><span>Blind this message from the auditee<br><span class="faint small">They see that you sent one and everything the agent does in response, but not your text. They still decide on release.</span></span></label>`}
         <div class="row"><button class="btn primary" data-act="followup" data-run="${r.id}">Send follow-up</button></div></div></details>`;
   }
-  return `<div class="run pad stack">${meta}${msgHtml}${main}</div>`;
+  return `<div class="run pad stack" id="run-${esc(r.id)}">${meta}${msgHtml}${main}</div>`;
 }
 
 // ---------------------------------------------------------------- disclosures
@@ -794,10 +815,11 @@ document.addEventListener("click", async (e) => {
       const answer_format = kind === "yes_no" ? { kind } : kind === "choice"
         ? { kind, options: val("qOptions").split("\n").map(s => s.trim()).filter(Boolean) }
         : { kind: "text", max_bytes: Number(val("qBytes") || 4000) };
-      return sapi("/question", { method: "POST", body: { text: val("qText"), max_steps: Number(val("qSteps") || 150), allow_fine_tuned: $("#qFt")?.checked, answer_format } });
+      return sapi("/question", { method: "POST", body: { text: val("qText"), max_steps: Number(val("qSteps") || 150), allow_fine_tuned: $("#qFt")?.checked, answer_format } })
+        .then(r => { const t = $("#qText"); if (t) t.value = ""; $("[data-keep=qform]")?.removeAttribute("open"); return r; });
     },
-    "q-accept": () => sapi("/question/decision", { method: "POST", body: { version: Number(b.dataset.v), accept: true, note: val("qNote") } }),
-    "q-reject": () => sapi("/question/decision", { method: "POST", body: { version: Number(b.dataset.v), accept: false, note: val("qNote") } }),
+    "q-accept": () => sapi("/question/decision", { method: "POST", body: { version: Number(b.dataset.v), accept: true, note: val(`qNote-${b.dataset.v}`) } }),
+    "q-reject": () => sapi("/question/decision", { method: "POST", body: { version: Number(b.dataset.v), accept: false, note: val(`qNote-${b.dataset.v}`) } }),
     "github": () => sapi("/code/github", { method: "POST", timeout: 15 * 60 * 1000, body: { repo: val("ghRepo").trim(), ref: val("ghRef").trim() || undefined, token: val("ghToken").trim() } }),
     "connect": () => {
       const k = b.dataset.kind, body = { kind: k };
@@ -810,6 +832,7 @@ document.addEventListener("click", async (e) => {
       return sapi("/connections", { method: "POST", timeout: 60000, body });
     },
     "tool-approval": () => sapi("/tool-approval", { method: "POST", body: { enabled: !!b.dataset.on } }),
+    "watch": () => sapi("/auditor-watch", { method: "POST", body: { mode: b.dataset.mode } }),
     "tc-decide": () => sapi(`/tool-calls/${b.dataset.id}`, { method: "POST", body: { approve: !!b.dataset.ok, reason: val("tcr-" + b.dataset.id) } }),
     "disconnect": () => sapi(`/connections/${b.dataset.id}`, { method: "DELETE" }),
     "propose-model": () => sapi("/models", { method: "POST", body: { provider: $("#mProv [aria-pressed=true]").dataset.p, model: val("mModel"), api_key: val("mKey"), openrouter_zdr: $("#mZdr")?.checked, openrouter_only: (val("mOnly") || "").split(",").map(s => s.trim()).filter(Boolean), mock_endpoint: val("mMock"), agent: val("mAgent") || "builtin", ...cloudValues("m") } }),
@@ -904,8 +927,10 @@ async function refresh(wait = false) {
   const q = wait && S.view ? `?version=${S.view.version}&wait=25` : "";
   const view = await sapi(q, { timeout: 35000 });
   if (!S.view || view.version >= S.view.version) S.view = view;
+  // The auditor's copy depends on what it may watch: refetch when that changes.
+  if (!isAuditee() && S.watchMode !== S.view.auditor_watch) { S.traces = {}; S.watchMode = S.view.auditor_watch; }
   for (const r of S.view.runs) {
-    if (!isAuditee()) continue;
+    if (!isAuditee() && !watching(S.view)) continue;
     const t = S.traces[r.id] || (S.traces[r.id] = { entries: [], next: 0, done: false });
     if (t.done) continue;
     // Pages of up to a few MiB; keep fetching while there's more.
@@ -923,7 +948,10 @@ async function refresh(wait = false) {
 async function pollLoop() {
   if (S.polling) return; S.polling = true;
   for (;;) {
-    try { await refresh(true); } catch (e) { await new Promise(r => setTimeout(r, 5000)); }
+    // A watching auditor isn't woken by the agent's progress (that would
+    // leak timing to auditors who can't watch), so it polls instead.
+    const live = !isAuditee() && watching(S.view) && S.view.runs.some(r => r.status === "running");
+    try { await refresh(!live); if (live) await new Promise(r => setTimeout(r, 2000)); } catch (e) { await new Promise(r => setTimeout(r, 5000)); }
   }
 }
 

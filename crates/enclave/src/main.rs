@@ -1277,6 +1277,7 @@ async fn session_route(
         }
         ("POST", ["notify"]) => ok(s.set_notify(ctx, role, &body_json(req).await?)?),
         ("POST", ["tool-approval"]) => ok(s.set_tool_approval(ctx, role, &body_json(req).await?)?),
+        ("POST", ["auditor-watch"]) => ok(s.set_auditor_watch(ctx, role, &body_json(req).await?)?),
         ("GET", ["tool-calls"]) => {
             if role != attest_core::Role::Auditee {
                 return Err(anyhow!("only the auditee approves tool calls").into());

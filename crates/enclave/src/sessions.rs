@@ -139,6 +139,27 @@ struct State {
     connections: Vec<crate::connections::Connection>,
     /// The auditee approves each tool call of runs started while this is on.
     tool_approval: bool,
+    /// What the auditor may watch of the agent's work, as it happens:
+    /// "" (nothing), "steps" (which tools it called) or "full" (everything
+    /// the auditee sees). The auditee chooses; it covers every run.
+    auditor_watch: String,
+}
+
+/// Names of the tools a raw model response (Anthropic or OpenAI, JSON or
+/// SSE) calls, in order, without repeats.
+fn tool_names(text: &str) -> Vec<Value> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r#""type"\s*:\s*"(?:tool_use|server_tool_use|function_call|custom_tool_call|local_shell_call)"[^{}]*?"name"\s*:\s*"([A-Za-z0-9_.:-]{1,64})""#).unwrap()
+    });
+    let mut out: Vec<Value> = Vec::new();
+    for c in re.captures_iter(text) {
+        let n = json!(&c[1]);
+        if !out.contains(&n) {
+            out.push(n);
+        }
+    }
+    out
 }
 
 /// A status: one of a fixed set of strings. (An alias, so serde doesn't
@@ -774,11 +795,9 @@ impl Session {
         let mut st = lock(&self.st);
         ensure!(
             st.questions.len() < MAX_QUESTION_VERSIONS,
-            "this session has {MAX_QUESTION_VERSIONS} question versions already; start a new session"
+            "this session has {MAX_QUESTION_VERSIONS} questions already; start a new session"
         );
-        for q in st.questions.iter_mut().filter(|q| q.status == "proposed") {
-            q.status = "superseded";
-        }
+        // Each question is independent: asking one doesn't replace another.
         let version = st.questions.len() as u32 + 1;
         st.questions.push(Question {
             version,
@@ -791,11 +810,7 @@ impl Session {
             note: None,
             decided_at_ms: None,
         });
-        let msg = if version == 1 {
-            "The auditor asked a question.".to_string()
-        } else {
-            format!("The auditor revised the question (version {version}).")
-        };
+        let msg = format!("The auditor asked question {version}.");
         self.event(
             ctx,
             &mut st,
@@ -828,13 +843,9 @@ impl Session {
         let mut st = lock(&self.st);
         let q = st
             .questions
-            .last_mut()
-            .ok_or_else(|| anyhow!("no question yet"))?;
-        ensure!(
-            q.version == version,
-            "question version {version} is not the current one ({})",
-            q.version
-        );
+            .iter_mut()
+            .find(|q| q.version == version)
+            .ok_or_else(|| anyhow!("no question {version}"))?;
         ensure!(
             q.status == "proposed",
             "question {version} was already {}",
@@ -844,9 +855,9 @@ impl Session {
         q.note = note.clone();
         q.decided_at_ms = Some(now_ms());
         let msg = match (accept, &note) {
-            (true, _) => format!("The auditee accepted question version {version}."),
-            (false, Some(n)) => format!("The auditee rejected question version {version}: {n}"),
-            (false, None) => format!("The auditee rejected question version {version}."),
+            (true, _) => format!("The auditee accepted question {version}."),
+            (false, Some(n)) => format!("The auditee rejected question {version}: {n}"),
+            (false, None) => format!("The auditee rejected question {version}."),
         };
         self.event(
             ctx,
@@ -925,6 +936,28 @@ impl Session {
             self.event(ctx, &mut st, "tool_approval", msg.into(), None, Some(role), false);
         }
         Ok(json!({"tool_approval": on}))
+    }
+
+    /// Let the auditor watch the agent's work: nothing, its steps, or all of it.
+    pub fn set_auditor_watch(self: &Arc<Self>, ctx: &Arc<Ctx>, role: Role, v: &Value) -> Result<Value> {
+        ensure!(role == Role::Auditee, "only the auditee decides what the auditor sees");
+        let mode = match v["mode"].as_str().unwrap_or("") {
+            "" | "off" => "",
+            "steps" => "steps",
+            "full" => "full",
+            m => bail!("mode must be off, steps or full (got {m})"),
+        };
+        let mut st = lock(&self.st);
+        if st.auditor_watch != mode {
+            st.auditor_watch = mode.into();
+            let msg = match mode {
+                "steps" => "The auditee lets the auditor watch which tools the agent uses, as it works (not what it reads).",
+                "full" => "The auditee lets the auditor watch everything the agent does, including what it reads.",
+                _ => "The auditor can no longer watch the agent's work.",
+            };
+            self.event(ctx, &mut st, "auditor_watch", msg.into(), None, Some(role), true);
+        }
+        Ok(json!({"auditor_watch": if mode.is_empty() { "off" } else { mode }}))
     }
 
     pub fn tool_approval_on(&self) -> bool {
@@ -1316,17 +1349,22 @@ impl Session {
         if st.expired {
             return;
         }
-        let Some(q) = st.questions.last() else { return };
-        // Not while a run awaits the auditee's decision either: a new run
-        // starting would tell the auditor when the earlier one finished.
-        if q.status != "accepted"
-            || st
-                .runs
-                .iter()
-                .any(|r| r.status == "running" || r.status == "awaiting_release")
-        {
+        // One run at a time, and not while a run awaits the auditee's
+        // decision either: a new run starting would tell the auditor when
+        // the earlier one finished.
+        if st.runs.iter().any(|r| r.status == "running" || r.status == "awaiting_release") {
             return;
         }
+        // The earliest accepted question that hasn't run yet; otherwise the
+        // latest accepted one (it reruns when the model or what's connected
+        // changes).
+        let accepted = || st.questions.iter().filter(|q| q.status == "accepted");
+        let Some(q) = accepted()
+            .find(|q| !st.runs.iter().any(|r| r.parent.is_none() && r.question_version == q.version))
+            .or_else(|| accepted().last())
+        else {
+            return;
+        };
         // Something to investigate: code, connected services, or both.
         let tree = match &st.code {
             Some(code) => {
@@ -1656,6 +1694,7 @@ impl Session {
             }),
             "connections": st.connections.iter().map(|c| &c.rec).collect::<Vec<_>>(),
             "tool_approval": st.tool_approval,
+            "auditor_watch": if st.auditor_watch.is_empty() { "off" } else { st.auditor_watch.as_str() },
             "pending_tool_calls": if role == Role::Auditee { json!(self.approvals.list()) } else { Value::Null },
             "models": st.models.iter().map(|m| m.public()).collect::<Vec<_>>(),
             "runs": runs,
@@ -1676,11 +1715,12 @@ impl Session {
     }
 
     pub fn trace(&self, role: Role, run_id: &str, after: usize) -> Result<Value> {
-        ensure!(
-            role == Role::Auditee,
-            "only the auditee can see the agent's trace"
-        );
         let st = lock(&self.st);
+        let steps_only = match (role, st.auditor_watch.as_str()) {
+            (Role::Auditee, _) | (_, "full") => false,
+            (_, "steps") => true,
+            _ => bail!("only the auditee can see the agent's trace"),
+        };
         let r = st
             .runs
             .iter()
@@ -1689,7 +1729,23 @@ impl Session {
         Ok(
             {
                 // Pages of up to 4 MiB: a run's trace can be 40 MiB.
-                let (entries, next) = r.trace.page(after, 4 << 20);
+                let (mut entries, next) = r.trace.page(after, 4 << 20);
+                if steps_only {
+                    // Which tools, nothing they read or wrote. Placeholders
+                    // keep positions, which the client pages by.
+                    for e in entries.iter_mut() {
+                        *e = if e["type"] == "assistant" {
+                            let tools: Vec<Value> = e["tool_calls"].as_array().map(|c| c.iter().map(|c| c["name"].clone()).collect()).unwrap_or_default();
+                            json!({"type": "step", "tools": tools})
+                        } else if e["type"] == "model_exchange" {
+                            // A jailed agent's model call: the tools the model
+                            // asked for, from the raw response.
+                            json!({"type": "step", "tools": tool_names(e["response"].as_str().unwrap_or(""))})
+                        } else {
+                            json!({"type": "hidden"})
+                        };
+                    }
+                }
                 json!({"run_id": r.id, "status": r.status, "next": next, "more": next < r.trace.len(), "entries": entries})
             },
         )

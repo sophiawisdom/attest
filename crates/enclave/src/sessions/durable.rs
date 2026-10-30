@@ -83,6 +83,7 @@ struct SnapshotRef<'a> {
     disclosures: &'a Vec<DisclosureState>,
     connections: &'a Vec<crate::connections::Connection>,
     tool_approval: bool,
+    auditor_watch: &'a str,
 }
 
 /// ...and owned, to read it back.
@@ -108,6 +109,8 @@ struct Snapshot {
     connections: Vec<crate::connections::Connection>,
     #[serde(default)]
     tool_approval: bool,
+    #[serde(default)]
+    auditor_watch: String,
 }
 
 fn code_name(b: &Bundle) -> String {
@@ -261,6 +264,7 @@ impl Session {
                 disclosures: &st.disclosures,
                 connections: &st.connections,
                 tool_approval: st.tool_approval,
+                auditor_watch: &st.auditor_watch,
             })?
         };
         let generation = lock(&self.written).0 + 1;
@@ -558,6 +562,7 @@ async fn restore_session(ctx: &Arc<Ctx>, sid: &str, head_ref: &str) -> Result<Ar
         disclosures: snap.disclosures,
         connections: snap.connections,
         tool_approval: snap.tool_approval,
+        auditor_watch: snap.auditor_watch,
         disclosures_in_flight: 0,
     };
     // Runs that were going when the state was written can't continue here:
