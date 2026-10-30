@@ -75,6 +75,12 @@ ARG TARGETARCH
 ARG CODEX_VERSION=0.164.0
 ARG CLAUDE_CODE_VERSION=2.1.311
 ARG NODE_VERSION=v24.22.0
+# Python for the jailed agents, with the usual data libraries, so they can
+# open parquet, pickles and the like. Versions pinned; wheels not hash-pinned
+# yet.
+ARG PY_BUILD=20261013
+ARG PY_VERSION=3.12.15
+ARG PY_PACKAGES="numpy==2.3.4 pandas==2.3.3 pyarrow==21.0.0"
 COPY build/pi/package.json build/pi/package-lock.json /tmp/pi/
 # `busybox --list` includes "busybox" itself, which must not be linked over
 # the binary. Codex runs its exec tool through codex-code-mode-host.
@@ -88,12 +94,14 @@ RUN set -eux; J=/opt/jailroot; mkdir -p $J/bin $J/usr/bin $J/usr/lib $J/lib; \
         CODEX_SHA=29a507a2a3fd8f6cd94b96b762d281d299d15d7902dee6132d314b78cf9108eb; \
         CMH_SHA=0e0bdde24d5b31b05519693635baa9c4f2dc4fe7eee31c67b92155f190dd32d2; \
         CC_SHA=804f385122f395d382cf3dec51e1bec1dd8e5c07078222781a1a251d46d236e5; \
-        NODE_SHA=fef00bb4d36e1c50104a9775a10359beee98f162b4104dd12472c75065c6a143 ;; \
+        NODE_SHA=fef00bb4d36e1c50104a9775a10359beee98f162b4104dd12472c75065c6a143; \
+        PY_T=aarch64-unknown-linux-gnu; PY_SHA=9467a99bacc7d90b64b02de7fa9ecfc99b72905e64e74f7ff6b460ad95cfed5a ;; \
       amd64) T=x86_64-unknown-linux-musl; N=x64; \
         CODEX_SHA=90dd0b03b28afcb7fa733a4f73b413db2916a47347efd43fb669cc1c774ee8e4; \
         CMH_SHA=feade7026436baa4e82e898050c7ef82a8adbd98163dc504771275b5ef224f2f; \
         CC_SHA=4353c611f9a33063c5525348a15f1212bdc0085e4a7a81b8370b790003df1b56; \
-        NODE_SHA=cc2f601cee82d9a5a233302fe307abc600727035fd7d2c3a3571755989e95008 ;; \
+        NODE_SHA=cc2f601cee82d9a5a233302fe307abc600727035fd7d2c3a3571755989e95008; \
+        PY_T=x86_64-unknown-linux-gnu; PY_SHA=178d3d83b6e8e99285a65d3fce9c16b87952cc5efdb4d1a0e3ff3be18ff0fc9c ;; \
       *) echo "unsupported arch $TARGETARCH" >&2; exit 1 ;; \
     esac; \
     R=https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}; \
@@ -114,11 +122,18 @@ RUN set -eux; J=/opt/jailroot; mkdir -p $J/bin $J/usr/bin $J/usr/lib $J/lib; \
     mkdir -p $J/usr/lib/pi; mv /tmp/pi/node_modules $J/usr/lib/pi/node_modules; \
     printf '#!/bin/sh\nexec /usr/bin/node /usr/lib/pi/node_modules/@mariozechner/pi-coding-agent/dist/cli.js "$@"\n' > $J/usr/bin/pi; \
     chmod 755 $J/usr/bin/*; \
-    for b in $J/usr/bin/node $J/usr/bin/claude; do ldd $b; done \
-      | awk '$2 == "=>" && $3 ~ /^\// {print $3} $1 ~ /^\/.*ld-linux/ {print $1}' | sort -u > /tmp/libs; \
+    curl -fsSL -o /tmp/py.tgz https://github.com/astral-sh/python-build-standalone/releases/download/${PY_BUILD}/cpython-${PY_VERSION}+${PY_BUILD}-${PY_T}-install_only_stripped.tar.gz; \
+    echo "$PY_SHA  /tmp/py.tgz" | sha256sum -c; \
+    tar -xzf /tmp/py.tgz -C $J/usr; \
+    $J/usr/python/bin/python3 -m pip install --no-cache-dir --no-compile --disable-pip-version-check -q $PY_PACKAGES; \
+    ln -sf ../python/bin/python3 $J/usr/bin/python3; ln -sf ../python/bin/python3 $J/usr/bin/python; \
+    { for b in $J/usr/bin/node $J/usr/bin/claude $J/usr/python/bin/python3; do ldd $b; done; \
+      find $J/usr/python -name '*.so*' -type f -exec ldd {} \; 2>/dev/null; } \
+      | awk '$2 == "=>" && $3 ~ /^\// && $3 !~ /^\/opt\/jailroot/ {print $3} $1 ~ /^\/.*ld-linux/ {print $1}' | sort -u > /tmp/libs; \
     cat /tmp/libs; \
     while read l; do case "$l" in */lib64/*) mkdir -p $J/lib64; cp -L "$l" $J/lib64/ ;; *) cp -L "$l" $J/lib/ ;; esac; done < /tmp/libs; \
     chroot $J /usr/bin/node --version; chroot $J /usr/bin/pi --version; \
+    chroot $J /usr/bin/python3 -c 'import pandas, pyarrow, numpy; print("python ok", pandas.__version__, pyarrow.__version__)'; \
     find $J -exec touch -h -d @0 {} +
 
 FROM scratch AS artifacts
