@@ -73,6 +73,8 @@ step "building the EIF and restarting"
   install -m 755 attest-host \$O/bin/attest-host
   echo 'fast-$SHA' > \$O/built-commit
   sudo rm -f /etc/attest/pair.env /var/lib/attest/promoted
+  # Start as a lone primary, not by taking over from the (stopped) standby.
+  sudo python3 -c 'import json; p=\"/etc/attest/host.json\"; c=json.load(open(p)); c.pop(\"peer\",None); c.pop(\"standby\",None); open(p,\"w\").write(json.dumps(c))'
   cd ~/attest-src && S3_BUCKET='$BUCKET' S3_REGION='$REGION' deploy/run.sh >/dev/null
   for i in \$(seq 30); do curl -sk -m 3 https://127.0.0.1/healthz | grep -q '\"ok\":true' && exit 0; sleep 1; done
   echo 'service did not come up; see ~/attest-host.log' >&2; exit 1"
