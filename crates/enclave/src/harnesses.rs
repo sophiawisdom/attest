@@ -134,9 +134,8 @@ pub fn agent_prompt(
     );
     if let Some((v, msg)) = previous {
         p.push_str(&format!(
-            "\nYour previous verdict was: {} (confidence {:.2}).\nPrevious summary:\n{}\n\nFollow-up message from the auditor:\n<message>\n{msg}\n</message>\n",
+            "\nYour previous verdict was: {}.\nPrevious summary:\n{}\n\nFollow-up message from the auditor:\n<message>\n{msg}\n</message>\n",
             serde_json::to_string(&v.answer).unwrap_or_default(),
-            v.confidence,
             v.summary
         ));
     }
@@ -144,7 +143,7 @@ pub fn agent_prompt(
     p.push_str(match format {
         AnswerFormat::YesNo => "\nWhen you are done, write your verdict as JSON to /work/verdict.json: {\"answer\": \"yes\" | \"no\" | \"inconclusive\"} and nothing else. Then stop.",
         AnswerFormat::Choice { .. } => "\nWhen you are done, write your verdict as JSON to /work/verdict.json: {\"choice\": \"<exactly one of the options>\"} and nothing else. Then stop.",
-        AnswerFormat::Text { .. } => "\nWhen you are done, write your verdict as JSON to /work/verdict.json with exactly these keys: \"answer\" (one of \"yes\", \"no\", \"answered\", \"inconclusive\", \"needs_clarification\"; \"answered\" is for an open question, such as what, how or why, answered in the summary), \"confidence\" (0 to 1), \"summary\" (for the auditor, per the rules above, within the byte limit), and \"clarification_request\" (a string, only with needs_clarification). Then stop.",
+        AnswerFormat::Text { .. } => "\nWhen you are done, write your verdict as JSON to /work/verdict.json with exactly these keys: \"answer\" (one of \"yes\", \"no\", \"answered\", \"inconclusive\", \"needs_clarification\"; \"answered\" is for an open question, such as what, how or why, answered in the summary), \"summary\" (for the auditor, per the rules above, within the byte limit), and \"clarification_request\" (a string, only with needs_clarification). Then stop.",
     });
     p
 }

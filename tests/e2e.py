@@ -233,7 +233,7 @@ def run(work):
     msg = body["manifest"]["auditor_messages"][0]
     check(msg["blinded"] and msg["text"] is None, "certificate records the blinded message by hash only")
     check(body["manifest"]["model"]["proposed_by"] == "auditor" and body["manifest"]["model"]["key_owner"] == "org-mock-auditor", "certificate records who chose the model and the key's org")
-    check(body["manifest"]["model"]["key_from"] == "auditor" and any("auditor's own provider account" in f for f in json.loads(out.stdout)["flags"]), "certificate flags that the auditor's account was used")
+    check(body["manifest"]["model"]["key_from"] == "auditor", "certificate records that the auditor's account was used")
     check(body["manifest"]["history"]["prior_runs_in_session"] == 2, "certificate counts earlier runs")
     cert["signed"]["body"] = cert["signed"]["body"].replace('"yes"', '"no"')
     with open(path, "w") as fh:

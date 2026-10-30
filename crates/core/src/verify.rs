@@ -212,9 +212,6 @@ fn categories(c: &ScanCounts) -> String {
 /// are what the parties chose or what happened.
 pub fn manifest_warnings(m: &Manifest) -> Vec<String> {
     let mut w = Vec::new();
-    if m.verdict_only() {
-        w.push("the auditee released the verdict only: no run times, code size or tree hash, activity, or instruction-scan counts".into());
-    }
     if let Some(b) = &m.ran_on_boot_id {
         w.push(format!(
             "the run happened on boot {b}; a successor enclave of the same image took its sessions over and signed this"
@@ -224,9 +221,6 @@ pub fn manifest_warnings(m: &Manifest) -> Vec<String> {
         Outcome::Completed => {}
         Outcome::StepLimit => w.push("the agent hit its step limit before answering".into()),
         Outcome::Error { message } => w.push(format!("the run failed: {message}")),
-    }
-    if m.model.key_from == Some(Role::Auditor) {
-        w.push("the auditor's own provider account was used: it may have logged everything the model saw (the auditee accepted this)".into());
     }
     if m.model.provider == Provider::Azure {
         w.push(format!(
@@ -254,26 +248,6 @@ pub fn manifest_warnings(m: &Manifest) -> Vec<String> {
             ));
         }
     }
-    if m.model.provider == Provider::Openrouter {
-        w.push(format!(
-            "routed through OpenRouter (zero data retention {}; {}); upstream providers: {}",
-            if m.model.openrouter_zdr == Some(true) {
-                "required"
-            } else {
-                "not required"
-            },
-            if m.model.openrouter_only.is_empty() {
-                "upstream host not pinned, OpenRouter chose".to_string()
-            } else {
-                format!("upstream pinned to {}", m.model.openrouter_only.join(", "))
-            },
-            if m.model.upstream_providers.is_empty() {
-                "unreported".into()
-            } else {
-                m.model.upstream_providers.join(", ")
-            }
-        ));
-    }
     if m.model.response_models.iter().any(|r| {
         !r.starts_with(&m.model.requested_model) && !m.model.requested_model.starts_with(r.as_str())
     }) {
@@ -284,12 +258,6 @@ pub fn manifest_warnings(m: &Manifest) -> Vec<String> {
         ));
     }
     let h = &m.history;
-    if h.prior_runs_in_session > 0 {
-        w.push(format!(
-            "{} earlier run(s) in this session",
-            h.prior_runs_in_session
-        ));
-    }
     let other_trees = h
         .prior_code_trees_in_session
         .iter()

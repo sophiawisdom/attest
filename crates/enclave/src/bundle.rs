@@ -919,10 +919,9 @@ fn verdict_schema(format: &attest_core::AnswerFormat) -> serde_json::Value {
         },"required":["choice"]}),
         AnswerFormat::Text { max_bytes } => json!({"type":"object","properties":{
             "answer":{"type":"string","enum":["yes","no","answered","inconclusive","needs_clarification"],"description":"answered: an open question (what, how, why), answered in the summary"},
-            "confidence":{"type":"number","description":"0 to 1"},
             "summary":{"type":"string","description": format!("For the auditor, at most {max_bytes} bytes. Answer the question and explain the basis at a high level. No code, secrets or file contents.")},
             "clarification_request":{"type":"string","description":"Only with needs_clarification: what the auditor should change about the question (counts toward the byte limit)."}
-        },"required":["answer","confidence","summary"]}),
+        },"required":["answer","summary"]}),
     }
 }
 
