@@ -283,7 +283,7 @@ per-session key that never leaves the enclave, and bound to its session,
 path and content hash. The operator learns the number of files and their
 sizes. A run loads the whole repository into enclave memory before it
 starts, so the operator doesn't learn which files the agent reads. A file it alters or swaps fails
-authentication and is refused. Limits: 64 MiB per file, 1 GiB per upload by
+authentication and is refused. Files over 32 MiB are stored as several sealed parts. Limit: 1 GiB per upload by
 default.
 
 ## Verifying this service

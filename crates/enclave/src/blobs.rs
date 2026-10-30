@@ -33,8 +33,11 @@ pub const OP_RESET: u8 = 4;
 /// Drop the parent's local cache (it may hold records another enclave has
 /// since overwritten in the shared store).
 pub const OP_DROP_CACHE: u8 = 5;
-/// Largest single file we store (plaintext).
+/// Largest single blob we store (plaintext). Bigger files are stored as
+/// several parts of at most PART_BYTES (Sealer::seal_part).
 pub const MAX_FILE_BYTES: usize = 64 << 20;
+/// Plaintext bytes per part of a file stored in parts.
+pub const PART_BYTES: usize = 32 << 20;
 /// The parent's limit on one stored blob (crates/host: MAX_BLOB_BYTES).
 pub const HOST_MAX_BLOB_BYTES: usize = 80 << 20;
 
@@ -308,40 +311,74 @@ impl Sealer {
     /// host sees roughly how big a file is, not its exact compressed size,
     /// which could be matched against guesses of the content.
     pub fn seal(&self, path: &str, digest: &[u8; 32], plain: &[u8]) -> Result<(BlobId, Vec<u8>)> {
-        let packed = pad_blob(lz4_flex::compress_prepend_size(plain));
-        let plain = &packed[..];
+        let id = self.new_id();
+        Ok((id, self.seal_with(&self.aad(path, digest), plain)?))
+    }
+
+    /// A fresh blob id in this sealer's namespace.
+    pub fn new_id(&self) -> BlobId {
         let mut id = [0u8; 24];
         id[..8].copy_from_slice(&self.tag);
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut id[8..]);
+        id
+    }
+
+    /// Part `index` of `count` of a file too big for one blob. A file's
+    /// parts are bound to it by `first` (the id of its part 0, which is
+    /// random), so the host can't swap, reorder or drop parts; the reader
+    /// checks the whole file's digest once it has all of them.
+    fn part_aad(&self, path: &str, first: &BlobId, index: u32, count: u32) -> Vec<u8> {
+        let mut a = Vec::with_capacity(96 + path.len());
+        a.extend_from_slice(b"attest-blob-part-v1\0");
+        a.extend_from_slice(self.session_id.as_bytes());
+        a.push(0);
+        a.extend_from_slice(path.as_bytes());
+        a.push(0);
+        a.extend_from_slice(first);
+        a.extend_from_slice(&index.to_le_bytes());
+        a.extend_from_slice(&count.to_le_bytes());
+        a
+    }
+
+    /// Seal one part (store it under a fresh id; part 0 under `first`).
+    pub fn seal_part(&self, path: &str, first: &BlobId, index: u32, count: u32, plain: &[u8]) -> Result<Vec<u8>> {
+        ensure!(plain.len() <= PART_BYTES, "a part of {path} is too large");
+        self.seal_with(&self.part_aad(path, first, index, count), plain)
+    }
+
+    /// Open one part (its content is checked with the whole file's digest).
+    pub fn open_part(&self, path: &str, first: &BlobId, index: u32, count: u32, sealed: &[u8]) -> Result<Vec<u8>> {
+        self.open_with(path, &self.part_aad(path, first, index, count), sealed)
+    }
+
+    fn seal_with(&self, aad: &[u8], plain: &[u8]) -> Result<Vec<u8>> {
+        let packed = pad_blob(lz4_flex::compress_prepend_size(plain));
         let mut nonce = [0u8; 12];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
         let ct = self
             .cipher
-            .encrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: plain,
-                    aad: &self.aad(path, digest),
-                },
-            )
+            .encrypt(Nonce::from_slice(&nonce), Payload { msg: &packed[..], aad })
             .map_err(|_| anyhow!("encryption failed"))?;
         let mut out = Vec::with_capacity(12 + ct.len());
         out.extend_from_slice(&nonce);
         out.extend_from_slice(&ct);
-        Ok((id, out))
+        Ok(out)
     }
 
     pub fn open(&self, path: &str, digest: &[u8; 32], sealed: &[u8]) -> Result<Vec<u8>> {
+        let plain = self.open_with(path, &self.aad(path, digest), sealed)?;
+        ensure!(
+            &attest_core::sha256(&plain) == digest,
+            "stored copy of {path} has the wrong content"
+        );
+        Ok(plain)
+    }
+
+    fn open_with(&self, path: &str, aad: &[u8], sealed: &[u8]) -> Result<Vec<u8>> {
         ensure!(sealed.len() >= 12 + 16, "sealed file too short");
         let plain = self
             .cipher
-            .decrypt(
-                Nonce::from_slice(&sealed[..12]),
-                Payload {
-                    msg: &sealed[12..],
-                    aad: &self.aad(path, digest),
-                },
-            )
+            .decrypt(Nonce::from_slice(&sealed[..12]), Payload { msg: &sealed[12..], aad })
             .map_err(|_| {
                 anyhow!(
                     "stored copy of {path} failed authentication (tampered or swapped by the host)"
@@ -354,13 +391,7 @@ impl Sealer {
             declared <= MAX_FILE_BYTES,
             "stored copy of {path} is too large"
         );
-        let plain = lz4_flex::decompress_size_prepended(plain)
-            .map_err(|_| anyhow!("stored copy of {path} is malformed"))?;
-        ensure!(
-            &attest_core::sha256(&plain) == digest,
-            "stored copy of {path} has the wrong content"
-        );
-        Ok(plain)
+        lz4_flex::decompress_size_prepended(plain).map_err(|_| anyhow!("stored copy of {path} is malformed"))
     }
 }
 

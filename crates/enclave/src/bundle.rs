@@ -5,7 +5,7 @@
 //! parsed as they stream in, one file at a time, and reads go through a
 //! shared, size-capped cache.
 
-use crate::blobs::{BlobClient, BlobId, Cache, Sealer, MAX_FILE_BYTES};
+use crate::blobs::{BlobClient, BlobId, Cache, Sealer, PART_BYTES};
 use anyhow::{bail, ensure, Context, Result};
 use attest_core::tree::{normalize_path, sha256, tree_hash};
 use attest_core::{scan, CodeInfo, ScanCounts};
@@ -16,6 +16,9 @@ use std::sync::Arc;
 
 pub struct Entry {
     blob: BlobId,
+    /// A file bigger than one blob: the ids of its parts after the first
+    /// (`blob` is part 0). Empty for most files.
+    more: Vec<BlobId>,
     pub size: u64,
     pub digest: [u8; 32],
     pub text: bool,
@@ -73,6 +76,8 @@ pub struct CodeManifest {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ManifestEntry {
     blob: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    more: Vec<String>,
     size: u64,
     digest: String,
     text: bool,
@@ -279,11 +284,6 @@ impl Bundle {
             }
             ensure!(dirs.len() <= MAX_DIRS, "more than {MAX_DIRS} directories");
             let size = entry.size();
-            ensure!(
-                size as usize <= MAX_FILE_BYTES,
-                "{path} is larger than {} MiB; leave it out",
-                MAX_FILE_BYTES >> 20
-            );
             total += size;
             ensure!(
                 total <= max_total,
@@ -291,24 +291,50 @@ impl Bundle {
                 max_total >> 20
             );
             ensure!(files.len() < MAX_FILES, "more than {MAX_FILES} files");
-            let mut bytes = Vec::with_capacity(size as usize);
-            (&mut entry)
-                .take(MAX_FILE_BYTES as u64 + 1)
-                .read_to_end(&mut bytes)?;
-            ensure!(
-                bytes.len() as u64 == size,
-                "{path}: truncated archive entry"
-            );
-            let digest = sha256(&bytes);
-            let text = is_text(&bytes);
-            let scan = if text {
-                scan::scan_text(&String::from_utf8_lossy(&bytes))
-                    .into_iter()
-                    .map(|(k, n)| (k.to_string(), n))
-                    .collect()
-            } else {
-                vec![]
-            };
+            // Small files are one blob; bigger ones go in parts, read and
+            // sealed one at a time so a big file never sits whole in memory
+            // here.
+            let parts = (size as usize).div_ceil(PART_BYTES).max(1);
+            let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+            let mut text = true;
+            let mut scan_counts: BTreeMap<String, u64> = BTreeMap::new();
+            let mut ids: Vec<BlobId> = Vec::with_capacity(parts);
+            let mut digest = [0u8; 32];
+            let mut got = 0u64;
+            for i in 0..parts {
+                let want = (size - got).min(PART_BYTES as u64);
+                let mut bytes = Vec::with_capacity(want as usize);
+                (&mut entry).take(want).read_to_end(&mut bytes)?;
+                ensure!(bytes.len() as u64 == want, "{path}: truncated archive entry");
+                got += want;
+                if i == 0 {
+                    text = is_text(&bytes);
+                }
+                if text {
+                    for (k, n) in scan::scan_text(&String::from_utf8_lossy(&bytes)) {
+                        *scan_counts.entry(k.to_string()).or_default() += n;
+                    }
+                }
+                if parts == 1 {
+                    digest = sha256(&bytes);
+                    let (blob, sealed) = sealer.seal(&path, &digest, &bytes)?;
+                    drop(bytes);
+                    rt.block_on(store.put(&blob, &sealed)).with_context(|| format!("storing {path}"))?;
+                    ids.push(blob);
+                } else {
+                    sha2::Digest::update(&mut hasher, &bytes);
+                    let id = sealer.new_id();
+                    let first = if i == 0 { id } else { ids[0] };
+                    let sealed = sealer.seal_part(&path, &first, i as u32, parts as u32, &bytes)?;
+                    drop(bytes);
+                    rt.block_on(store.put(&id, &sealed)).with_context(|| format!("storing {path}"))?;
+                    ids.push(id);
+                }
+            }
+            if parts > 1 {
+                digest = sha2::Digest::finalize(hasher).into();
+            }
+            let scan: Vec<(String, u64)> = scan_counts.into_iter().collect();
             if !scan.is_empty() {
                 scan_total.files_with_matches += 1;
                 for (k, n) in &scan {
@@ -318,15 +344,14 @@ impl Bundle {
                         .or_default() += n;
                 }
             }
-            let (blob, sealed) = sealer.seal(&path, &digest, &bytes)?;
-            drop(bytes);
-            rt.block_on(store.put(&blob, &sealed))
-                .with_context(|| format!("storing {path}"))?;
+            let blob = ids[0];
+            let more = ids[1..].to_vec();
             if files
                 .insert(
                     path.clone(),
                     Entry {
                         blob,
+                        more,
                         size,
                         digest,
                         text,
@@ -399,6 +424,7 @@ impl Bundle {
                         p.clone(),
                         ManifestEntry {
                             blob: hex::encode(e.blob),
+                            more: e.more.iter().map(hex::encode).collect(),
                             size: e.size,
                             digest: hex::encode(e.digest),
                             text: e.text,
@@ -428,6 +454,7 @@ impl Bundle {
                 p,
                 Entry {
                     blob: arr(&e.blob)?,
+                    more: e.more.iter().map(|m| arr(m)).collect::<Result<_>>()?,
                     size: e.size,
                     digest: arr(&e.digest)?,
                     text: e.text,
@@ -467,20 +494,11 @@ impl Bundle {
         }
         use futures_util::StreamExt;
         let mut all = std::collections::HashMap::with_capacity(self.files.len());
-        let jobs: Vec<(String, BlobId, [u8; 32])> = self
-            .files
-            .iter()
-            .map(|(p, e)| (p.clone(), e.blob, e.digest))
-            .collect();
-        let mut fetched = futures_util::stream::iter(jobs.into_iter().map(|(p, blob, digest)| {
+        let paths: Vec<String> = self.files.keys().cloned().collect();
+        let mut fetched = futures_util::stream::iter(paths.into_iter().map(|p| {
             let me = self.clone();
             async move {
-                let sealed = me
-                    .store
-                    .get(&blob)
-                    .await?
-                    .with_context(|| format!("the host lost the stored copy of {p}"))?;
-                let plain = me.sealer.open(&p, &digest, &sealed)?;
+                let plain = me.fetch(&p, &me.files[&p]).await?;
                 Ok::<_, anyhow::Error>((p, Arc::new(plain)))
             }
         }))
@@ -510,14 +528,29 @@ impl Bundle {
         if let Some(hit) = self.cache.get(&e.blob) {
             return Ok(hit);
         }
-        let sealed = self
-            .store
-            .get(&e.blob)
-            .await?
-            .with_context(|| format!("the host lost the stored copy of {path}"))?;
-        let plain = Arc::new(self.sealer.open(path, &e.digest, &sealed)?);
+        let plain = Arc::new(self.fetch(path, e).await?);
         self.cache.put(e.blob, plain.clone());
         Ok(plain)
+    }
+
+    /// Get a file from the host: its one blob, or all its parts in order.
+    async fn fetch(&self, path: &str, e: &Entry) -> Result<Vec<u8>> {
+        let get = |id: BlobId| async move {
+            self.store
+                .get(&id)
+                .await?
+                .with_context(|| format!("the host lost the stored copy of {path}"))
+        };
+        if e.more.is_empty() {
+            return self.sealer.open(path, &e.digest, &get(e.blob).await?);
+        }
+        let count = 1 + e.more.len() as u32;
+        let mut out = Vec::with_capacity(e.size as usize);
+        for (i, id) in std::iter::once(e.blob).chain(e.more.iter().copied()).enumerate() {
+            out.extend_from_slice(&self.sealer.open_part(path, &e.blob, i as u32, count, &get(id).await?)?);
+        }
+        ensure!(out.len() as u64 == e.size && sha256(&out) == e.digest, "stored copy of {path} has the wrong content");
+        Ok(out)
     }
 
     pub fn scan_all(&self) -> ScanCounts {
@@ -1053,6 +1086,50 @@ mod tests {
             Some("some/file.rs")
         );
         assert!(pax_path(b"99 path=x\n").is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn big_files_are_stored_in_parts() {
+        // 70 MiB: three parts. Not compressible, so it's a real test of sizes.
+        let mut big = vec![0u8; 70 << 20];
+        let mut x: u64 = 1;
+        for b in big.iter_mut() {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            *b = (x as u8) | 1; // no NULs: counts as text
+        }
+        let rt = tokio::runtime::Handle::current();
+        let store = BlobClient::memory();
+        let s2 = store.clone();
+        let t = tar_of(&[("big.txt", &big), ("small.txt", b"hello")]);
+        let b = Arc::new(
+            std::thread::spawn(move || Bundle::ingest(&t[..], "s", s2, Arc::new(Cache::new(1 << 20)), rt, 1 << 30, false))
+                .join()
+                .unwrap()
+                .unwrap(),
+        );
+        let e = &b.files["big.txt"];
+        assert_eq!(e.more.len(), 2);
+        assert!(e.text);
+        assert_eq!(e.digest, sha256(&big));
+        assert_eq!(&b.read("big.txt").await.unwrap()[..], &big[..]);
+        assert_eq!(&b.read("small.txt").await.unwrap()[..], b"hello");
+        // The manifest round-trips the parts.
+        let m = serde_json::to_string(&b.manifest()).unwrap();
+        let r = Bundle::restore("s", serde_json::from_str(&m).unwrap(), store.clone(), Arc::new(Cache::new(1 << 20))).unwrap();
+        assert_eq!(r.files["big.txt"].more, e.more);
+        let r = Arc::new(r); // kept alive: dropping it would delete the stored parts
+        let pin = r.pin().await.unwrap();
+        drop(pin);
+        // The host swapping two parts, or losing one, is caught.
+        let (p1, p2) = (store.get(&e.more[0]).await.unwrap().unwrap(), store.get(&e.more[1]).await.unwrap().unwrap());
+        store.put(&e.more[0], &p2).await.unwrap();
+        store.put(&e.more[1], &p1).await.unwrap();
+        let fresh = Bundle::restore("s", serde_json::from_str(&m).unwrap(), store.clone(), Arc::new(Cache::new(1 << 20))).unwrap();
+        let err = fresh.read("big.txt").await.unwrap_err().to_string();
+        assert!(err.contains("failed authentication"), "{err}");
+        store.put(&e.more[0], &p1).await.unwrap();
+        store.put(&e.more[1], &p1).await.unwrap(); // part 1 replayed as part 2
+        assert!(fresh.read("big.txt").await.is_err());
     }
 
     #[tokio::test(flavor = "multi_thread")]

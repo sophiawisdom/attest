@@ -342,8 +342,9 @@ def run(work):
     with open(os.path.join(big, "ok.txt"), "w") as f:
         f.write("fine\n")
     out = subprocess.run([os.path.join(BIN, "attest"), "upload", link, big, "--allow-dev", "--allow-dirty"], capture_output=True, text=True)
-    check(out.returncode == 0 and "leaving out huge.bin" in out.stderr, "CLI leaves out files over 64 MiB")
-    check(auditee.view()["code"]["file_count"] == 1, "upload replaced the code with the smaller tree")
+    check(out.returncode == 0 and "leaving out" not in out.stderr, "a 65 MiB file uploads (stored in parts)")
+    v = auditee.view()["code"]
+    check(v["file_count"] == 2 and v["total_bytes"] == (65 << 20) + 5, "upload replaced the code with the new tree, big file included")
     for p in blob_files(work):
         data = bytearray(open(p, "rb").read()); data[-1] ^= 1; open(p, "wb").write(bytes(data))
     s2 = ok("POST", "/api/sessions", body={})

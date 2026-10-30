@@ -7,7 +7,8 @@ use std::path::Path;
 use std::process::Command;
 
 /// Same per-file limit as the enclave.
-pub const MAX_FILE_BYTES: u64 = 64 << 20;
+/// The most a server accepts in total (its operator sets 1 to 4 GiB).
+pub const MAX_FILE_BYTES: u64 = 4 << 30;
 
 pub struct GitInfo {
     pub head: Option<String>,
@@ -98,7 +99,7 @@ pub fn collect(dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
         }
         if meta.len() > MAX_FILE_BYTES {
             eprintln!(
-                "note: leaving out {p} ({} MiB; the limit is 64 MiB per file)",
+                "note: leaving out {p} ({} MiB; servers accept at most 4 GiB of code)",
                 meta.len() >> 20
             );
             continue;
