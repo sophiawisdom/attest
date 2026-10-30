@@ -411,7 +411,7 @@ function toolPanes() {
   const cmd = `attest upload '${link}' ~/path/to/repo`;
   return {
     github: `<p class="small muted">The enclave downloads the repository from GitHub itself, and the certificate records the repository and commit it got. Public code needs no enclave: anyone can audit it directly.</p>
-      <div class="grid2">${field("ghRepo", "Repository", "owner/name")}${field("ghRef", "Branch, tag or commit", "main")}</div>
+      <div class="grid2">${field("ghRepo", "Repository", "owner/name")}${field("ghRef", "Branch, tag or commit", "empty: the default branch")}</div>
       ${field("ghToken", "Token", "github_pat_…", "password", `Make one at <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">github.com/settings/personal-access-tokens/new</a>: under Repository access pick only this repository; under Permissions set Contents to read-only. It's used for this one download and never stored.`)}
       <div class="row"><button class="btn primary" data-act="github">Import repository</button></div>`,
     slack: `<p class="small muted">The agent can read channels and messages through the Slack Web API. The enclave asks Slack which workspace the token belongs to, and the certificate says so.</p>

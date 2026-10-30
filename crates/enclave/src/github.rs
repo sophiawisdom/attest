@@ -51,9 +51,13 @@ fn explain(status: u16, what: &str) -> anyhow::Error {
     match status {
         401 => anyhow!("GitHub rejected the token (expired or mistyped?)"),
         403 | 429 => anyhow!("GitHub refused {what} (rate limit, or the token lacks read access to contents)"),
-        404 | 422 => anyhow!("GitHub found no such repository or ref, or the token can't read it"),
+        404 | 422 => anyhow!("GitHub found no such repository, or the token can't read it (a fine-grained token needs this repository selected, with Contents: read)"),
         s => anyhow!("GitHub answered {what} with HTTP {s}"),
     }
+}
+
+fn hv_json<'a>(h: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
+    h.iter().map(|(k, v)| (*k, v.as_str())).collect()
 }
 
 /// The commit `r` names in `repo`.
@@ -66,6 +70,22 @@ pub async fn resolve(net: &Net, repo: &str, r: &str, token: &str) -> Result<Stri
         .request_full("GET", true, API, 443, &format!("/repos/{repo}/commits/{r}"), &hv, Vec::new(), Duration::from_secs(30))
         .await?;
     if resp.status != 200 {
+        // Say which it is: the ref, or the repository (or the token).
+        if matches!(resp.status, 404 | 422) {
+            if let Ok(info) = net
+                .request_full("GET", true, API, 443, &format!("/repos/{repo}"), &hv_json(&h), Vec::new(), Duration::from_secs(30))
+                .await
+            {
+                if info.status == 200 {
+                    let v: serde_json::Value = serde_json::from_slice(&info.body).unwrap_or_default();
+                    let default = v["default_branch"].as_str().unwrap_or("");
+                    bail!(
+                        "{repo} has no branch, tag or commit named \"{r}\"{}",
+                        if default.is_empty() { String::new() } else { format!(" (its default branch is \"{default}\"; leave the field empty to use it)") }
+                    );
+                }
+            }
+        }
         return Err(explain(resp.status, "the ref lookup"));
     }
     let sha = String::from_utf8_lossy(&resp.body).trim().to_string();
