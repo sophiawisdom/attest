@@ -372,7 +372,7 @@ function renderQuestion(v) {
   const runFor = (q) => v.runs.filter(r => !r.parent_run_id && r.question_version === q.version).slice(-1)[0];
   let body = "";
   if (!qs.length) body += `<p class="muted">${isAuditee() ? "Waiting for the auditor to ask a question." : "Ask something the connected information can answer. Be specific about what counts as yes."}</p>`;
-  body += qs.slice().reverse().map(q => {
+  body += qs.map(q => {
     const r = runFor(q);
     let h = `<div class="stack" style="gap:6px;padding:10px 0;border-top:1px solid var(--line)">
       <div class="row"><b>Q${q.version}</b>${statusPill(q.status)}${r ? `<a href="#run-${esc(r.id)}" class="small">run ${r.number}</a> ${statusPill(r.status)}` : ""}
@@ -515,7 +515,7 @@ function renderCode(v) {
         ? `<span class="pill"><b>${num(c.file_count)}</b> files</span><span class="pill"><b>${bytes(c.total_bytes)}</b></span><span class="pill">tree ${hash(c.tree_sha256)}</span>`
         : `<span class="pill">commitment ${hash(c.commitment_sha256)}</span>`}<span class="faint small">${esc(ago(c.uploaded_at_ms))}</span></div>
         ${cur ? `<span class="small">${esc(a.record.statement)}</span>` : ""}
-        ${isAuditee() ? "" : `<span class="small muted">Size and tree hash stay hidden until a result is released; the certificate opens the commitment.</span>`}</div>`;
+        ${isAuditee() ? "" : ``}</div>`;
     }
     for (const k of conns) {
       body += `<div class="panel pad stack" style="gap:6px"><div class="row"><b>${esc(k.name)}</b><span class="pill">${esc(k.kind)}</span>${k.methods.length ? `<span class="pill">${esc(k.methods.join(", "))}</span>` : ""}<span class="faint small">${esc(ago(k.connected_at_ms))}</span>
@@ -582,7 +582,7 @@ function renderModel(v) {
   let body = "";
   const rows = [...v.models].reverse().filter(m => m.status !== "superseded");
   if (rows.length) body += `<div class="stack" style="gap:8px">${rows.map(m => `<div class="row" style="justify-content:space-between">
-      <div class="row" style="gap:8px"><b>${esc(m.provider)} / ${esc(m.model)}</b>${m.agent && m.agent !== "builtin" ? `<span class="pill">${esc(m.agent)}</span>` : ""}${statusPill(m.status)}${m.fine_tuned ? `<span class="pill warn">fine-tune</span>` : ""}${m.provider === "openrouter" ? `<span class="pill">${(m.openrouter_only || []).length ? "via " + esc(m.openrouter_only.join(", ")) : "any host"}${m.openrouter_zdr ? ", ZDR" : ""}</span>` : ""}<span class="faint small">${m.has_key ? `key from the ${esc(m.key_from || m.proposed_by)}` : "awaiting the auditee's key"}</span></div>
+      <div class="row" style="gap:8px"><b>${esc(m.provider)} / ${esc(m.model)}</b>${m.agent && m.agent !== "builtin" ? `<span class="pill">${esc(m.agent)}</span>` : ""}${statusPill(m.status)}${m.fine_tuned ? `<span class="pill warn">fine-tune</span>` : ""}${m.provider === "openrouter" && (m.openrouter_only || []).length ? `<span class="pill">via ${esc(m.openrouter_only.join(", "))}</span>` : ""}<span class="faint small">${m.has_key ? `key from the ${esc(m.key_from || m.proposed_by)}` : "awaiting the auditee's key"}</span></div>
       ${isAuditee() && m.status === "pending" ? `<div class="row"><button class="btn danger" data-act="m-reject" data-id="${m.id}">Reject</button></div>` : ""}
     </div>${m.note ? `<div class="small faint">“${esc(m.note)}”</div>` : ""}
     ${isAuditee() && m.status === "pending" ? `<div class="stack" data-keep="approve-${m.id}" style="gap:8px;padding:10px 12px;background:var(--sunken);border-radius:8px">
@@ -742,7 +742,7 @@ function runHtml(v, r) {
   const msgHtml = msgs.map(m => `<div class="callout info"><span class="ic">✉</span><span>${m.blinded ? "<b>Blinded</b> message" : "Message"} from the auditor${m.text ? `: ${esc(m.text)}` : (isAuditee() ? " (hidden from you)" : "")}</span></div>`).join("");
   let main = "";
   if (isAuditee()) {
-    if (r.status === "running") main += `<div class="row"><i class="spin" style="color:var(--accent)"></i><span>The agent is working · ${r.steps} model call${r.steps === 1 ? "" : "s"}</span></div>`;
+    if (r.status === "running") main += `<div class="row"><i class="spin" style="color:var(--accent)"></i><span>The agent is working${r.steps ? ` · ${r.steps} model call${r.steps === 1 ? "" : "s"}` : ""}</span></div>`;
     else main += verdictHtml(r) + flagsHtml(r, "The auditor will also see: ");
     if (r.status === "awaiting_release") main += `<div class="stack" data-keep="rel-${r.id}" style="border-top:1px solid var(--line);padding-top:12px">
       <p class="small muted">Read the answer and the transcript. Releasing sends the auditor a signed certificate with the verdict (and summary, if the format has one). Declining tells them you declined.</p>
@@ -750,9 +750,9 @@ function runHtml(v, r) {
       <label class="f">Note to the auditor (optional)<input type="text" id="note-${r.id}"></label>
       <div class="row"><button class="btn primary" data-act="release" data-run="${r.id}">Release to auditor</button><button class="btn danger" data-act="decline" data-run="${r.id}">Decline</button></div></div>`;
     if (r.status === "released" || r.status === "declined") main += `<p class="small faint">You ${r.status} this ${esc(ago(r.decided_at_ms))}${r.decision_note ? `: “${esc(r.decision_note)}”` : ""}.</p>`;
-    main += `<details ${r.status === "running" ? "open" : ""} data-keep="txd-${r.id}"><summary>Transcript (only you can see this)</summary><div class="tx cc" id="tx-${r.id}"></div></details>`;
+    main += `<details ${r.status === "running" ? "open" : ""} data-keep="txd-${r.id}-${r.status === "running" ? "live" : "done"}-${v.auditor_watch || "off"}"><summary>Transcript ${v.auditor_watch === "full" ? "(the auditor can watch it too)" : v.auditor_watch === "steps" ? "(the auditor sees the steps, not the results)" : "(only you can see this)"}</summary><div class="tx cc" id="tx-${r.id}"></div></details>`;
   } else {
-    if (watching(v)) main += `<details ${r.status === "running" ? "open" : ""} data-keep="txd-${r.id}"><summary>${r.status === "running" ? `<i class="spin" style="color:var(--accent)"></i> The agent is working: watch it` : "What the agent did"}</summary><div class="tx cc" id="tx-${r.id}"></div></details>`;
+    if (watching(v)) main += `<details ${r.status === "running" ? "open" : ""} data-keep="txd-${r.id}-${r.status === "running" ? "live" : "done"}"><summary>${r.status === "running" ? `<i class="spin" style="color:var(--accent)"></i> The agent is working: watch it` : "What the agent did"}</summary><div class="tx cc" id="tx-${r.id}"></div></details>`;
     if (r.status === "running" && watching(v)) {}
     else if (r.status === "running") main += `<div class="row"><i class="spin" style="color:var(--accent)"></i><span class="muted">The agent is working. You can't see its progress; you'll see the result if the auditee releases it.</span></div>`;
     else if (r.status === "awaiting_release") main += `<p class="muted">The agent finished. Waiting for the auditee to release or decline the result.</p>`;
