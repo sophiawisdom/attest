@@ -238,6 +238,9 @@ pub enum Answer {
     Yes,
     No,
     Inconclusive,
+    /// An open question (what, how, why): the answer is the summary.
+    /// Text format only.
+    Answered,
     /// The agent wants the auditor to rephrase or narrow the question.
     NeedsClarification,
 }

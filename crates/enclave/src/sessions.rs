@@ -150,7 +150,7 @@ struct State {
 fn tool_names(text: &str) -> Vec<Value> {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| {
-        regex::Regex::new(r#""type"\s*:\s*"(?:tool_use|server_tool_use|function_call|custom_tool_call|local_shell_call)"[^{}]*?"name"\s*:\s*"([A-Za-z0-9_.:-]{1,64})""#).unwrap()
+        regex::Regex::new(r#""type"\s*:\s*"(?:tool_use|server_tool_use|function_call|custom_tool_call|local_shell_call)"(?:[^{}]|\{[^{}]*\})*?"name"\s*:\s*"([A-Za-z0-9_.:-]{1,64})""#).unwrap()
     });
     let mut out: Vec<Value> = Vec::new();
     for c in re.captures_iter(text) {

@@ -190,9 +190,10 @@ pub fn parse_verdict(args: &Value, format: &AnswerFormat) -> anyhow::Result<Verd
         Some("yes") => Answer::Yes,
         Some("no") => Answer::No,
         Some("inconclusive") => Answer::Inconclusive,
+        Some("answered") => Answer::Answered,
         Some("needs_clarification") => Answer::NeedsClarification,
         other => anyhow::bail!(
-            "answer must be yes, no, inconclusive or needs_clarification (got {other:?})"
+            "answer must be yes, no, answered, inconclusive or needs_clarification (got {other:?})"
         ),
     };
     let confidence = args["confidence"].as_f64().unwrap_or(0.0).clamp(0.0, 1.0);

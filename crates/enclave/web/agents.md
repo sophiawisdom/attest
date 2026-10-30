@@ -204,8 +204,8 @@ is written for an agent to follow, and takes one script.
    `tool_approval` with counts of approved, denied and withheld calls, and the
    verifier warns that denials can keep evidence from the agent.
 
-6. The run ends with a verdict: `yes`, `no`, `inconclusive`, or
-   `needs_clarification` (with a `clarification_request` for the auditor).
+6. The run ends with a verdict: `yes`, `no`, `answered` (an open question,
+   answered in the summary), `inconclusive`, or `needs_clarification` (with a `clarification_request` for the auditor).
 7. The auditee decides: `POST /api/sessions/ID/runs/RUN_ID/release`
    `{"release": true|false, "details": false, "note": "optional"}`. On release
    the auditor sees the verdict and can fetch the signed certificate. By
