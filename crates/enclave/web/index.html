@@ -388,10 +388,11 @@ function renderQuestion(v) {
   if (!isAuditee()) {
     const f = last?.answer_format;
     const clar = v.runs.find(r => r.verdict?.answer === "needs_clarification" && r.status === "released");
-    body += `<details data-keep="qform" ${!qs.length ? "open" : ""}><summary>${qs.length ? "Ask another question" : "Your question"}</summary>
+    body += `<details data-keep="qform" open><summary>${qs.length ? "Ask another question" : "Your question"}</summary>
       <div class="stack" style="margin-top:10px">
         ${clar ? `<div class="callout info"><span class="ic">?</span><span>The agent asked for clarification: ${esc(clar.verdict.clarification_request)}</span></div>` : ""}
         <textarea id="qText" placeholder="Does the training pipeline compute loss on chain-of-thought tokens of model outputs?"></textarea>
+        <details class="opts"><summary class="small">Options: answer format, step limit${f && f.kind !== "text" ? ` <span class="pill">${esc(f.kind.replace("_", "/"))}</span>` : ""}</summary><div class="stack" style="margin-top:10px">
         <label class="f">What you can receive back
           <span class="hint">The enclave enforces this, so it caps what any answer can carry out. The auditee sees it before accepting.</span>
           <select id="qFormat">
@@ -405,6 +406,7 @@ function renderQuestion(v) {
         </div>
         <div class="grid2"><label class="f">Step limit<input type="number" id="qSteps" min="1" max="400" value="${last?.max_steps || 150}"></label>
         <div class="f" style="justify-content:flex-end"><label class="check"><input type="checkbox" id="qFt" ${last?.allow_fine_tuned ? "checked" : ""}><span>Allow fine-tuned models<br><span class="faint small">A private fine-tune is the cheapest way to get a model that answers one question wrongly.</span></span></label></div></div>
+        </div></details>
         <div class="row"><button class="btn primary" data-act="ask">Send question</button><span class="faint small">The auditee must accept it. Each question gets its own fresh run.</span></div>
       </div></details>`;
   }

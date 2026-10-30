@@ -2717,8 +2717,10 @@ fn status_line(st: &State, role: Role) -> String {
         };
     }
     match q.map(|q| q.status) {
+        None if role == Role::Auditor => return "Ask your question below.".into(),
         None => return "Waiting for the auditor to ask a question.".into(),
-        Some("proposed") => return "Waiting for the auditee to accept the question.".into(),
+        Some("proposed") if role == Role::Auditee => return "The auditor asked a question. Accept or reject it below.".into(),
+        Some("proposed") => return "Waiting for the auditee to accept your question.".into(),
         Some("rejected") => {
             return "The auditee rejected the question. Waiting for the auditor to revise it."
                 .into()
@@ -2754,6 +2756,22 @@ fn status_line(st: &State, role: Role) -> String {
             return "Starting.".into();
         }
         return "Done. The auditor can send a follow-up or revise the question.".into();
+    }
+    if role == Role::Auditee {
+        let todo: Vec<&str> = missing
+            .iter()
+            .map(|m| match *m {
+                "the auditee to connect code or services" => "connect code or services",
+                "the auditee to provide code" => "provide code",
+                "the auditee to approve a model" => "approve the proposed model",
+                _ => "choose a model and API key",
+            })
+            .collect();
+        let mut t = todo.join(" and ");
+        if let Some(c) = t.get_mut(0..1) {
+            c.make_ascii_uppercase();
+        }
+        return format!("{t} below.");
     }
     format!("Waiting for {}.", missing.join(", "))
 }
