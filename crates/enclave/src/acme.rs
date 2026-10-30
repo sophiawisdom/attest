@@ -131,7 +131,20 @@ pub async fn run(net: Net, tls: Arc<ServerIdentity>, name: String, extra: Option
     ));
     let mut backoff = Duration::from_secs(60);
     let mut account: Option<Account> = None;
+    // Plus a random one-off name under the domain (a wildcard DNS record
+    // points those here): each boot's certificate then covers a new set of
+    // names, so restarts don't run into Let's Encrypt's limit of five per
+    // week for the same set. Without the wildcard, the domain alone.
     let mut names = vec![name.clone()];
+    if name.parse::<std::net::IpAddr>().is_err() {
+        let label = format!("b{}.{name}", &hex::encode(ring_random8())[..10]);
+        net.allow(&label); // for this self-check only
+        if net.peer_spki_sha256(&label, 443).await.is_ok_and(|s| s == tls.spki_sha256) {
+            names.push(label);
+        } else {
+            crate::log(&format!("acme: no wildcard DNS under {name}; asking for {name} alone"));
+        }
+    }
     loop {
         match obtain(&net, &tls, &names, &directory, &mut account).await {
             Ok(()) => {
@@ -153,7 +166,7 @@ pub async fn run(net: Net, tls: Arc<ServerIdentity>, name: String, extra: Option
                 ));
                 tokio::time::sleep(wait).await;
             }
-            Err(e) if names.len() == 1 && extra.is_some() && format!("{e:#}").contains("rateLimited") => {
+            Err(e) if !names.iter().any(|n| n.parse::<std::net::IpAddr>().is_ok()) && extra.is_some() && format!("{e:#}").contains("rateLimited") => {
                 tls.clear_challenge();
                 let ip = extra.clone().unwrap();
                 crate::log(&format!("acme: {name} alone is rate-limited; asking for {name} and {ip} together"));
@@ -244,4 +257,11 @@ async fn obtain(
         .context("polling certificate")?;
     tls.install_chain_pem(&chain)?;
     Ok(())
+}
+
+fn ring_random8() -> [u8; 8] {
+    use ring::rand::SecureRandom;
+    let mut b = [0u8; 8];
+    ring::rand::SystemRandom::new().fill(&mut b).expect("system randomness");
+    b
 }
