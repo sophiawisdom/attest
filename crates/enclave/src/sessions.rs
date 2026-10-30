@@ -1190,7 +1190,8 @@ impl Session {
         let note = field(v, "note", MAX_NOTE_BYTES)?;
         let details = v["details"].as_bool().unwrap_or(false);
         let mut st = lock(&self.st);
-        let strict = st.questions.last().map(|q| q.answer_format.is_strict());
+        let qv = st.runs.iter().find(|r| r.id == run_id).map(|r| r.question_version);
+        let strict = st.questions.iter().find(|q| Some(q.version) == qv).map(|q| q.answer_format.is_strict());
         let r = st
             .runs
             .iter_mut()
@@ -1218,6 +1219,8 @@ impl Session {
             (false, None) => format!("The auditee declined to release run {n}."),
         };
         self.event(ctx, &mut st, "release_decided", msg, None, Some(role), true);
+        // The next accepted question can run now.
+        self.maybe_start(ctx, &mut st);
         Ok(json!({"ok": true}))
     }
 
