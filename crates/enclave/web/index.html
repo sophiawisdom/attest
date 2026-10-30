@@ -878,7 +878,7 @@ document.addEventListener("click", async (e) => {
         ? { kind, options: val("qOptions").split("\n").map(s => s.trim()).filter(Boolean) }
         : { kind: "text", max_bytes: Number(val("qBytes") || 4000) };
       return sapi("/question", { method: "POST", body: { text: val("qText"), max_steps: Number(val("qSteps") || 150), allow_fine_tuned: $("#qFt")?.checked, answer_format } })
-        .then(r => { const t = $("#qText"); if (t) t.value = ""; $("[data-keep=qform]")?.removeAttribute("open"); return r; });
+        .then(r => { const t = $("#qText"); if (t) t.value = ""; return r; });
     },
     "q-accept": () => sapi("/question/decision", { method: "POST", body: { version: Number(b.dataset.v), accept: true, note: val(`qNote-${b.dataset.v}`) } }),
     "q-reject": () => sapi("/question/decision", { method: "POST", body: { version: Number(b.dataset.v), accept: false, note: val(`qNote-${b.dataset.v}`) } }),
