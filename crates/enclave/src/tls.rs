@@ -38,7 +38,7 @@ pub struct ServerIdentity {
 
 struct CertResolver {
     main: RwLock<(Arc<CertifiedKey>, CertSnapshot)>,
-    challenge: RwLock<Option<(String, Arc<CertifiedKey>)>>,
+    challenge: RwLock<Vec<(String, Arc<CertifiedKey>)>>,
 }
 
 impl std::fmt::Debug for CertResolver {
@@ -55,7 +55,7 @@ impl ResolvesServerCert for CertResolver {
             .unwrap_or(false);
         if wants_acme {
             let guard = self.challenge.read().unwrap();
-            if let Some((name, ck)) = guard.as_ref() {
+            for (name, ck) in guard.iter() {
                 // IP identifiers are validated with the reverse-DNS name as
                 // SNI (RFC 8738), or none at all.
                 let ok = match hello.server_name() {
@@ -105,7 +105,7 @@ impl ServerIdentity {
         ));
         let resolver = Arc::new(CertResolver {
             main: RwLock::new((ck, snapshot)),
-            challenge: RwLock::new(None),
+            challenge: RwLock::new(Vec::new()),
         });
 
         let mut server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -161,12 +161,15 @@ impl ServerIdentity {
         let sk = rustls::crypto::ring::sign::any_supported_type(&key_der)
             .map_err(|e| anyhow!("challenge signing key: {e}"))?;
         let ck = Arc::new(CertifiedKey::new(vec![cert.der().clone()], sk));
-        *self.resolver.challenge.write().unwrap() = Some((name.to_ascii_lowercase(), ck));
+        let name = name.to_ascii_lowercase();
+        let mut c = self.resolver.challenge.write().unwrap();
+        c.retain(|(n, _)| *n != name);
+        c.push((name, ck));
         Ok(())
     }
 
     pub fn clear_challenge(&self) {
-        *self.resolver.challenge.write().unwrap() = None;
+        self.resolver.challenge.write().unwrap().clear();
     }
 
     /// Install a CA-issued chain (PEM, leaf first) for the enclave key.

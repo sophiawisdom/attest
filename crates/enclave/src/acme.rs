@@ -124,15 +124,16 @@ async fn wait_for_dns(net: &Net, tls: &ServerIdentity, name: &str) {
     }
 }
 
-pub async fn run(net: Net, tls: Arc<ServerIdentity>, name: String, directory: String) {
+pub async fn run(net: Net, tls: Arc<ServerIdentity>, name: String, extra: Option<String>, directory: String) {
     wait_for_dns(&net, &tls, &name).await;
     crate::log(&format!(
         "acme: {name} points at this enclave; requesting a certificate"
     ));
     let mut backoff = Duration::from_secs(60);
     let mut account: Option<Account> = None;
+    let mut names = vec![name.clone()];
     loop {
-        match obtain(&net, &tls, &name, &directory, &mut account).await {
+        match obtain(&net, &tls, &names, &directory, &mut account).await {
             Ok(()) => {
                 backoff = Duration::from_secs(60);
                 // Renew when a third of the certificate's lifetime is left,
@@ -152,6 +153,12 @@ pub async fn run(net: Net, tls: Arc<ServerIdentity>, name: String, directory: St
                 ));
                 tokio::time::sleep(wait).await;
             }
+            Err(e) if names.len() == 1 && extra.is_some() && format!("{e:#}").contains("rateLimited") => {
+                tls.clear_challenge();
+                let ip = extra.clone().unwrap();
+                crate::log(&format!("acme: {name} alone is rate-limited; asking for {name} and {ip} together"));
+                names.push(ip);
+            }
             Err(e) => {
                 tls.clear_challenge();
                 crate::log(&format!("acme: {e:#}; retrying in {backoff:?}"));
@@ -167,7 +174,7 @@ pub async fn run(net: Net, tls: Arc<ServerIdentity>, name: String, directory: St
 async fn obtain(
     net: &Net,
     tls: &ServerIdentity,
-    name: &str,
+    names: &[String],
     directory: &str,
     account: &mut Option<Account>,
 ) -> Result<()> {
@@ -189,13 +196,15 @@ async fn obtain(
         *account = Some(acct);
     }
     let account = account.as_ref().expect("set above");
-    let ip = name.parse::<std::net::IpAddr>().ok();
-    let idents = [match ip {
-        Some(ip) => Identifier::Ip(ip),
-        None => Identifier::Dns(name.to_string()),
-    }];
+    let idents: Vec<Identifier> = names
+        .iter()
+        .map(|n| match n.parse::<std::net::IpAddr>() {
+            Ok(ip) => Identifier::Ip(ip),
+            Err(_) => Identifier::Dns(n.to_string()),
+        })
+        .collect();
     let mut new_order = NewOrder::new(&idents);
-    if ip.is_some() {
+    if idents.iter().any(|i| matches!(i, Identifier::Ip(_))) {
         new_order = new_order.profile("shortlived");
     }
     let mut order = account.new_order(&new_order).await.context("new order")?;
@@ -211,7 +220,12 @@ async fn obtain(
             .challenge(ChallengeType::TlsAlpn01)
             .ok_or_else(|| anyhow!("no tls-alpn-01 challenge offered"))?;
         let digest = challenge.key_authorization().digest();
-        tls.set_challenge(name, digest.as_ref())?;
+        let name = match challenge.identifier().identifier {
+            Identifier::Ip(ip) => ip.to_string(),
+            Identifier::Dns(d) => d.clone(),
+            _ => bail!("unexpected identifier type"),
+        };
+        tls.set_challenge(&name, digest.as_ref())?;
         challenge.set_ready().await.context("set_ready")?;
     }
     let status = order
@@ -222,7 +236,7 @@ async fn obtain(
     if status != OrderStatus::Ready {
         bail!("order status {status:?}");
     }
-    let csr = tls.csr_der(&[name.to_string()])?;
+    let csr = tls.csr_der(names)?;
     order.finalize_csr(&csr).await.context("finalize")?;
     let chain = order
         .poll_certificate(&RetryPolicy::default())

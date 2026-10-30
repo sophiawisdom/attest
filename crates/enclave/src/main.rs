@@ -535,7 +535,10 @@ async fn service() -> Result<()> {
         let (t, d) = (t.clone(), d.clone());
         tokio::spawn(async move {
             loop {
-                let task = tokio::spawn(acme::run(net.clone(), t.clone(), d.clone(), acme_dir.clone()));
+                // With a domain, the public IP is a fallback second name:
+                // a different set of names has its own weekly limit.
+                let extra = cfg.public_ip.clone().filter(|ip| ip.parse::<std::net::IpAddr>().is_ok() && *ip != d);
+                let task = tokio::spawn(acme::run(net.clone(), t.clone(), d.clone(), extra, acme_dir.clone()));
                 if let Err(e) = task.await {
                     log(&format!("acme: renewal task died ({e}); restarting in a minute"));
                 }
