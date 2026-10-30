@@ -119,6 +119,24 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); box-sha
 .hash { font-family: var(--mono); font-size: 12px; cursor: copy; border-bottom: 1px dotted var(--ink-3); }
 .dpre { white-space: pre-wrap; word-break: break-word; font: 12px/1.45 var(--mono); background: var(--sunken); border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin: 0; max-height: 360px; overflow: auto; }
 .tx { display: flex; flex-direction: column; gap: 8px; max-height: 560px; overflow: auto; padding: 4px 2px; }
+.tx.cc { gap: 6px; max-height: 70vh; font-family: var(--mono); font-size: 12.5px; line-height: 1.5; background: var(--sunken); border-radius: 10px; padding: 12px 14px; }
+.cc .l { display: flex; gap: 8px; align-items: baseline; min-width: 0; }
+.cc .l > span:last-child { min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.cc .dot { flex: none; color: var(--accent); }
+.cc .dot.say { color: var(--ink); }
+.cc .dot.dim { color: var(--ink-3); }
+.cc .nm { font-weight: 700; }
+.cc .arg { color: var(--ink-2); }
+.cc .res { padding-left: 18px; color: var(--ink-2); display: flex; gap: 8px; min-width: 0; }
+.cc .res > :last-child { min-width: 0; flex: 1; }
+.cc .res pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+.cc .res summary { list-style: none; cursor: pointer; }
+.cc .res summary::-webkit-details-marker { display: none; }
+.cc .more { color: var(--ink-3); }
+.cc details[open] > summary .more { display: none; }
+.cc .full { max-height: 420px; overflow: auto; }
+.cc .raw { padding-left: 18px; }
+.cc .raw summary { color: var(--ink-3); font-size: 11px; cursor: pointer; }
 .ev { display: grid; grid-template-columns: 68px minmax(0, 1fr); gap: 10px; }
 .ev .who { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-3); padding-top: 3px; font-weight: 600; }
 .ev .what { min-width: 0; }
@@ -619,39 +637,82 @@ function facts(m) {
     <dl class="kv"><dt>model calls</dt><dd>${num(m.activity.llm_calls)}</dd><dt>files read</dt><dd>${num(m.activity.files_read)}</dd><dt>searches</dt><dd>${num(m.activity.grep_calls + m.activity.find_calls)}</dd><dt>tokens</dt><dd>${num(m.activity.input_tokens)} in · ${num(m.activity.output_tokens)} out</dd></dl>
   </div></details>`;
 }
+// One line describing a tool call, as Claude Code shows it: Name(argument).
+function callArg(name, input) {
+  const i = input ?? {};
+  if (typeof i === "string") return i;
+  if (name === "submit_verdict") return i.answer ?? i.choice ?? "";
+  const cmd = i.command ?? i.cmd;
+  if (Array.isArray(cmd)) return cmd.join(" ");
+  if (cmd) return String(cmd);
+  const path = i.file_path ?? i.path ?? i.notebook_path;
+  const pat = i.pattern ?? i.query ?? i.regex;
+  if (pat != null) return String(pat) + (path ? ` in ${path}` : "");
+  if (path != null) return String(path) || "(root)";
+  if (i.url) return String(i.url);
+  const first = Object.values(i).find(x => typeof x === "string");
+  return first ?? (Object.keys(i).length ? JSON.stringify(i) : "");
+}
+function ccCall(c, res, hiddenResult) {
+  const arg = callArg(c.name, c.input);
+  const one = arg.length > 300 ? arg.slice(0, 300) + "…" : arg;
+  let out = `<div class="l"><span class="dot">⏺</span><span><span class="nm">${esc(c.name || "tool")}</span>${one !== "" ? `<span class="arg">(${esc(one)})</span>` : ""}</span></div>`;
+  if (res) {
+    const body = String(res.content ?? "");
+    const lines = body.split("\n"); const head = lines.slice(0, 3).join("\n");
+    const rest = lines.length - 3;
+    out += `<div class="res"><span>⎿</span>${rest > 0 || head.length > 400
+      ? `<details><summary><pre>${esc(head.slice(0, 400))}</pre><span class="more">${rest > 0 ? `… +${num(rest)} line${rest === 1 ? "" : "s"}` : "…"} (click to expand)</span></summary><pre class="full">${esc(body)}</pre></details>`
+      : `<pre${res.error ? ' style="color:var(--bad)"' : ""}>${esc(head) || "(no output)"}</pre>`}</div>`;
+  } else if (hiddenResult) out += `<div class="res"><span>⎿</span><span class="more">result not shared</span></div>`;
+  return out;
+}
 function traceHtml(entries) {
+  // Tool results, by call id, so each shows under its call.
+  const results = {}; const callIds = new Set();
+  for (const e of entries) {
+    if (e.type === "tool_result" && e.id != null) results[e.id] = e;
+    for (const r of e.turn?.results || []) if (r.id != null) results[r.id] = r;
+    for (const c of e.tool_calls || e.turn?.calls || e.calls || []) if (c.id != null) callIds.add(c.id);
+  }
+  const say = t => `<div class="l"><span class="dot say">⏺</span><span>${esc(t)}</span></div>`;
+  const note = (t, cls = "") => `<div class="l"><span class="dot dim">·</span><span class="more ${cls}">${t}</span></div>`;
   const out = [];
   for (const e of entries) {
-    if (e.type === "system") out.push(`<div class="ev"><div class="who">Harness</div><div class="what"><details><summary class="small">Fixed system prompt</summary><pre class="out">${esc(e.content)}</pre></details></div></div>`);
-    else if (e.type === "user") out.push(`<div class="ev"><div class="who">Task</div><div class="what small muted" style="white-space:pre-wrap">${esc(e.content)}</div></div>`);
-    else if (e.type === "auditor_message") out.push(`<div class="ev"><div class="who">Auditor</div><div class="what">${e.blinded ? `<span class="pill warn">blinded message: hidden from you</span>` : `<p style="white-space:pre-wrap">${esc(e.content)}</p>`}</div></div>`);
+    if (e.type === "system") out.push(`<div class="raw"><details><summary>fixed system prompt</summary><pre class="out">${esc(e.content)}</pre></details></div>`);
+    else if (e.type === "user") out.push(`<div class="l"><span class="dot dim">&gt;</span><span>${esc(e.content)}</span></div>`);
+    else if (e.type === "auditor_message") out.push(`<div class="l"><span class="dot dim">&gt;</span><span><b>Auditor:</b> ${e.blinded ? `<span class="pill warn">blinded message: hidden from you</span>` : esc(e.content)}</span></div>`);
     else if (e.type === "assistant") {
-      const calls = (e.tool_calls || []).map(c => {
-        const a = c.args || {}; const main = c.name === "submit_verdict" ? a.answer : (a.path ?? a.pattern ?? "");
-        return `<span class="call"><b>${esc(c.name)}</b> ${esc(main === "" ? "(root)" : main)}</span>`;
-      }).join("");
-      out.push(`<div class="ev"><div class="who">Agent</div><div class="what">${e.text ? `<p style="white-space:pre-wrap;margin-bottom:4px">${esc(e.text)}</p>` : ""}${calls}</div></div>`);
-    } else if (e.type === "tool_result" && e.name !== "submit_verdict") {
-      const c = String(e.content || ""); const n = c.split("\n").length;
-      out.push(`<div class="ev"><div class="who"></div><div class="what"><details><summary class="small">${esc(e.name)} · ${num(n)} line${n === 1 ? "" : "s"}</summary><pre class="out">${esc(c)}</pre></details></div></div>`);
+      if (e.text) out.push(say(e.text));
+      for (const c of e.tool_calls || []) out.push(ccCall({ name: c.name, input: c.args }, results[c.id]));
+    } else if (e.type === "tool_result") {
+      if (!callIds.has(e.id) && e.name !== "submit_verdict") out.push(ccCall({ name: e.name, input: "" }, e));
     } else if (e.type === "model_exchange") {
+      const t = e.turn || {};
+      for (const x of t.text || []) if (x.trim()) out.push(say(x));
+      for (const c of t.calls || []) out.push(ccCall(c, results[c.id]));
+      if (!(t.text || []).length && !(t.calls || []).length && e.status !== "200") out.push(note(`model call failed · HTTP ${esc(e.status)}`, "bad"));
       const req = e.request || {};
-      out.push(`<div class="ev"><div class="who">Model</div><div class="what"><details><summary class="small">exchange · ${num(req.bytes)} bytes sent · HTTP ${esc(e.status)}</summary><div class="small faint" style="margin-top:6px">New input (items ${num(req.new_from || 0)}–${num(req.items || 0)})</div><pre class="out">${esc(JSON.stringify(req.new || [], null, 1).slice(0, 200000))}</pre><div class="small faint">Response</div><pre class="out">${esc(e.response || "")}</pre></details></div></div>`);
-    } else if (e.type === "harness_log") out.push(`<div class="ev"><div class="who">Agent log</div><div class="what"><pre class="out" style="margin:0">${esc(e.content)}</pre></div></div>`);
-    else if (e.type === "approval") out.push(`<div class="ev"><div class="who">You</div><div class="what small">${e.approved ? `<span class="pill ok">approved</span>` : `<span class="pill warn">denied</span>`} <b>${esc(e.tool)}</b>${e.reason ? ` <span class="faint">${esc(e.reason)}</span>` : ""}</div></div>`);
-    else if (e.type === "harness") out.push(`<div class="ev"><div class="who">Harness</div><div class="what faint small">${esc(e.content)}</div></div>`);
-    else if (e.type === "error") out.push(`<div class="ev"><div class="who">Error</div><div class="what"><div class="callout bad"><span>${esc(e.content)}</span></div></div></div>`);
-    else if (e.type === "step") out.push(`<div class="ev"><div class="who">Agent</div><div class="what">${(e.tools || []).length ? e.tools.map(t => `<span class="call"><b>${esc(t)}</b></span>`).join("") : `<span class="faint small">thinking</span>`}</div></div>`);
-    else if (e.type === "files_read") out.push(`<div class="ev"><div class="who">Read</div><div class="what"><div class="pills">${(e.paths || []).map(p => `<span class="pill mono">${esc(p)}</span>`).join("") || `<span class="faint small">no files</span>`}</div></div></div>`);
+      out.push(`<div class="raw"><details><summary>raw model call · ${num(req.bytes)} bytes · HTTP ${esc(e.status)}</summary><div class="small faint" style="margin-top:6px">New input (items ${num(req.new_from || 0)}–${num(req.items || 0)})</div><pre class="out">${esc(JSON.stringify(req.new || [], null, 1).slice(0, 200000))}</pre><div class="small faint">Response</div><pre class="out">${esc(e.response || "")}</pre></details></div>`);
+    } else if (e.type === "step") {
+      const calls = e.calls || (e.tools || []).map(n => ({ name: n }));
+      if (!calls.length) out.push(note("thinking…"));
+      for (const c of calls) out.push(ccCall(c, null, true));
+    }
+    else if (e.type === "harness_log") out.push(`<div class="raw"><details><summary>agent log</summary><pre class="out">${esc(e.content)}</pre></details></div>`);
+    else if (e.type === "approval") out.push(note(`${e.approved ? "approved" : "denied"} by the auditee: <b>${esc(e.tool)}</b>${e.reason ? ` · ${esc(e.reason)}` : ""}`));
+    else if (e.type === "harness") out.push(note(esc(e.content)));
+    else if (e.type === "error") out.push(`<div class="l"><span class="dot" style="color:var(--bad)">⏺</span><span style="color:var(--bad)">${esc(e.content)}</span></div>`);
+    else if (e.type === "files_read") out.push(note(`files read: ${(e.paths || []).map(esc).join(", ") || "none"}`));
   }
-  return out.join("") || `<span class="faint small">Starting…</span>`;
+  return out.join("") || note("Starting…");
 }
 const watching = (v) => !!v && (v.auditor_watch === "steps" || v.auditor_watch === "full");
 function approvalHtml(v) {
   if (!isAuditee()) {
     const notes = [];
     if (v.tool_approval) notes.push("The auditee approves or denies each of the agent's tool calls before it runs. A denial can keep evidence from the agent; certificates count them.");
-    if (v.auditor_watch === "steps") notes.push("The auditee lets you watch which tools the agent uses as it works (not what it reads).");
+    if (v.auditor_watch === "steps") notes.push("The auditee lets you watch what the agent looks at as it works: each command, file and search, but not what comes back.");
     if (v.auditor_watch === "full") notes.push("The auditee lets you watch everything the agent does as it works.");
     return notes.length ? `<div class="pad stack" style="gap:6px">${notes.map(n => `<div class="callout info small"><span class="ic">i</span><span>${n}</span></div>`).join("")}</div>` : "";
   }
@@ -663,7 +724,7 @@ function approvalHtml(v) {
       <pre class="out" style="max-height:220px">${esc(JSON.stringify(c.input, null, 1))}</pre>
       <div class="row"><input type="text" id="tcr-${c.id}" placeholder="Reason (shown to the agent, optional)" style="flex:1"><button class="btn primary" data-act="tc-decide" data-id="${c.id}" data-ok="1">Approve</button><button class="btn danger" data-act="tc-decide" data-id="${c.id}" data-ok="">Deny</button></div></div>`).join("");
   const w = v.auditor_watch || "off";
-  const watch = `<div class="row" style="justify-content:space-between"><span class="small"><b>What the auditor can watch</b><br><span class="faint">${w === "full" ? "Everything the agent does, including what it reads." : w === "steps" ? "Which tools the agent uses, live. Not what it reads or writes." : "Nothing until you release a result."} Covers every run, earlier ones too.</span></span>
+  const watch = `<div class="row" style="justify-content:space-between"><span class="small"><b>What the auditor can watch</b><br><span class="faint">${w === "full" ? "Everything the agent does, including what it reads." : w === "steps" ? "What the agent looks at, live: each command, file and search. Not what comes back or what it says." : "Nothing until you release a result."} Covers every run, earlier ones too.</span></span>
     <div class="row" style="gap:4px" role="group">${[["off", "Nothing"], ["steps", "Steps"], ["full", "Everything"]].map(([m, l]) => `<button class="btn ${w === m ? "primary" : ""}" data-act="watch" data-mode="${m}" aria-pressed="${w === m}">${l}</button>`).join("")}</div></div>`;
   return `<div class="pad stack" style="gap:10px;border-bottom:1px solid var(--line,#8883)">${head}${items}${watch}</div>`;
 }
@@ -680,7 +741,7 @@ function runHtml(v, r) {
   const meta = `<div class="row" style="justify-content:space-between"><div class="row" style="gap:8px"><b>Run ${r.number}</b>${statusPill(r.status)}${parent ? `<span class="faint small">follow-up to run ${parent.number}</span>` : `<span class="faint small">Q${r.question_version}</span>`}</div>
     <span class="faint small">${esc(r.model?.provider)} / ${esc(r.model?.model)} · ${esc(ago(r.started_at_ms))}</span></div>`;
   const msgs = (r.messages || []).filter((m, i, all) => !parent || i >= (parent.messages || []).length);
-  const msgHtml = msgs.map(m => `<div class="callout info"><span class="ic">✉</span><span>${m.blinded ? "<b>Blinded</b> follow-up" : "Follow-up"} from the auditor${m.text ? `: ${esc(m.text)}` : (isAuditee() ? " (hidden from you)" : "")}</span></div>`).join("");
+  const msgHtml = msgs.map(m => `<div class="callout info"><span class="ic">✉</span><span>${m.blinded ? "<b>Blinded</b> message" : "Message"} from the auditor${m.text ? `: ${esc(m.text)}` : (isAuditee() ? " (hidden from you)" : "")}</span></div>`).join("");
   let main = "";
   if (isAuditee()) {
     if (r.status === "running") main += `<div class="row"><i class="spin" style="color:var(--accent)"></i><span>The agent is working · ${r.steps} model call${r.steps === 1 ? "" : "s"}</span></div>`;
@@ -691,9 +752,9 @@ function runHtml(v, r) {
       <label class="f">Note to the auditor (optional)<input type="text" id="note-${r.id}"></label>
       <div class="row"><button class="btn primary" data-act="release" data-run="${r.id}">Release to auditor</button><button class="btn danger" data-act="decline" data-run="${r.id}">Decline</button></div></div>`;
     if (r.status === "released" || r.status === "declined") main += `<p class="small faint">You ${r.status} this ${esc(ago(r.decided_at_ms))}${r.decision_note ? `: “${esc(r.decision_note)}”` : ""}.</p>`;
-    main += `<details ${r.status === "running" ? "open" : ""} data-keep="txd-${r.id}"><summary>Transcript (only you can see this)</summary><div class="tx" id="tx-${r.id}"></div></details>`;
+    main += `<details ${r.status === "running" ? "open" : ""} data-keep="txd-${r.id}"><summary>Transcript (only you can see this)</summary><div class="tx cc" id="tx-${r.id}"></div></details>`;
   } else {
-    if (watching(v)) main += `<details ${r.status === "running" ? "open" : ""} data-keep="txd-${r.id}"><summary>${r.status === "running" ? `<i class="spin" style="color:var(--accent)"></i> The agent is working: watch it` : "What the agent did"}</summary><div class="tx" id="tx-${r.id}"></div></details>`;
+    if (watching(v)) main += `<details ${r.status === "running" ? "open" : ""} data-keep="txd-${r.id}"><summary>${r.status === "running" ? `<i class="spin" style="color:var(--accent)"></i> The agent is working: watch it` : "What the agent did"}</summary><div class="tx cc" id="tx-${r.id}"></div></details>`;
     if (r.status === "running" && watching(v)) {}
     else if (r.status === "running") main += `<div class="row"><i class="spin" style="color:var(--accent)"></i><span class="muted">The agent is working. You can't see its progress; you'll see the result if the auditee releases it.</span></div>`;
     else if (r.status === "awaiting_release") main += `<p class="muted">The agent finished. Waiting for the auditee to release or decline the result.</p>`;
@@ -702,10 +763,11 @@ function runHtml(v, r) {
       + `${r.decision_note ? `<p class="small faint">Auditee's note: “${esc(r.decision_note)}”</p>` : ""}<div class="row"><a class="btn" href="#" data-act="cert" data-run="${r.id}">Download certificate</a><span class="faint small">Signed by the enclave; check it with <code>attest verify</code>.</span></div>`;
     const busyNow = v.runs.some(x => x.status === "running");
     if ((r.status === "released" || r.status === "declined") && !busyNow && r === [...v.runs].reverse().find(x => x.status === "released" || x.status === "declined"))
-      main += `<details data-keep="fu-${r.id}"><summary>Send the agent a follow-up</summary><div class="stack" style="margin-top:10px">
-        <textarea id="fu-${r.id}" placeholder="What did you check to rule out the RL pipeline?"></textarea>
+      main += `<details open data-keep="fu-${r.id}"><summary>Ask the agent to revise its answer</summary><div class="stack" style="margin-top:10px">
+        <span class="faint small">The agent picks up where it left off with your message, investigates more if needed, and gives a new answer. The auditee sees your message and decides whether to release the new answer.</span>
+        <textarea id="fu-${r.id}" placeholder="e.g. Also cover the scripts under synthetic/, and say which ones run on a schedule."></textarea>
         ${(v.connections || []).length ? `<span class="faint small">Blinded messages aren't available here: the agent's requests to the connected services could carry the text to the auditee.</span>` : `<label class="check"><input type="checkbox" id="fub-${r.id}"><span>Blind this message from the auditee<br><span class="faint small">They see that you sent one and everything the agent does in response, but not your text. They still decide on release.</span></span></label>`}
-        <div class="row"><button class="btn primary" data-act="followup" data-run="${r.id}">Send follow-up</button></div></div></details>`;
+        <div class="row"><button class="btn primary" data-act="followup" data-run="${r.id}">Send to the agent</button></div></div></details>`;
   }
   return `<div class="run pad stack" id="run-${esc(r.id)}">${meta}${msgHtml}${main}</div>`;
 }

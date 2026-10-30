@@ -140,26 +140,144 @@ struct State {
     /// The auditee approves each tool call of runs started while this is on.
     tool_approval: bool,
     /// What the auditor may watch of the agent's work, as it happens:
-    /// "" (nothing), "steps" (which tools it called) or "full" (everything
+    /// "" (nothing), "steps" (each tool call and its input, not the results) or "full" (everything
     /// the auditee sees). The auditee chooses; it covers every run.
     auditor_watch: String,
 }
 
-/// Names of the tools a raw model response (Anthropic or OpenAI, JSON or
-/// SSE) calls, in order, without repeats.
-fn tool_names(text: &str) -> Vec<Value> {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| {
-        regex::Regex::new(r#""type"\s*:\s*"(?:tool_use|server_tool_use|function_call|custom_tool_call|local_shell_call)"(?:[^{}]|\{[^{}]*\})*?"name"\s*:\s*"([A-Za-z0-9_.:-]{1,64})""#).unwrap()
-    });
-    let mut out: Vec<Value> = Vec::new();
-    for c in re.captures_iter(text) {
-        let n = json!(&c[1]);
-        if !out.contains(&n) {
-            out.push(n);
+/// A raw model exchange (Anthropic or OpenAI; JSON or SSE) as a readable
+/// turn: the results of earlier tool calls the request carried, then what
+/// the model said and which tools it called with which inputs.
+fn exchange_turn(e: &Value) -> Value {
+    let mut results = Vec::new();
+    let text_of = |c: &Value| -> String {
+        match c {
+            Value::String(s) => s.clone(),
+            Value::Array(a) => a.iter().filter_map(|b| b["text"].as_str().or(b["output"].as_str())).collect::<Vec<_>>().join("\n"),
+            _ => String::new(),
+        }
+    };
+    for it in e["request"]["new"].as_array().into_iter().flatten() {
+        // Anthropic: a user message with tool_result blocks.
+        for b in it["content"].as_array().into_iter().flatten() {
+            if b["type"] == "tool_result" {
+                results.push(json!({"id": b["tool_use_id"], "content": text_of(&b["content"]), "error": b["is_error"].as_bool().unwrap_or(false)}));
+            }
+        }
+        // OpenAI Responses and Chat Completions.
+        let t = it["type"].as_str().unwrap_or("");
+        if t.ends_with("_call_output") {
+            results.push(json!({"id": it["call_id"], "content": text_of(&it["output"]), "error": false}));
+        } else if it["role"] == "tool" {
+            results.push(json!({"id": it["tool_call_id"], "content": text_of(&it["content"]), "error": false}));
         }
     }
-    out
+    let raw = e["response"].as_str().unwrap_or("");
+    let mut text: Vec<String> = Vec::new();
+    let mut calls: Vec<Value> = Vec::new();
+    // Blocks by index while streaming: (kind, id, name, accumulated).
+    let mut blocks: std::collections::BTreeMap<i64, (String, Value, Value, String)> = Default::default();
+    let mut chat_calls: std::collections::BTreeMap<i64, (Value, String, String)> = Default::default();
+    let mut chat_text = String::new();
+    let parse_args = |s: &str| serde_json::from_str::<Value>(s).unwrap_or_else(|_| if s.is_empty() { json!({}) } else { json!(s) });
+    let mut whole = |v: &Value, text: &mut Vec<String>, calls: &mut Vec<Value>| {
+        // A complete response (non-streaming), or a finished Responses item.
+        for b in v["content"].as_array().into_iter().flatten() {
+            match b["type"].as_str() {
+                Some("text") => text.push(b["text"].as_str().unwrap_or("").into()),
+                Some("tool_use") | Some("server_tool_use") => calls.push(json!({"id": b["id"], "name": b["name"], "input": b["input"]})),
+                _ => {}
+            }
+        }
+        for it in v["output"].as_array().into_iter().flatten() {
+            item(it, text, calls);
+        }
+        for c in v["choices"].as_array().into_iter().flatten() {
+            if let Some(t) = c["message"]["content"].as_str() {
+                if !t.is_empty() { text.push(t.into()); }
+            }
+            for tc in c["message"]["tool_calls"].as_array().into_iter().flatten() {
+                calls.push(json!({"id": tc["id"], "name": tc["function"]["name"], "input": parse_args(tc["function"]["arguments"].as_str().unwrap_or(""))}));
+            }
+        }
+    };
+    fn item(it: &Value, text: &mut Vec<String>, calls: &mut Vec<Value>) {
+        let parse = |s: &str| serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!(s));
+        match it["type"].as_str() {
+            Some("message") => {
+                for c in it["content"].as_array().into_iter().flatten() {
+                    if let Some(t) = c["text"].as_str() { text.push(t.into()); }
+                }
+            }
+            Some("function_call") => calls.push(json!({"id": it["call_id"], "name": it["name"], "input": parse(it["arguments"].as_str().unwrap_or(""))})),
+            Some("custom_tool_call") => calls.push(json!({"id": it["call_id"], "name": it["name"], "input": it["input"]})),
+            Some("local_shell_call") => calls.push(json!({"id": it["call_id"], "name": "shell", "input": it["action"]})),
+            _ => {}
+        }
+    }
+    if let Ok(v) = serde_json::from_str::<Value>(raw) {
+        whole(&v, &mut text, &mut calls);
+    } else {
+        for line in raw.lines() {
+            let Some(d) = line.strip_prefix("data:") else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(d.trim()) else { continue };
+            let i = v["index"].as_i64().unwrap_or(0);
+            match v["type"].as_str() {
+                Some("content_block_start") => {
+                    let b = &v["content_block"];
+                    let init = b["text"].as_str().unwrap_or("").to_string();
+                    blocks.insert(i, (b["type"].as_str().unwrap_or("").into(), b["id"].clone(), b["name"].clone(), init));
+                }
+                Some("content_block_delta") => {
+                    if let Some(b) = blocks.get_mut(&i) {
+                        let d = &v["delta"];
+                        b.3.push_str(d["text"].as_str().or(d["partial_json"].as_str()).unwrap_or(""));
+                    }
+                }
+                Some("response.output_item.done") => item(&v["item"], &mut text, &mut calls),
+                _ => {
+                    // Chat Completions chunks.
+                    for c in v["choices"].as_array().into_iter().flatten() {
+                        chat_text.push_str(c["delta"]["content"].as_str().unwrap_or(""));
+                        for tc in c["delta"]["tool_calls"].as_array().into_iter().flatten() {
+                            let k = tc["index"].as_i64().unwrap_or(0);
+                            let ent = chat_calls.entry(k).or_insert((Value::Null, String::new(), String::new()));
+                            if !tc["id"].is_null() { ent.0 = tc["id"].clone(); }
+                            ent.1.push_str(tc["function"]["name"].as_str().unwrap_or(""));
+                            ent.2.push_str(tc["function"]["arguments"].as_str().unwrap_or(""));
+                        }
+                    }
+                }
+            }
+        }
+        for (_, (kind, id, name, acc)) in blocks {
+            match kind.as_str() {
+                "text" if !acc.is_empty() => text.push(acc),
+                "tool_use" | "server_tool_use" => calls.push(json!({"id": id, "name": name, "input": parse_args(&acc)})),
+                _ => {}
+            }
+        }
+        if !chat_text.is_empty() { text.push(chat_text); }
+        for (_, (id, name, args)) in chat_calls {
+            calls.push(json!({"id": id, "name": name, "input": parse_args(&args)}));
+        }
+    }
+    json!({"results": results, "text": text, "calls": calls})
+}
+
+/// Long strings cut short, for the steps view: what the agent looked at,
+/// not what it wrote.
+fn clip(v: &Value, n: usize) -> Value {
+    match v {
+        Value::String(s) if s.len() > n => {
+            let mut k = n;
+            while !s.is_char_boundary(k) { k -= 1; }
+            json!(format!("{}…", &s[..k]))
+        }
+        Value::Array(a) => Value::Array(a.iter().map(|x| clip(x, n)).collect()),
+        Value::Object(o) => Value::Object(o.iter().map(|(k, x)| (k.clone(), clip(x, n))).collect()),
+        x => x.clone(),
+    }
 }
 
 /// A status: one of a fixed set of strings. (An alias, so serde doesn't
@@ -1733,20 +1851,27 @@ impl Session {
             {
                 // Pages of up to 4 MiB: a run's trace can be 40 MiB.
                 let (mut entries, next) = r.trace.page(after, 4 << 20);
+                // A jailed agent's model calls, made readable.
+                for e in entries.iter_mut() {
+                    if e["type"] == "model_exchange" {
+                        e["turn"] = exchange_turn(e);
+                    }
+                }
                 if steps_only {
-                    // Which tools, nothing they read or wrote. Placeholders
-                    // keep positions, which the client pages by.
+                    // What the agent looked at (each tool and its input),
+                    // not what came back or what it said. Placeholders keep
+                    // positions, which the client pages by.
                     for e in entries.iter_mut() {
-                        *e = if e["type"] == "assistant" {
-                            let tools: Vec<Value> = e["tool_calls"].as_array().map(|c| c.iter().map(|c| c["name"].clone()).collect()).unwrap_or_default();
-                            json!({"type": "step", "tools": tools})
+                        let calls: Vec<Value> = if e["type"] == "assistant" {
+                            e["tool_calls"].as_array().map(|c| c.iter().map(|c| json!({"id": c["id"], "name": c["name"], "input": clip(&c["args"], 400)})).collect()).unwrap_or_default()
                         } else if e["type"] == "model_exchange" {
-                            // A jailed agent's model call: the tools the model
-                            // asked for, from the raw response.
-                            json!({"type": "step", "tools": tool_names(e["response"].as_str().unwrap_or(""))})
+                            e["turn"]["calls"].as_array().map(|c| c.iter().map(|c| json!({"id": c["id"], "name": c["name"], "input": clip(&c["input"], 400)})).collect()).unwrap_or_default()
                         } else {
-                            json!({"type": "hidden"})
+                            *e = json!({"type": "hidden"});
+                            continue;
                         };
+                        let tools: Vec<Value> = calls.iter().map(|c| c["name"].clone()).collect();
+                        *e = json!({"type": "step", "tools": tools, "calls": calls});
                     }
                 }
                 json!({"run_id": r.id, "status": r.status, "next": next, "more": next < r.trace.len(), "entries": entries})
