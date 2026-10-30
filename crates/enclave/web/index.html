@@ -789,13 +789,15 @@ function renderDisclosures(v) {
       <label class="f">Note for the auditor (optional)<input type="text" id="dNote"></label>
       <div class="row"><button class="btn primary" data-act="disc-draft">Prepare draft</button></div></div></details>`;
   } else if (!ds.length) {
-    body += `<p class="muted">Nothing disclosed. The auditee can choose to show you files, or the output of scripts run over the code, each signed by the enclave.</p>`;
+    $("#cDisclose").hidden = true;
+    return;
   }
   body += ds.slice().reverse().map(d => `<div class="stack" style="gap:6px;border-top:1px solid var(--line);padding-top:10px">
     <div class="row"><b>${d.status === "published" ? "#" + d.number : "draft " + d.draft}</b> ${statusPill(d.status)}<span class="faint small">${esc(ago(d.body.published_at_ms || d.body.created_at_ms))}</span></div>
     ${d.body.note ? `<p class="small">${esc(d.body.note)}</p>` : ""}${disclosureContent(d.body.content)}
     ${d.status === "draft" ? `<div class="row"><button class="btn primary" data-act="disc-publish" data-n="${d.draft}">Publish to auditor</button><button class="btn danger" data-act="disc-discard" data-n="${d.draft}">Discard</button></div>`
       : `<div class="row"><a class="btn" href="#" data-act="disc-get" data-n="${d.number}">Download signed disclosure</a><span class="faint small">Check it with <code>attest verify</code>.</span></div>`}</div>`).join("");
+  $("#cDisclose").hidden = false;
   patch("cDisclose", `<div class="card-head"><h2>Disclosures</h2></div><div class="pad stack">${body}</div>`);
 }
 
