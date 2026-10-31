@@ -713,16 +713,16 @@ function traceHtml(entries) {
 function approvalHtml(v) {
   if (!isAuditee()) {
     const notes = [];
-    if (v.tool_approval) notes.push("The auditee approves or denies each of the agent's tool calls before it runs. A denial can keep evidence from the agent; certificates count them.");
+    if (v.tool_approval) notes.push("The auditee approves or denies each of the agent's tool calls before it runs. A denial can keep evidence from the agent.");
     return notes.length ? `<div class="pad stack" style="gap:6px">${notes.map(n => `<div class="callout info small"><span class="ic">i</span><span>${n}</span></div>`).join("")}</div>` : "";
   }
   const pend = v.pending_tool_calls || [];
-  const head = `<div class="row" style="justify-content:space-between"><span class="small"><b>Approve each tool call</b> ${v.tool_approval ? `<span class="pill ok">on</span>` : `<span class="pill">off</span>`}<br><span class="faint">Every command, file read or service request waits for your decision (denied after 15 minutes). The auditor sees that this is on, and certificates count the denials.</span></span>
+  const head = `<div class="row" style="justify-content:space-between"><span class="small"><b>Approve each tool call</b> ${v.tool_approval ? `<span class="pill ok">on</span>` : `<span class="pill">off</span>`}<br><span class="faint">Every command, file read or service request waits for your decision (denied after 15 minutes). The agent is told only “The auditee denied this call.” The auditor sees that this is on; certificates count denials only if you release details.</span></span>
     <button class="btn" data-act="tool-approval" data-on="${v.tool_approval ? "" : "1"}">${v.tool_approval ? "Turn off" : "Turn on"}</button></div>
     ${v.tool_approval ? `<details><summary class="small">Let your own agent decide</summary><p class="small muted" style="margin-top:6px">It long-polls <code>GET /api/sessions/${esc(S.sid)}/tool-calls?wait=25</code> and answers each call with <code>POST /api/sessions/${esc(S.sid)}/tool-calls/ID</code> <code>{"approve": true|false, "reason": "..."}</code>, using your token as <code>Authorization: Bearer</code>. Applies to new runs, with any agent: built-in, Claude Code, Codex or pi.</p></details>` : ""}`;
   const items = pend.map(c => `<div class="panel pad stack" style="gap:6px;border-color:var(--warn,#c80)"><div class="row" style="gap:8px"><b>${esc(c.tool)}</b><span class="pill">run ${c.run_number}</span><span class="pill">${esc(c.agent)}</span><span class="faint small">waiting ${esc(ago(c.asked_at_ms))}</span></div>
       <pre class="out" style="max-height:220px">${esc(JSON.stringify(c.input, null, 1))}</pre>
-      <div class="row"><input type="text" id="tcr-${c.id}" placeholder="Reason (shown to the agent, optional)" style="flex:1"><button class="btn primary" data-act="tc-decide" data-id="${c.id}" data-ok="1">Approve</button><button class="btn danger" data-act="tc-decide" data-id="${c.id}" data-ok="">Deny</button></div></div>`).join("");
+      <div class="row"><input type="text" id="tcr-${c.id}" placeholder="Note for your records (not shown to the agent)" style="flex:1"><button class="btn primary" data-act="tc-decide" data-id="${c.id}" data-ok="1">Approve</button><button class="btn danger" data-act="tc-decide" data-id="${c.id}" data-ok="">Deny</button></div></div>`).join("");
   return `<div class="pad stack" style="gap:10px;border-bottom:1px solid var(--line,#8883)">${head}${items}</div>`;
 }
 function renderRuns(v) {

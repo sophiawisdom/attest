@@ -21,6 +21,10 @@ const MAX_SHOWN_INPUT: usize = 20_000;
 /// Harness bookkeeping that reads and changes nothing; approved without asking.
 const INTERNAL: &[&str] = &["TodoWrite", "todowrite", "update_plan", "get_goal", "create_goal", "update_goal"];
 
+/// What the agent is told about a denial, always: the auditee's reason is
+/// for its own record, never a channel to the agent the auditor can't see.
+pub const DENIED: &str = "The auditee denied this call.";
+
 pub const WITHHELD: &str = "[withheld by the enclave: this tool call ran without the auditee's approval, so its result is not shown]";
 
 #[derive(Clone, Debug)]
@@ -325,7 +329,7 @@ function ask(call) {
         r#"module.exports = function (pi) {
   pi.on("tool_call", async (event) => {
     const d = await ask({tool: event.toolName, input: event.input, id: event.toolCallId});
-    if (!d.approve) return {block: true, reason: "The auditee denied this tool call" + (d.reason ? ": " + d.reason : "")};
+    if (!d.approve) return {block: true, reason: "The auditee denied this call."};
   });
 };
 "#
@@ -337,7 +341,7 @@ process.stdin.on("end", async () => {
   try { const h = JSON.parse(input); d = await ask({tool: h.tool_name, input: h.tool_input, id: h.tool_use_id}); }
   catch (e) { d = {approve: false, reason: "no decision: " + e}; }
   process.stdout.write(d.approve ? "{}" : JSON.stringify({hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny",
-    permissionDecisionReason: "The auditee denied this tool call" + (d.reason ? ": " + d.reason : "")}}));
+    permissionDecisionReason: "The auditee denied this call."}}));
 });
 "#
     };

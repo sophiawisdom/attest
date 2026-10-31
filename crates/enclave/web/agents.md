@@ -193,7 +193,8 @@ is written for an agent to follow, and takes one script.
    (returns `{"pending": [{"id", "run_number", "agent", "tool", "input",
    "deadline_ms"}, ...]}` as soon as something waits) and answers each with
    `POST /api/sessions/ID/tool-calls/CALL_ID` `{"approve": true|false,
-   "reason": "..."}`; the reason is shown to the agent. A call without a
+   "reason": "..."}`. The agent is told only "The auditee denied this call.";
+   the reason is kept in the auditee's trace and never reaches the agent. A call without a
    decision within 15 minutes is denied. The built-in agent asks before each
    call; Claude Code and Codex ask from a pre-tool hook given on their command
    line, pi from an extension. Codex runs with code mode and subagents off
@@ -201,8 +202,9 @@ is written for an agent to follow, and takes one script.
    (the enclave sends the approved one). As a backstop, the enclave withholds
    from the model the result of any call that ran without a decision. The
    auditor's view shows `tool_approval: true`; certificates carry
-   `tool_approval` with counts of approved, denied and withheld calls, and the
-   verifier warns that denials can keep evidence from the agent.
+   `tool_approval`, and the verifier warns that denials can keep evidence
+   from the agent. Its counts of approved, denied and withheld calls are
+   zero in a verdict-only certificate and released only with details.
 
 6. The run ends with a verdict: `yes`, `no`, `answered` (an open question,
    answered in the summary), `inconclusive`, or `needs_clarification` (with a `clarification_request` for the auditor).
@@ -213,8 +215,8 @@ is written for an agent to follow, and takes one script.
    and harness, run and question counts, whether the code changed between
    runs, and the verdict. Nothing else the code or the model could have
    shaped: no run times, no tree hash or code size (the commitment stays
-   closed), no activity or instruction-scan counts, no error text. With
-   `"details": true` the auditee releases all of those too. On decline the
+   closed), no activity, tool-approval or instruction-scan counts, no error
+   text. With `"details": true` the auditee releases all of those too. On decline the
    auditor sees that it was declined, and the note. A new run doesn't start
    while one awaits this decision. The auditee can fetch a certificate of
    the full record at any time from the same `certificate` route.

@@ -38,6 +38,11 @@ const MAX_MESSAGE_CHARS: usize = 20_000;
 /// Events kept per session (the activity feed).
 const MAX_EVENTS: usize = 500;
 
+/// Whether a role's event `seq` is among its latest MAX_EVENTS of `count`.
+fn in_window(seq: u64, count: u64) -> bool {
+    seq > count.saturating_sub(MAX_EVENTS as u64)
+}
+
 /// Application context shared by every session.
 pub struct Ctx {
     pub dev: bool,
@@ -139,6 +144,8 @@ struct State {
     connections: Vec<crate::connections::Connection>,
     /// The auditee approves each tool call of runs started while this is on.
     tool_approval: bool,
+    /// The next connection id (ids are never reused). In memory only.
+    next_connection_id: u32,
     /// Retired (the auditor never sees the agent's work); kept so stored
     /// state still loads.
     #[allow(dead_code)]
@@ -814,12 +821,12 @@ impl Session {
             important,
         };
         st.events.push(ev.clone());
-        // The activity feed keeps the latest events only: a party repeating
-        // an action can't grow a session without bound.
-        if st.events.len() > MAX_EVENTS {
-            let extra = st.events.len() - MAX_EVENTS;
-            st.events.drain(..extra);
-        }
+        // The activity feed keeps each role's latest MAX_EVENTS only: a party
+        // repeating an action can't grow a session without bound. Counted
+        // per role, so events private to one party never push the other's
+        // out of its feed.
+        let counts = st.event_counts;
+        st.events.retain(|e| (0..2).any(|r| e.seqs[r] > 0 && in_window(e.seqs[r], counts[r])));
         match to {
             Some(r) => self.changed_for(st, r),
             None => self.changed(st),
@@ -1010,7 +1017,13 @@ impl Session {
         let mut st = lock(&self.st);
         ensure!(st.connections.len() < MAX_CONNECTIONS, "a session has at most {MAX_CONNECTIONS} connections");
         ensure!(!st.connections.iter().any(|x| x.rec.name == c.rec.name), "a connection named {} already exists; give this one another name", c.rec.name);
-        c.rec.id = st.connections.iter().map(|x| x.rec.id).max().unwrap_or(0) + 1;
+        // Never reused: a follow-up compares connection ids with its parent's.
+        // (After a restore the counter starts again above every id still in
+        // use or recorded by a run.)
+        let floor = st.connections.iter().map(|x| x.rec.id).chain(st.runs.iter().flat_map(|r| r.connections.iter().copied())).max().unwrap_or(0) + 1;
+        st.next_connection_id = st.next_connection_id.max(floor);
+        c.rec.id = st.next_connection_id;
+        st.next_connection_id += 1;
         let rec = c.rec.clone();
         st.connections.push(c);
         let msg = format!(
@@ -1060,6 +1073,8 @@ impl Session {
         let mut st = lock(&self.st);
         let i = st.connections.iter().position(|c| c.rec.id == id).ok_or_else(|| anyhow!("no connection {id}"))?;
         let c = st.connections.remove(i);
+        // Runs hold copies; this stops them using it from their next request.
+        c.revoke();
         self.event(ctx, &mut st, "connection_removed", format!("The auditee removed the connection {}.", c.rec.name), None, Some(role), false);
         Ok(json!({"removed": id}))
     }
@@ -1746,7 +1761,7 @@ impl Session {
         let events: Vec<Event> = st
             .events
             .iter()
-            .filter(|e| e.seqs[ri(role)] > since)
+            .filter(|e| e.seqs[ri(role)] > since && in_window(e.seqs[ri(role)], st.event_counts[ri(role)]))
             .map(|e| Event {
                 seq: e.seqs[ri(role)],
                 ..e.clone()
@@ -2447,6 +2462,11 @@ fn minimize_for_strict_format(m: &mut Manifest) {
         ..Default::default()
     };
     m.instruction_scan.files_read = ScanCounts::default();
+    if let Some(t) = &mut m.tool_approval {
+        // How many calls the agent made is model-steered, like activity.
+        let p2 = |n: u32| p2(n as u64).min(u32::MAX as u64) as u32;
+        *t = ToolApproval { approved: p2(t.approved), denied: p2(t.denied), timed_out: p2(t.timed_out), withheld: p2(t.withheld) };
+    }
     let hour = 3_600_000;
     m.started_at_ms -= m.started_at_ms % hour;
     m.finished_at_ms -= m.finished_at_ms % hour;
@@ -2485,6 +2505,11 @@ fn public_body(full: &CertificateBody, details: bool, strict: bool) -> Certifica
     m.activity = Activity::default();
     for c in &mut m.connections {
         c.calls = 0;
+    }
+    // Only that the auditee approved calls; how many it approved, denied or
+    // had withheld depends on what the agent did.
+    if let Some(t) = &mut m.tool_approval {
+        *t = ToolApproval::default();
     }
     m.instruction_scan = InstructionScan::default();
     m.history.prior_code_trees_in_session.clear();

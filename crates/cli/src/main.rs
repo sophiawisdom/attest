@@ -629,8 +629,8 @@ async fn main() -> Result<()> {
             match &v.body.verdict {
                 Some(vd) => {
                     println!(
-                        "\nverdict: {:?} (confidence {:.2})\n{}",
-                        vd.answer, vd.confidence, vd.summary
+                        "\nverdict: {:?}\n{}",
+                        vd.answer, vd.summary
                     );
                     if let Some(c) = &vd.clarification_request {
                         println!("clarification requested: {c}");
