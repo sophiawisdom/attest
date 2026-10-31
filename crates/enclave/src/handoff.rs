@@ -254,34 +254,32 @@ impl Giver {
         // From here this enclave takes no new session changes, waits for
         // those under way, writes everything to the store, which then
         // refuses its writes, and keeps the ownership lock for good.
+        // Until the commit below, any way out (an error, or the request
+        // being dropped mid-await) puts the enclave back to serving.
+        struct Rollback<'a> {
+            moved: &'a AtomicBool,
+            done: &'a AtomicBool,
+            armed: bool,
+        }
+        impl Drop for Rollback<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.moved.store(false, Ordering::SeqCst);
+                    self.done.store(false, Ordering::SeqCst);
+                }
+            }
+        }
+        let mut rollback = Rollback { moved: &ctx.moved, done: &self.done, armed: true };
         ctx.moved.store(true, Ordering::SeqCst);
-        let owner = match tokio::time::timeout(Duration::from_secs(120), ctx.owner.write()).await {
-            Ok(g) => g,
-            Err(_) => {
-                ctx.moved.store(false, Ordering::SeqCst);
-                self.done.store(false, Ordering::SeqCst);
-                anyhow::bail!("requests that change sessions are still under way; try again shortly");
-            }
-        };
-        let sessions = match ctx.store.write_all(&ctx.persist).await {
-            Ok(s) => s,
-            Err(e) => {
-                ctx.moved.store(false, Ordering::SeqCst);
-                self.done.store(false, Ordering::SeqCst);
-                return Err(e.context("writing state before the handoff"));
-            }
-        };
+        // Declared after `rollback`, so dropped (unlocked) before it resets.
+        let owner = tokio::time::timeout(Duration::from_secs(120), ctx.owner.write())
+            .await
+            .map_err(|_| anyhow!("requests that change sessions are still under way; try again shortly"))?;
+        let sessions = ctx.store.write_all(&ctx.persist).await.context("writing state before the handoff")?;
         // Sealed and attested before anything irreversible: if this fails,
         // the enclave just keeps serving.
-        let resp = match seal_payload(ctx, att, sessions, &r_pub, &n_r) {
-            Ok((resp, _)) => resp,
-            Err(e) => {
-                drop(owner);
-                ctx.moved.store(false, Ordering::SeqCst);
-                self.done.store(false, Ordering::SeqCst);
-                return Err(e.context("preparing the handoff"));
-            }
-        };
+        let (resp, _) = seal_payload(ctx, att, sessions, &r_pub, &n_r).context("preparing the handoff")?;
+        rollback.armed = false;
         ctx.blobs.fence();
         std::mem::forget(owner);
         crate::log(&format!(

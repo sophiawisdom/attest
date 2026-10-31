@@ -325,16 +325,24 @@ impl Store {
         Ok(heads)
     }
 
+    /// Whether this enclave has written the lineage's session index.
+    pub fn index_written(&self) -> bool {
+        lock(&self.index_written).is_some()
+    }
+
     /// Write the session index if the set of sessions changed: those
     /// written at least once, and those still pending. Sessions are written
     /// before the index, so every session it lists has a head.
     async fn write_index(&self, p: &crate::persist::Persist, force: bool) -> Result<()> {
+        // Never hold `sessions` and `pending` together (retry_pending takes
+        // them in the other order); each is read in its own statement.
         let mut ids: Vec<String> = lock(&self.sessions)
             .values()
             .filter(|s| lock(&s.written).1.is_some())
             .map(|s| s.id.clone())
-            .chain(lock(&self.pending).iter().map(|(sid, _)| sid.clone()))
             .collect();
+        let pending: Vec<String> = lock(&self.pending).iter().map(|(sid, _)| sid.clone()).collect();
+        ids.extend(pending);
         ids.sort();
         ids.dedup();
         if !force && lock(&self.index_written).as_ref() == Some(&ids) {
@@ -348,10 +356,21 @@ impl Store {
     /// For a promoted standby: every session in the index, each from its
     /// newest head that reads back. One that doesn't read yet waits in
     /// `pending`. Returns (sessions listed, sessions restored).
-    pub async fn restore_latest(&self, ctx: &Arc<Ctx>) -> Result<(usize, usize)> {
+    ///
+    /// `index_expected`: the primary told this standby it had written an
+    /// index. A missing one is then not an empty lineage (the parent lost or
+    /// withheld it), and promotion fails rather than publish an empty index
+    /// over every session.
+    pub async fn restore_latest(&self, ctx: &Arc<Ctx>, index_expected: bool) -> Result<(usize, usize)> {
         let ids: Vec<String> = match ctx.persist.get_any(INDEX_SID, INDEX).await? {
             Some((plain, _)) => serde_json::from_slice(&plain).context("the session index is malformed")?,
-            None => Vec::new(),
+            None => {
+                anyhow::ensure!(
+                    !index_expected,
+                    "the session index is missing, but the primary had written one; refusing to start from an empty lineage"
+                );
+                Vec::new()
+            }
         };
         let mut n = 0;
         for sid in &ids {
@@ -416,10 +435,12 @@ impl Store {
         let mut n = 0;
         for (sid, head) in pending {
             if let Ok(s) = restore_from(ctx, &sid, &head).await {
-                let mut p = lock(&self.pending);
-                p.retain(|(x, h)| !(x == &sid && h == &head));
+                // One lock at a time (write_index reads them in the other
+                // order). Listed as a session before it leaves `pending`,
+                // so an index written in between still names it.
                 self.index_text(&s);
-                lock(&self.sessions).insert(sid, s);
+                lock(&self.sessions).insert(sid.clone(), s);
+                lock(&self.pending).retain(|(x, h)| !(x == &sid && h == &head));
                 n += 1;
             }
         }

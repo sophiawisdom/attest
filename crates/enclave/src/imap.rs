@@ -12,6 +12,10 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 const TIMEOUT: Duration = Duration::from_secs(60);
 /// Bytes one command may return.
 const MAX_READ: usize = 24 << 20;
+/// Untagged responses (and literals) one command may return: what's kept
+/// per response costs far more than a short line does to send.
+const MAX_RESPONSES: usize = 200_000;
+const MAX_LITERALS: usize = 20_000;
 /// Bytes of one message fetched for reading.
 const MAX_MESSAGE: usize = 4 << 20;
 
@@ -118,6 +122,7 @@ impl Session {
         self.io.get_mut().flush().await?;
         let mut out = Vec::new();
         let mut cur: Option<Untagged> = None;
+        let mut literals = 0usize;
         loop {
             let line = self.line().await?;
             let text = String::from_utf8_lossy(&line).into_owned();
@@ -131,7 +136,11 @@ impl Session {
             let u = cur.get_or_insert_with(|| Untagged { text: String::new(), literals: Vec::new() });
             u.text.push_str(&text);
             if let Some(n) = literal {
-                ensure!(self.read + n <= MAX_READ, "the server sent too much");
+                // Checked before allocating, without overflow: n is the
+                // server's to choose.
+                ensure!(n <= MAX_READ.saturating_sub(self.read), "the server sent too much");
+                literals += 1;
+                ensure!(literals <= MAX_LITERALS, "the server sent too many literals");
                 let mut data = vec![0; n];
                 self.io.read_exact(&mut data).await?;
                 self.read += n;
@@ -149,6 +158,10 @@ impl Session {
             if u.text.starts_with("+") {
                 bail!("the server asked for more input");
             }
+            if u.text.is_empty() && u.literals.is_empty() {
+                continue;
+            }
+            ensure!(out.len() < MAX_RESPONSES, "the server sent too many responses");
             out.push(u);
         }
     }

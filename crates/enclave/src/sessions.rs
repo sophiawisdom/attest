@@ -586,9 +586,23 @@ impl Session {
         now.saturating_sub(self.created_at_ms) >= SESSION_TTL_MS
     }
 
+    /// Nothing anyone would miss: no question, code, connection, model,
+    /// notification setting or run, and the invited party never came. Only
+    /// such sessions are evicted early; a full server refuses new ones.
     fn idle(&self) -> bool {
         let st = lock(&self.st);
-        st.questions.is_empty() && st.code.is_none()
+        // The auditor opening a session they started themselves isn't the
+        // invited party joining.
+        let invited_joined = st.auditor_joined && self.creator != Some(Role::Auditor);
+        st.questions.is_empty()
+            && st.code.is_none()
+            && st.connections.is_empty()
+            && st.models.is_empty()
+            && st.notify.is_empty()
+            && st.runs.is_empty()
+            && st.disclosures.is_empty()
+            && st.affidavit.is_none()
+            && !invited_joined
     }
 }
 
@@ -718,10 +732,11 @@ impl Store {
             .filter(|s| !s.expired(now_ms()));
         let h = sha256_hex(token.as_bytes());
         if let Some(s) = s {
-            if h == s.token_hashes[0] {
+            let eq = |want: &str| ring::constant_time::verify_slices_are_equal(h.as_bytes(), want.as_bytes()).is_ok();
+            if eq(&s.token_hashes[0]) {
                 return Ok((s, Role::Auditee));
             }
-            if h == s.token_hashes[1] {
+            if eq(&s.token_hashes[1]) {
                 return Ok((s, Role::Auditor));
             }
         }
@@ -1005,6 +1020,13 @@ impl Session {
     }
 
     /// Add a service the agent may use (already checked by connections::connect).
+    /// Whether a connection could be added now: checked before the
+    /// (network, memory-hungry) discovery, and again when adding.
+    pub fn connection_room(&self) -> Result<()> {
+        ensure!(lock(&self.st).connections.len() < MAX_CONNECTIONS, "a session has at most {MAX_CONNECTIONS} connections");
+        crate::budget::ensure_room(SESSION_ALLOWANCE)
+    }
+
     pub fn add_connection(self: &Arc<Self>, ctx: &Arc<Ctx>, role: Role, mut c: crate::connections::Connection) -> Result<Value> {
         ensure!(role == Role::Auditee, "only the auditee connects services");
         let mut st = lock(&self.st);
@@ -1906,7 +1928,7 @@ impl Session {
                     .acquire()
                     .await
                     .map_err(|_| anyhow!("shutting down"))?;
-                let _code_memory = reserve_code_memory(&bundle, 1).await;
+                let _code_memory = reserve_code_memory(&bundle, 1).await?;
                 let _pin = bundle.pin().await?;
                 let opened = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
                 let out = sandbox
@@ -2147,7 +2169,8 @@ impl RunJob {
         let ctx = self.ctx.clone();
         let _permit = ctx.slots.acquire().await;
         let copies = if self.harness_job.is_some() { 2 } else { 1 };
-        let _code_memory = reserve_code_memory(&self.bundle, copies).await;
+        // Held until the run ends; a refusal ends the run as failed below.
+        let code_memory = reserve_code_memory(&self.bundle, copies).await;
         let started_at_ms = now_ms();
         let session = self.session.clone();
         let run_id = self.run_id.clone();
@@ -2230,14 +2253,19 @@ impl RunJob {
                 progress.clone(),
             )
         });
-        let work = std::panic::AssertUnwindSafe(self.agent(progress.clone(), gate.clone()));
-        let out = match tokio::time::timeout(deadline, futures_util::FutureExt::catch_unwind(work)).await {
-            Ok(Ok(out)) => out,
-            Ok(Err(_)) => failed_output("the run failed inside the enclave (an internal error)"),
-            Err(_) => failed_output(&format!(
-                "the run did not finish within its {} minutes",
-                deadline.as_secs() / 60
-            )),
+        let out = match &code_memory {
+            Err(e) => failed_output(&format!("{e:#}")),
+            Ok(_) => {
+                let work = std::panic::AssertUnwindSafe(self.agent(progress.clone(), gate.clone()));
+                match tokio::time::timeout(deadline, futures_util::FutureExt::catch_unwind(work)).await {
+                    Ok(Ok(out)) => out,
+                    Ok(Err(_)) => failed_output("the run failed inside the enclave (an internal error)"),
+                    Err(_) => failed_output(&format!(
+                        "the run did not finish within its {} minutes",
+                        deadline.as_secs() / 60
+                    )),
+                }
+            }
         };
         self.session.approvals.cancel_run(&self.run_id);
         let counts = gate.map(|g| *g.counts.lock().unwrap());
@@ -2391,16 +2419,22 @@ fn code_memory() -> &'static tokio::sync::Semaphore {
 
 /// Reserve room for `copies` copies of `bundle` (a repository bigger than
 /// the whole budget gets the whole budget).
-async fn reserve_code_memory(bundle: &Bundle, copies: u64) -> tokio::sync::SemaphorePermit<'static> {
+/// Code needing more than the whole pool is refused, not squeezed in.
+async fn reserve_code_memory(bundle: &Bundle, copies: u64) -> Result<tokio::sync::SemaphorePermit<'static>> {
     let budget = (crate::cgroups::mem_total() / 10 * 3 >> 20).max(1);
     // Files take whole pages in memory, plus inode and directory entries:
     // a repository of tiny files costs far more than its byte count.
     let per_copy = (bundle.info.total_bytes as u64).saturating_add((bundle.info.file_count as u64).saturating_mul(4096 + 512));
-    let mib = ((per_copy.saturating_mul(copies) >> 20) + 1).min(budget);
-    code_memory()
+    let mib = (per_copy.saturating_mul(copies) >> 20) + 1;
+    ensure!(
+        mib <= budget,
+        "this code needs about {mib} MiB of enclave memory to load ({} files), more than the {budget} MiB this server has for code; share a smaller repository",
+        bundle.info.file_count
+    );
+    Ok(code_memory()
         .acquire_many(mib as u32)
         .await
-        .expect("the code memory semaphore is never closed")
+        .expect("the code memory semaphore is never closed"))
 }
 
 /// Aborts a background task when dropped.

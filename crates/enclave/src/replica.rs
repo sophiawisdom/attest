@@ -89,7 +89,7 @@ impl Replication {
 
     /// A standby's heartbeat, answered encrypted to the channel key so the
     /// parent can't answer for this enclave.
-    pub fn sync(&self, body: &Value, boot_id: &str) -> Result<Value> {
+    pub fn sync(&self, body: &Value, boot_id: &str, index_written: bool) -> Result<Value> {
         let id: [u8; 32] = hex::decode(body["id"].as_str().context("id")?)?
             .try_into()
             .map_err(|_| anyhow!("bad id"))?;
@@ -105,7 +105,7 @@ impl Replication {
             s.seen = Instant::now();
             s.key
         };
-        let plain = serde_json::to_vec(&json!({"alive": true, "boot_id": boot_id}))?;
+        let plain = serde_json::to_vec(&json!({"alive": true, "boot_id": boot_id, "index_written": index_written}))?;
         let ct = ChaCha20Poly1305::new(Key::from_slice(&key))
             .encrypt(Nonce::from_slice(&response_nonce(&id, n)), Payload { msg: &plain, aad: &response_aad(&id, n) })
             .map_err(|_| anyhow!("encryption failed"))?;
@@ -122,6 +122,8 @@ pub struct Follower {
     n: AtomicU64,
     contact: Mutex<Instant>,
     promoted: AtomicBool,
+    /// The primary said it had written the session index (heartbeat).
+    index_seen: AtomicBool,
     promoting: tokio::sync::Mutex<()>,
 }
 
@@ -135,6 +137,7 @@ impl Follower {
             n: AtomicU64::new(0),
             contact: Mutex::new(Instant::now()),
             promoted: AtomicBool::new(false),
+            index_seen: AtomicBool::new(false),
             promoting: tokio::sync::Mutex::new(()),
         }
     }
@@ -180,6 +183,9 @@ impl Follower {
             .map_err(|_| anyhow!("a heartbeat response failed authentication"))?;
         let v: Value = serde_json::from_slice(&plain)?;
         ensure!(v["alive"] == true, "malformed heartbeat");
+        if v["index_written"] == true {
+            self.index_seen.store(true, Ordering::SeqCst);
+        }
         Ok(())
     }
 
@@ -209,7 +215,7 @@ impl Follower {
             .drop_cache()
             .await
             .context("clearing the parent's cache before reading state")?;
-        let (total, restored) = ctx.store.restore_latest(ctx).await.context("reading the session index")?;
+        let (total, restored) = ctx.store.restore_latest(ctx, self.index_seen.load(Ordering::SeqCst)).await.context("reading the session index")?;
         self.promoted.store(true, Ordering::SeqCst);
         ctx.standby.store(false, Ordering::SeqCst);
         tokio::spawn(crate::sessions::write_loop(ctx.clone()));

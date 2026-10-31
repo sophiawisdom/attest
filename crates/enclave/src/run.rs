@@ -116,6 +116,8 @@ pub async fn agent_loop(
             // one turn adds to the conversation and how long it takes.
             let out = if i >= MAX_TOOL_CALLS_PER_TURN {
                 format!("error: at most {MAX_TOOL_CALLS_PER_TURN} tool calls run per turn; this one was skipped, call it again")
+            } else if call.oversized {
+                format!("error: this call's arguments were over {} KiB; it was not run", crate::llm::MAX_CALL_ARGS >> 10)
             } else if call.name == "submit_verdict" {
                 match parse_verdict(&call.args, format) {
                     Ok(v) => {
@@ -140,6 +142,19 @@ pub async fn agent_loop(
                 json!({"type": "tool_result", "id": call.id, "name": call.name, "content": out}),
             );
             results.push((call.id.clone(), out));
+        }
+        if reply.dropped_calls > 0 {
+            // Said in the last result: the dropped calls are gone from the
+            // conversation, so they have no results of their own.
+            let note = format!(
+                "\n[the enclave dropped {} more tool call(s) from your last reply: at most {} are kept per reply]",
+                reply.dropped_calls,
+                crate::llm::MAX_CALLS_PER_REPLY
+            );
+            if let Some((_, out)) = results.last_mut() {
+                out.push_str(&note);
+            }
+            events.push(json!({"type": "harness", "content": note.trim()}));
         }
         progress(events);
         // Keep the tool results in the conversation even when finishing, so a

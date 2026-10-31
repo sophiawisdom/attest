@@ -496,7 +496,9 @@ async fn handle(up: Arc<Upstream>, req: Request<hyper::body::Incoming>) -> Respo
         let Some(gate) = up.gate.clone() else {
             return reply(StatusCode::NOT_FOUND, "tool-call approval is off");
         };
-        let call: Value = match http_body_util::Limited::new(req.into_body(), 4 << 20).collect().await {
+        // Small: it's a tool name, an id and the call's input (shown to the
+        // auditee capped anyway), parsed in enclave memory outside the jail.
+        let call: Value = match http_body_util::Limited::new(req.into_body(), 256 << 10).collect().await {
             Ok(b) => serde_json::from_slice(&b.to_bytes()).unwrap_or(Value::Null),
             Err(_) => return reply(StatusCode::PAYLOAD_TOO_LARGE, "too large"),
         };
