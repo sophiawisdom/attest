@@ -449,6 +449,8 @@ async fn main() -> Result<()> {
                 };
                 rebuilt_note = format!("built here from {source_repo} at {} ({}); {published}", &commit[..12], path.display());
                 policy.pcrs = Some(path);
+                // The build takes minutes: the first connection is long gone.
+                c = Conn::open(&base).await?;
             }
             let (expected, mut source) = local::expected_policy(&mut c, &measurements_repo, &policy).await?;
             if rebuild {
