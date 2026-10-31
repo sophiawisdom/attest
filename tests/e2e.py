@@ -143,10 +143,7 @@ def run(work):
     auditee, auditor = Party(s["session_id"], s["auditee_token"]), Party(s["session_id"], s["auditor_token"])
     check(hmac.new(s["auditee_token"].encode(), b"attest-invite/1", hashlib.sha256).hexdigest() == s["auditor_token"]
           and auditee.view()["creator"] == "auditee", "the starter's token derives the other party's link")
-    sa = ok("POST", "/api/sessions?role=auditor", body={})
-    check(hmac.new(sa["auditor_token"].encode(), b"attest-invite/1", hashlib.sha256).hexdigest() == sa["auditee_token"]
-          and Party(sa["session_id"], sa["auditee_token"]).view()["role"] == "auditee"
-          and Party(sa["session_id"], sa["auditor_token"]).view()["creator"] == "auditor", "an auditor can start a session")
+    check(call("POST", "/api/sessions?role=auditor", body={})[0] == 400, "an auditor can't start a session")
     check(call("POST", "/api/sessions?role=boss", body={})[0] == 400, "an unknown starting role is refused")
     check(call("GET", f"/api/sessions/{s['session_id']}", "wrong")[0] == 404, "wrong token is rejected")
     check(auditee.view()["role"] == "auditee" and auditor.view()["role"] == "auditor", "tokens decide roles")

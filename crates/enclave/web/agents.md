@@ -18,12 +18,13 @@ is written for an agent to follow, and takes one script.
 
 ## Roles and links
 
-- `POST /api/sessions?role=auditor` (or `role=auditee`, the default) creates
-  a session started by that party and returns two links,
-  `https://HOST/s/SESSION_ID#TOKEN`. The starter keeps theirs and sends the
-  other over a channel they already trust (for example Signal). The other
-  link's token is HMAC-SHA256(starter's token, "attest-invite/1") in hex, so
-  the starter can always rebuild it; the view's `creator` names the starter. There are no accounts or long-term keys. Whoever holds a link acts
+- Only the auditee starts a session: `POST /api/sessions` returns two links,
+  `https://HOST/s/SESSION_ID#TOKEN`. The auditee keeps theirs and sends the
+  auditor theirs over a channel they already trust (for example Signal). The
+  auditor's token is HMAC-SHA256(auditee's token, "attest-invite/1") in hex, so
+  the auditee can always rebuild it; the view's `creator` names the starter.
+  Auditors can't start sessions (`?role=auditor` is refused): the starter
+  holds both links, and the auditee's link shows the agent's transcript. There are no accounts or long-term keys. Whoever holds a link acts
   as that party. If `GET /api/info` shows `"open": false`, the server is
   private: only its operator starts sessions, sending the operator key as
   the header `x-operator-key`. Anyone given a link takes part.
@@ -316,7 +317,7 @@ Do this before uploading code or trusting a result.
    reproducible, so you get the same `pcrs.json`. Published values are in
    `measurements/` in the repository.
 
-The CLI does all of this: `attest verify-service https://HOST` (it fetches the measurements published for the commit the server names; `--pcrs FILE` uses your own).
+The CLI does all of this: `attest verify-service https://HOST` (it fetches the measurements published for the commit the server names; `--pcrs FILE` uses your own; `--rebuild` checks out the server's commit, builds the image with `build/build-eif.sh` (docker and nitro-cli 1.5.0; the image is arm64), and checks against that build, also saying whether the published measurements match it). This shows which code runs, not that the code keeps its promises: that takes reading the source.
 
 **If a person will use the web app,** checking the service yourself doesn't
 protect them: their browser makes its own TLS connection, and whoever

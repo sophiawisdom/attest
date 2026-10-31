@@ -2,7 +2,7 @@
 
 Prove it without showing it. Give an AI agent access to your information (code, Slack, email, bank data, any API) inside an attested enclave; someone else asks it questions, and every answer goes past you before it's sent.
 
-Either party starts a session and sends the other a private link (over
+The auditee starts a session and sends the auditor a private link (over
 Signal or whatever they already use). The **auditor** asks a question. The
 **auditee** accepts it, connects what the agent may look at (Slack, email
 over IMAP, Gmail, bank data through Plaid, a remote MCP server, any HTTPS
@@ -52,6 +52,7 @@ error text). The auditee can choose to release those details too.
 ```sh
 attest open 'https://32.190.88.43/s/ID#TOKEN'
 attest verify-service https://32.190.88.43   # or --pcrs measurements/<commit>.pcrs.json
+attest verify-service --rebuild https://32.190.88.43   # build the commit here (docker + nitro-cli, arm64) and compare
 attest upload 'https://32.190.88.43/s/ID#TOKEN' ~/repo --org "Example Lab" --pcrs ...
 attest verify certificate.json --pcrs ...
 attest verify disclosure.json --pcrs ...

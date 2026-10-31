@@ -285,7 +285,7 @@ async fn new_conn(state: &State) -> Result<Conn> {
 }
 
 /// GET over ordinary web PKI (for published measurements).
-async fn https_get(url: &str) -> Result<Vec<u8>> {
+pub async fn https_get(url: &str) -> Result<Vec<u8>> {
     let u = url::Url::parse(url)?;
     let host = u.host_str().ok_or_else(|| anyhow!("no host"))?.to_string();
     let mut roots = rustls::RootCertStore::empty();

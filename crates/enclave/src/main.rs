@@ -1003,11 +1003,14 @@ fn create_session(app: &App, req: &Request<hyper::body::Incoming>) -> Result<Res
             ));
         }
     }
-    // ?role=auditor: the starter is the auditor (the default is the auditee).
+    // Only the auditee starts sessions: the starter can rebuild the other
+    // link, and an auditor holding the auditee's link could read the agent's
+    // transcript and release answers. The auditee holding the auditor's link
+    // gains nothing: whatever is asked with it shows on the auditor's page.
     let creator = match req.uri().query().unwrap_or("").split('&').find_map(|kv| kv.strip_prefix("role=")) {
         None | Some("auditee") => attest_core::Role::Auditee,
-        Some("auditor") => attest_core::Role::Auditor,
-        Some(_) => return Err(anyhow!("role must be auditee or auditor").into()),
+        Some("auditor") => return Err(anyhow!("only the auditee starts a session (whoever starts one also holds the other party's link); ask the auditee to start one and send you the auditor link").into()),
+        Some(_) => return Err(anyhow!("role must be auditee").into()),
     };
     let (s, auditee, auditor) = app.ctx.store.create(creator)?;
     let base = base_url(app, req);

@@ -251,9 +251,10 @@ function verifyPanel() {
     : `<p class="small muted">This server runs in an AWS Nitro enclave: a sealed machine that can prove which software it runs. Nobody can see inside it, including whoever operates it. You can check that proof yourself:</p>
     <ol class="steps small">
       <li>Install the client (needs <a href="https://rustup.rs" target="_blank" rel="noopener">Rust</a>):${line(install)}</li>
-      <li>Check the server. This confirms it runs exactly the published source at commit <code>${esc(commit.slice(0, 7))}</code>, and that connections to it end inside the enclave:${line(check)}</li>
+      <li>Check the server. This confirms it runs the build published for commit <code>${esc(commit.slice(0, 7))}</code>, and that connections to it end inside the enclave. Add <code>--rebuild</code> to build that commit yourself instead of trusting the published build (needs Docker and nitro-cli; easiest on an arm64 Linux machine):${line(check)}</li>
       <li>Before connecting anything sensitive, open your session through the client. It checks the enclave first and then serves this page locally:${line(openCmd())}</li>
     </ol>
+    <p class="small muted">This proves which code runs, not that the code keeps the promises on this page. For that, read the source at that commit, or have an AI agent review it against <a href="/agents.md">the guide</a>.</p>
     <p class="small faint">Why not just trust this page? A browser checks the address, not the software behind it: whoever controls the address could serve a lookalike page.</p>`;
   return `<div class="panel pad stack" id="verify">
     <h3>Verify this service</h3>
@@ -291,9 +292,9 @@ function landing() {
   </div>`;
 }
 function startButtons() {
-  return `<div class="stack" style="gap:8px"><b>Start a session as</b>
-    <div class="row"><button class="btn primary big" data-act="create" data-role="auditor">The auditor</button><button class="btn primary big" data-act="create" data-role="auditee">The auditee</button></div>
-    <span class="faint small">The auditor asks the questions. The auditee connects the information and decides which answers go out.</span></div>`;
+  return `<div class="stack" style="gap:8px">
+    <div class="row"><button class="btn primary big" data-act="create" data-role="auditee">Start a session</button></div>
+    <span class="faint small">The auditee starts the session: you connect the information, send the auditor their link, and decide which answers go out. Auditors: ask the auditee to start one and send you your link.</span></div>`;
 }
 async function createSession(btn) {
   await busy(btn, async () => {
