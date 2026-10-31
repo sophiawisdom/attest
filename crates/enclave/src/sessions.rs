@@ -123,19 +123,21 @@ pub struct Session {
     pub approvals: Arc<crate::approvals::Queue>,
 }
 
+/// A follow-up message that runs only once the auditee accepts it.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PendingFollowup {
+    pub run_id: String,
+    pub run_number: u32,
+    pub text: String,
+    pub sent_at_ms: u64,
+}
+
 #[derive(Default)]
 struct State {
     /// Set when the session is swept away; nothing new starts after that.
     expired: bool,
     versions: [u64; 2],
     auditor_joined: bool,
-    /// The other party's link is a one-time invite (`join`): their working
-    /// token is made when they open it, so the creator never holds it.
-    /// False only for sessions from before invites, whose invitee used the
-    /// derived token directly.
-    invites: bool,
-    /// When the invite was used, and the hash of the token it gave out.
-    joined: Option<Joined>,
     questions: Vec<Question>,
     code: Option<Arc<Bundle>>,
     affidavit: Option<(String, AffidavitRecord)>,
@@ -153,6 +155,8 @@ struct State {
     tool_approval: bool,
     /// The next connection id (ids are never reused). In memory only.
     next_connection_id: u32,
+    /// A follow-up the auditor sent, waiting for the auditee to accept it.
+    followup: Option<PendingFollowup>,
     /// Retired (the auditor never sees the agent's work); kept so stored
     /// state still loads.
     #[allow(dead_code)]
@@ -488,47 +492,12 @@ fn ri(role: Role) -> usize {
     }
 }
 
-/// The other party's invite, derived from the creator's token: the
-/// creator's page can always show the link to send, and no plaintext token
-/// is stored. It works once (`Store::join`), for a token of the invitee's
-/// own that the creator never sees.
+/// The other party's token, derived from the creator's: the creator's page
+/// can always show the link to send, and no plaintext token is stored. The
+/// invitee's token reveals nothing about the creator's.
 pub fn invite_token(creator_token: &str) -> String {
     let k = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, creator_token.as_bytes());
     hex::encode(ring::hmac::sign(&k, b"attest-invite/1").as_ref())
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct Joined {
-    pub token_hash: String,
-    pub at_ms: u64,
-}
-
-fn same_hash(a: &str, b: &str) -> bool {
-    a.len() == b.len() && ring::constant_time::verify_slices_are_equal(a.as_bytes(), b.as_bytes()).is_ok()
-}
-
-/// "2026-10-31 06:31" for a time in ms since the epoch.
-fn fmt_utc(ms: u64) -> String {
-    let secs = ms / 1000;
-    let (days, rem) = ((secs / 86400) as i64, secs % 86400);
-    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
-    let z = days + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", rem / 3600, rem % 3600 / 60)
-}
-
-fn other(r: Role) -> Role {
-    match r {
-        Role::Auditee => Role::Auditor,
-        Role::Auditor => Role::Auditee,
-    }
 }
 
 const MAX_CONNECTIONS: usize = 12;
@@ -642,7 +611,7 @@ impl Session {
         let st = lock(&self.st);
         // The auditor opening a session they started themselves isn't the
         // invited party joining.
-        let invited_joined = st.joined.is_some() || (st.auditor_joined && self.creator != Some(Role::Auditor));
+        let invited_joined = st.auditor_joined && self.creator != Some(Role::Auditor);
         st.questions.is_empty()
             && st.code.is_none()
             && st.connections.is_empty()
@@ -757,7 +726,7 @@ impl Store {
                 sha256_hex(auditor.as_bytes()),
             ],
             creator: Some(creator),
-            st: Mutex::new(State { invites: true, ..State::default() }),
+            st: Mutex::new(State::default()),
             tx,
             dirty: AtomicBool::new(true),
             written: Mutex::new((0, None)),
@@ -781,68 +750,14 @@ impl Store {
             .filter(|s| !s.expired(now_ms()));
         let h = sha256_hex(token.as_bytes());
         if let Some(s) = s {
-            let (invites, joined) = {
-                let st = lock(&s.st);
-                (st.invites, st.joined.clone())
-            };
-            let invitee = s.creator.map(other);
-            for role in [Role::Auditee, Role::Auditor] {
-                let hit = same_hash(&h, &s.token_hashes[ri(role)]);
-                if !invites || Some(role) != invitee {
-                    if hit {
-                        return Ok((s, role));
-                    }
-                    continue;
-                }
-                // The invitee's slot holds the invite; their token is the joined one.
-                if joined.as_ref().is_some_and(|j| same_hash(&h, &j.token_hash)) {
-                    return Ok((s, role));
-                }
-                if hit {
-                    match &joined {
-                        Some(j) => bail!(
-                            "this invite link was already used (at {} UTC); it works only once. If you didn't use it, someone else has this party's access: ask for a new session",
-                            fmt_utc(j.at_ms)
-                        ),
-                        None => bail!("this is an invite link: open it in a browser to join (it gives you a link of your own)"),
-                    }
-                }
+            if h == s.token_hashes[0] {
+                return Ok((s, Role::Auditee));
+            }
+            if h == s.token_hashes[1] {
+                return Ok((s, Role::Auditor));
             }
         }
         bail!("unknown session or wrong link")
-    }
-
-    /// Use the invite: the invitee gets a token of their own, made here, that
-    /// whoever created the session never sees. The invite then stops working.
-    pub fn join(&self, ctx: &Arc<Ctx>, id: &str, invite: &str) -> Result<(Arc<Session>, Role, String)> {
-        let s = lock(&self.sessions)
-            .get(id)
-            .cloned()
-            .filter(|s| !s.expired(now_ms()))
-            .ok_or_else(|| anyhow!("unknown session or wrong link"))?;
-        let role = s.creator.map(other).ok_or_else(|| anyhow!("this session has no invite"))?;
-        if !same_hash(&sha256_hex(invite.as_bytes()), &s.token_hashes[ri(role)]) {
-            bail!("unknown session or wrong link");
-        }
-        let token = random_hex(32);
-        {
-            let mut st = lock(&s.st);
-            ensure!(st.invites, "this session's links work directly; open it with your link");
-            if let Some(j) = &st.joined {
-                bail!(
-                    "this invite link was already used (at {} UTC); it works only once. If you didn't use it, someone else has this party's access: ask for a new session",
-                    fmt_utc(j.at_ms)
-                );
-            }
-            st.joined = Some(Joined { token_hash: sha256_hex(token.as_bytes()), at_ms: now_ms() });
-            let text = match role {
-                Role::Auditee => "The auditee joined with the invite link.",
-                Role::Auditor => "The auditor joined with the invite link.",
-            };
-            s.event(ctx, &mut st, "joined", text.into(), None, Some(role), false);
-        }
-        s.dirty.store(true, Ordering::SeqCst);
-        Ok((s, role, token))
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<Session>> {
@@ -1438,6 +1353,8 @@ impl Session {
         Ok(json!({"ok": true}))
     }
 
+    /// The auditor proposes a follow-up to a decided run. It runs only once
+    /// the auditee accepts it (`decide_followup`); a newer one replaces it.
     pub fn followup(
         self: &Arc<Self>,
         ctx: &Arc<Ctx>,
@@ -1449,7 +1366,6 @@ impl Session {
             role == Role::Auditor,
             "only the auditor sends follow-up messages"
         );
-        crate::budget::ensure_room(SESSION_ALLOWANCE)?;
         let text = clean(v["text"].as_str()).ok_or_else(|| anyhow!("text is required"))?;
         ensure!(
             text.chars().count() <= MAX_MESSAGE_CHARS,
@@ -1457,59 +1373,74 @@ impl Session {
         );
         // Every message the auditor sends is visible to the auditee.
         ensure!(!v["blinded"].as_bool().unwrap_or(false), "messages to the agent can't be hidden from the auditee");
-        let blinded = false;
         let mut st = lock(&self.st);
         ensure!(
             !busy_for(&st, role),
             "wait until the current run is released or declined"
         );
-        let parent = st
-            .runs
-            .iter()
-            .find(|r| r.id == run_id)
-            .ok_or_else(|| anyhow!("no such run"))?;
-        ensure!(
-            parent.status == "released" || parent.status == "declined",
-            "follow-ups are possible after the auditee decides on run {}",
-            parent.number
-        );
-        // The same answer for every run from before a move, whether or not
-        // it had finished: which ones had says when they ended.
-        ensure!(
-            !parent.before_move,
-            "run {} ran before this service moved to a new enclave and can't be continued; revise the question to run it again",
-            parent.number
-        );
-        // A follow-up continues that run as agreed: same code, same model and
-        // account. If either changed since, the old conversation (and its
-        // excerpts of the old code) mustn't mix with the new, nor new code go
-        // to a model or account that was replaced.
-        let model = st.models.iter().find(|m| m.id == parent.model_id).unwrap();
-        let tree = st.code.as_ref().map(|c| c.info.tree_sha256.clone()).unwrap_or_default();
-        let conns: Vec<u32> = st.connections.iter().map(|c| c.rec.id).collect();
-        ensure!(
-            model.status == "approved" && tree == parent.tree && conns == parent.connections,
-            "the code, the connected services or the model changed since run {}; revise the question to run it again",
-            parent.number
-        );
-        // The agent can send requests to services the auditee runs, so a
-        // message hidden from the auditee could reach them that way.
-        ensure!(
-            !blinded || conns.is_empty(),
-            "blinded messages aren't possible with connected services: the agent's requests to them could carry the message to the auditee"
-        );
-        let rec = MessageRecord {
+        let number = followup_parent(&st, run_id)?;
+        let replaced = st.followup.is_some();
+        st.followup = Some(PendingFollowup {
+            run_id: run_id.into(),
+            run_number: number,
+            text: text.clone(),
             sent_at_ms: now_ms(),
-            blinded,
-            text_sha256: sha256_hex(text.as_bytes()),
-            text: (!blinded).then(|| text.clone()),
+        });
+        let msg = format!(
+            "The auditor {} a follow-up to run {number}: \"{}\" It runs once the auditee accepts it.",
+            if replaced { "replaced their pending follow-up with" } else { "sent" },
+            text
+        );
+        self.event(ctx, &mut st, "followup_proposed", msg, None, Some(role), true);
+        Ok(json!({"pending": true}))
+    }
+
+    /// The auditee accepts (the run starts) or rejects the pending follow-up.
+    pub fn decide_followup(
+        self: &Arc<Self>,
+        ctx: &Arc<Ctx>,
+        role: Role,
+        v: &Value,
+    ) -> Result<Value> {
+        ensure!(
+            role == Role::Auditee,
+            "only the auditee accepts or rejects follow-ups"
+        );
+        let accept = v["accept"]
+            .as_bool()
+            .ok_or_else(|| anyhow!("accept (true/false) is required"))?;
+        let note = field(v, "note", MAX_NOTE_BYTES)?;
+        let mut st = lock(&self.st);
+        let f = st.followup.clone().ok_or_else(|| anyhow!("no follow-up is waiting"))?;
+        if !accept {
+            st.followup = None;
+            let msg = match note {
+                Some(n) => format!("The auditee rejected the follow-up to run {}: {n}", f.run_number),
+                None => format!("The auditee rejected the follow-up to run {}.", f.run_number),
+            };
+            self.event(ctx, &mut st, "followup_decided", msg, None, Some(role), true);
+            return Ok(json!({"ok": true}));
+        }
+        crate::budget::ensure_room(SESSION_ALLOWANCE)?;
+        ensure!(
+            !st.runs.iter().any(|r| r.status == "running" || r.status == "awaiting_release"),
+            "decide on the current run first"
+        );
+        followup_parent(&st, &f.run_id)?;
+        let parent = st.runs.iter().find(|r| r.id == f.run_id).unwrap();
+        let rec = MessageRecord {
+            sent_at_ms: f.sent_at_ms,
+            blinded: false,
+            text_sha256: sha256_hex(f.text.as_bytes()),
+            text: Some(f.text.clone()),
         };
         let spec = RunSpec {
             question_version: parent.question_version,
             model_id: parent.model_id,
             parent: Some(parent.id.clone()),
-            message: Some((rec, text)),
+            message: Some((rec, f.text.clone())),
         };
+        st.followup = None;
         let id = self.start_run(ctx, &mut st, spec)?;
         Ok(json!({"run_id": id}))
     }
@@ -1898,9 +1829,6 @@ impl Session {
             "version": st.versions[ri(role)],
             "boot_id": ctx.info.boot_id,
             "auditor_joined": st.auditor_joined,
-            // When the other party's one-time invite was used (null: not
-            // yet, or a session from before invites).
-            "invite": if st.invites { json!({"used_at_ms": st.joined.as_ref().map(|j| j.at_ms)}) } else { Value::Null },
             "questions": st.questions,
             "code": st.code.as_ref().map(|b| match role {
                 Role::Auditee => json!(b.info),
@@ -1916,6 +1844,7 @@ impl Session {
             }),
             "connections": st.connections.iter().map(|c| &c.rec).collect::<Vec<_>>(),
             "tool_approval": st.tool_approval,
+            "pending_followup": st.followup,
             "pending_tool_calls": if role == Role::Auditee { json!(self.approvals.list()) } else { Value::Null },
             "models": st.models.iter().map(|m| m.public()).collect::<Vec<_>>(),
             "runs": runs,
@@ -2673,6 +2602,37 @@ fn sign_certificate(ctx: &Ctx, body: &CertificateBody) -> Result<Certificate> {
 /// not: how long a run takes is model-controlled and would be a side channel.
 /// Whether `role` should treat a run as still going. The auditor can't
 /// tell a finished-but-undecided run from a running one, through any API.
+/// The run a follow-up continues, if it still can be: decided, from this
+/// enclave, and with the same code, connected services and model.
+fn followup_parent(st: &State, run_id: &str) -> Result<u32> {
+    let parent = st
+        .runs
+        .iter()
+        .find(|r| r.id == run_id)
+        .ok_or_else(|| anyhow!("no such run"))?;
+    ensure!(
+        parent.status == "released" || parent.status == "declined",
+        "follow-ups are possible after the auditee decides on run {}",
+        parent.number
+    );
+    ensure!(
+        !parent.before_move,
+        "run {} ran before this service moved to a new enclave and can't be continued; revise the question to run it again",
+        parent.number
+    );
+    // The old conversation (and its excerpts of the old code) mustn't mix
+    // with new code, nor go to a model or account that was replaced.
+    let model = st.models.iter().find(|m| m.id == parent.model_id).unwrap();
+    let tree = st.code.as_ref().map(|c| c.info.tree_sha256.clone()).unwrap_or_default();
+    let conns: Vec<u32> = st.connections.iter().map(|c| c.rec.id).collect();
+    ensure!(
+        model.status == "approved" && tree == parent.tree && conns == parent.connections,
+        "the code, the connected services or the model changed since run {}; revise the question to run it again",
+        parent.number
+    );
+    Ok(parent.number)
+}
+
 fn busy_for(st: &State, role: Role) -> bool {
     st.runs
         .iter()
@@ -2819,6 +2779,12 @@ fn status_line(st: &State, role: Role) -> String {
             Role::Auditor => "The agent finished. Waiting for the auditee to decide whether to release the result.".into(),
         };
     }
+    if let Some(f) = &st.followup {
+        return match role {
+            Role::Auditee => format!("The auditor sent a follow-up to run {}. Accept or reject it below.", f.run_number),
+            Role::Auditor => format!("Waiting for the auditee to accept your follow-up to run {}.", f.run_number),
+        };
+    }
     match q.map(|q| q.status) {
         None if role == Role::Auditor => return "Ask your question below.".into(),
         None => return "Waiting for the auditor to ask a question.".into(),
@@ -2920,7 +2886,7 @@ fn next_actions(st: &State, role: Role, sid: &str) -> Vec<Value> {
                         "send_followup",
                         "POST",
                         format!("{base}/runs/{}/followup", r.id),
-                        "Ask the agent to revise its answer (the auditee sees your message).",
+                        "Ask the agent to revise its answer; it runs once the auditee accepts your message.",
                     ));
                 }
                 if r.status == "released" {
@@ -2934,6 +2900,14 @@ fn next_actions(st: &State, role: Role, sid: &str) -> Vec<Value> {
             }
         }
         Role::Auditee => {
+            if let Some(f) = &st.followup {
+                out.push(a(
+                    "decide_followup",
+                    "POST",
+                    format!("{base}/followup/decision"),
+                    &format!("Accept or reject the auditor's follow-up to run {}: {{accept: true|false, note}}.", f.run_number),
+                ));
+            }
             if let Some(q) = q.filter(|q| q.status == "proposed") {
                 out.push(a(
                     "decide_question",

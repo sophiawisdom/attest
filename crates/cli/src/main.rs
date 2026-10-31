@@ -443,9 +443,6 @@ async fn main() -> Result<()> {
                 .filter(|t| !t.is_empty())
                 .ok_or_else(|| anyhow!("the link has no token after #"))?
                 .to_string();
-            if token.starts_with("join-") {
-                bail!("this is a one-time invite link: open it in a browser (or with `attest open`) first, then use the link that page shows");
-            }
             let sid = u
                 .path()
                 .strip_prefix("/s/")

@@ -72,8 +72,6 @@ struct SnapshotRef<'a> {
     creator: Option<Role>,
     versions: [u64; 2],
     auditor_joined: bool,
-    invites: bool,
-    joined: &'a Option<super::Joined>,
     questions: &'a Vec<Question>,
     code: Option<CodeRef>,
     affidavit: &'a Option<(String, AffidavitRecord)>,
@@ -86,6 +84,7 @@ struct SnapshotRef<'a> {
     connections: &'a Vec<crate::connections::Connection>,
     tool_approval: bool,
     auditor_watch: &'a str,
+    followup: &'a Option<super::PendingFollowup>,
 }
 
 /// ...and owned, to read it back.
@@ -98,10 +97,6 @@ struct Snapshot {
     creator: Option<Role>,
     versions: [u64; 2],
     auditor_joined: bool,
-    #[serde(default)]
-    invites: bool,
-    #[serde(default)]
-    joined: Option<super::Joined>,
     questions: Vec<Question>,
     code: Option<CodeRef>,
     affidavit: Option<(String, AffidavitRecord)>,
@@ -117,6 +112,8 @@ struct Snapshot {
     tool_approval: bool,
     #[serde(default)]
     auditor_watch: String,
+    #[serde(default)]
+    followup: Option<super::PendingFollowup>,
 }
 
 fn code_name(b: &Bundle) -> String {
@@ -236,8 +233,6 @@ impl Session {
                 creator: self.creator,
                 versions: st.versions,
                 auditor_joined: st.auditor_joined,
-                invites: st.invites,
-                joined: &st.joined,
                 questions: &st.questions,
                 code,
                 affidavit: &st.affidavit,
@@ -273,6 +268,7 @@ impl Session {
                 connections: &st.connections,
                 tool_approval: st.tool_approval,
                 auditor_watch: &st.auditor_watch,
+                followup: &st.followup,
             })?
         };
         let generation = lock(&self.written).0 + 1;
@@ -556,8 +552,6 @@ async fn restore_session(ctx: &Arc<Ctx>, sid: &str, head_ref: &str) -> Result<Ar
         expired: false,
         versions: snap.versions,
         auditor_joined: snap.auditor_joined,
-        invites: snap.invites,
-        joined: snap.joined,
         questions: snap.questions,
         code,
         affidavit: snap.affidavit,
@@ -595,6 +589,7 @@ async fn restore_session(ctx: &Arc<Ctx>, sid: &str, head_ref: &str) -> Result<Ar
         tool_approval: snap.tool_approval,
         next_connection_id: 0,
         auditor_watch: snap.auditor_watch,
+        followup: snap.followup,
         disclosures_in_flight: 0,
     };
     // Runs that were going when the state was written can't continue here:
