@@ -280,6 +280,13 @@ async fn service() -> Result<()> {
     args.concurrency = args.concurrency.clamp(1, 16);
     let attester = nsm::Attester::new(args.dev)?;
     let cfg = read_host_config(&args).await?;
+    // A key that's set but too short must not quietly leave session
+    // creation open to everyone. Checked before taking any keys over, so
+    // the failure can't strand a handoff.
+    let operator_key = cfg.operator_key.as_deref().map(str::trim).filter(|k| !k.is_empty());
+    if let Some(k) = operator_key {
+        anyhow::ensure!(k.len() >= 16, "the operator key is set but shorter than 16 characters; refusing to start");
+    }
     log(&format!(
         "config: domain={:?} public_ip={:?} email_from={:?}",
         cfg.domain, cfg.public_ip, cfg.email_from
@@ -381,12 +388,8 @@ async fn service() -> Result<()> {
     }
     let mut boot = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut boot);
-    let operator_key_hash = cfg
-        .operator_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|k| k.len() >= 16)
-        .map(|k| attest_core::sha256_hex(k.as_bytes()));
+    // Checked at startup, before any handoff (see `operator_key` above).
+    let operator_key_hash = operator_key.map(|k| attest_core::sha256_hex(k.as_bytes()));
     let info = EnclaveInfo {
         service: "attest".into(),
         version: env!("CARGO_PKG_VERSION").into(),
@@ -866,7 +869,7 @@ async fn replica_sync(app: &App, req: Request<hyper::body::Incoming>) -> Result<
     if app.ctx.standby.load(std::sync::atomic::Ordering::SeqCst) || app.ctx.moved.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "this enclave isn't serving sessions".into()));
     }
-    match app.ctx.repl.sync(&body, &app.ctx.info.boot_id) {
+    match app.ctx.repl.sync(&body, &app.ctx.info.boot_id, app.ctx.store.index_written()) {
         Ok(v) => Ok(json_resp(StatusCode::OK, &v)),
         Err(e) => Err(ApiError(StatusCode::FORBIDDEN, format!("{e:#}"))),
     }
@@ -1253,6 +1256,10 @@ async fn session_route(
                 return Err(anyhow!("only the auditee connects services").into());
             }
             let v = body_json(req).await?;
+            // Room first: discovery talks to the service and parses what it
+            // sends, in enclave memory.
+            s.connection_room()?;
+            let _slot = connections::discovery_slot().await?;
             // Checked against the service before it's added (outside the
             // session lock: it makes requests).
             let c = connections::connect(&ctx.net, 0, &v).await?;
@@ -1262,7 +1269,10 @@ async fn session_route(
             if role != attest_core::Role::Auditee {
                 return Err(anyhow!("only the auditee connects services").into());
             }
-            ok(connections::preview(&ctx.net, &body_json(req).await?).await?)
+            let v = body_json(req).await?;
+            s.connection_room()?;
+            let _slot = connections::discovery_slot().await?;
+            ok(connections::preview(&ctx.net, &v).await?)
         }
         ("DELETE", ["connections", cid]) => {
             let id: u32 = cid.parse().map_err(|_| anyhow!("bad connection id"))?;

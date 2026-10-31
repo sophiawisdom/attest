@@ -18,6 +18,22 @@ const MAX_RESPONSE_CHARS: usize = 40_000;
 const TIMEOUT: Duration = Duration::from_secs(30);
 pub const KINDS: &[&str] = &["slack", "gmail", "plaid", "github_api", "http", "imap", "mcp"];
 const METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"];
+/// Longest identity (from the service's own answer) kept.
+const MAX_IDENTITY_CHARS: usize = 500;
+
+/// Connection setups and previews under way at once, server-wide: each
+/// talks to a server the auditee names and parses its replies in enclave
+/// memory (outside any jail's limits).
+static DISCOVERY: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+/// A slot for connecting or previewing; waits briefly, then says busy.
+pub async fn discovery_slot() -> Result<tokio::sync::SemaphorePermit<'static>> {
+    tokio::time::timeout(Duration::from_secs(5), DISCOVERY.acquire())
+        .await
+        .ok()
+        .and_then(|p| p.ok())
+        .ok_or_else(|| anyhow!("the server is busy connecting other services; try again in a minute"))
+}
 
 /// A connection: its public record and the credentials only the enclave
 /// sees (kept in the session's sealed state, like model API keys).
@@ -124,6 +140,7 @@ pub async fn connect(net: &Net, id: u32, v: &Value) -> Result<Connection> {
         "gmail" => {
             let mut secret = Secret::default();
             if let Some(rt) = text(v, "refresh_token") {
+                ensure!(rt.len() <= 4000, "the refresh token is too long");
                 secret.refresh = Some(Refresh {
                     client_id: need(v, "client_id", "the OAuth client ID")?.into(),
                     client_secret: need(v, "client_secret", "the OAuth client secret")?.into(),
@@ -158,8 +175,13 @@ pub async fn connect(net: &Net, id: u32, v: &Value) -> Result<Connection> {
                 ensure!(h.len() <= 100 && h.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'), "a header name is letters, digits and -");
                 headers.push((h.to_ascii_lowercase(), need(v, "header_value", "the header's value")?.to_string()));
             }
+            // Each known method once, whatever was sent.
             let methods: Vec<&str> = match v["methods"].as_array() {
-                Some(a) => a.iter().filter_map(|m| m.as_str()).filter_map(|m| METHODS.iter().copied().find(|k| k.eq_ignore_ascii_case(m))).collect(),
+                Some(a) => METHODS
+                    .iter()
+                    .copied()
+                    .filter(|k| a.iter().filter_map(|m| m.as_str()).any(|m| k.eq_ignore_ascii_case(m)))
+                    .collect(),
                 None => vec!["GET"],
             };
             ensure!(!methods.is_empty(), "choose at least one HTTP method");
@@ -214,7 +236,7 @@ pub async fn connect(net: &Net, id: u32, v: &Value) -> Result<Connection> {
     };
     let net = net.scoped(&c.hosts_only());
     c.refresh(&net).await?;
-    c.rec.identity = c.identify(&net).await?;
+    c.rec.identity = c.identify(&net).await?.map(|i| i.chars().take(MAX_IDENTITY_CHARS).collect());
     if let Some(server) = &c.secret.mcp {
         let (name, tools) = server.discover(&net).await?;
         let wanted: Vec<String> = v["tools"].as_array().map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect()).unwrap_or_default();

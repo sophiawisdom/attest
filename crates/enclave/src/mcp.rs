@@ -13,6 +13,8 @@ const PROTOCOL: &str = "2025-06-18";
 const TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_BODY: usize = 8 << 20;
 pub const MAX_TOOLS: usize = 80;
+/// The server's name and version, as kept (they're its own, unverified).
+const MAX_SERVER_NAME: usize = 200;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Tool {
@@ -126,11 +128,13 @@ impl Server {
 
     async fn call(&self, net: &Net, live: &mut Live, method: &str, params: Value) -> Result<Value> {
         let (_, v) = self.rpc(net, live, method, params, false).await?;
-        let v = v.context("the MCP server sent no reply")?;
+        let mut v = v.context("the MCP server sent no reply")?;
         if let Some(e) = v.get("error") {
-            bail!("the MCP server returned an error: {}", e["message"].as_str().unwrap_or("unknown"));
+            let msg: String = e["message"].as_str().unwrap_or("unknown").chars().take(500).collect();
+            bail!("the MCP server returned an error: {msg}");
         }
-        Ok(v["result"].clone())
+        // Taken, not cloned: it can be most of an 8 MiB reply.
+        Ok(v.get_mut("result").map(Value::take).unwrap_or(Value::Null))
     }
 
     async fn initialize(&self, net: &Net, live: &mut Live) -> Result<Value> {
@@ -154,7 +158,9 @@ impl Server {
             anyhow!("{e:#}. The server must speak MCP's Streamable HTTP transport and accept a token in a header (servers that need a sign-in can't be connected)")
         })?;
         let info = &init["serverInfo"];
-        let server = format!("{} {}", info["name"].as_str().unwrap_or("unnamed"), info["version"].as_str().unwrap_or("")).trim().to_string();
+        let field = |k: &str, or: &str| -> String { info[k].as_str().unwrap_or(or).chars().take(MAX_SERVER_NAME).collect() };
+        let server: String = format!("{} {}", field("name", "unnamed"), field("version", "")).trim().to_string();
+        drop(init);
         let mut tools = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..10 {
@@ -163,11 +169,11 @@ impl Server {
                 None => json!({}),
             };
             let r = self.call(net, &mut live, "tools/list", params).await?;
-            for t in r["tools"].as_array().cloned().unwrap_or_default() {
-                let Some(name) = t["name"].as_str() else { continue };
+            for t in r["tools"].as_array().map(Vec::as_slice).unwrap_or_default() {
                 if tools.len() >= MAX_TOOLS {
                     break;
                 }
+                let Some(name) = t["name"].as_str() else { continue };
                 let mut schema = t["inputSchema"].clone();
                 if !schema.is_object() || serde_json::to_vec(&schema).map(|b| b.len()).unwrap_or(0) > 16_000 {
                     schema = json!({"type": "object"});
@@ -179,8 +185,8 @@ impl Server {
                     read_only: t["annotations"]["readOnlyHint"].as_bool(),
                 });
             }
-            cursor = r["nextCursor"].as_str().map(String::from);
-            if cursor.is_none() {
+            cursor = r["nextCursor"].as_str().filter(|c| c.len() <= 4096).map(String::from);
+            if cursor.is_none() || tools.len() >= MAX_TOOLS {
                 break;
             }
         }

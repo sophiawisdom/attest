@@ -160,11 +160,20 @@ pub fn is_fine_tuned(p: Provider, model: &str) -> bool {
     }
 }
 
+/// Tool calls kept from one reply; the rest are dropped (from the
+/// conversation too) and the model is told.
+pub const MAX_CALLS_PER_REPLY: usize = 32;
+/// A call whose arguments are larger is kept with empty arguments, and
+/// not run.
+pub const MAX_CALL_ARGS: usize = 256 << 10;
+
 #[derive(Clone, Debug)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub args: Value,
+    /// Its arguments were over MAX_CALL_ARGS and were dropped.
+    pub oversized: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -177,6 +186,8 @@ pub enum Turn {
 pub struct Reply {
     pub text: String,
     pub calls: Vec<ToolCall>,
+    /// Calls past MAX_CALLS_PER_REPLY, dropped.
+    pub dropped_calls: usize,
     pub raw_message: Value,
     pub model: Option<String>,
     pub upstream_provider: Option<String>,
@@ -326,27 +337,38 @@ fn parse_openai(resp: &HttpResponse) -> Result<Reply> {
         bail!("provider response has no message");
     }
     let mut calls = Vec::new();
+    let mut kept = Vec::new();
+    let mut dropped_calls = 0;
     if let Some(tc) = msg["tool_calls"].as_array() {
-        for c in tc {
+        dropped_calls = tc.len().saturating_sub(MAX_CALLS_PER_REPLY);
+        for c in tc.iter().take(MAX_CALLS_PER_REPLY) {
             let args_s = c["function"]["arguments"].as_str().unwrap_or("{}");
+            let oversized = args_s.len() > MAX_CALL_ARGS;
+            let mut c = c.clone();
+            if oversized {
+                c["function"]["arguments"] = json!("{}");
+            }
             calls.push(ToolCall {
                 id: c["id"].as_str().unwrap_or_default().to_string(),
                 name: c["function"]["name"]
                     .as_str()
                     .unwrap_or_default()
                     .to_string(),
-                args: serde_json::from_str(args_s).unwrap_or(Value::Null),
+                args: if oversized { Value::Null } else { serde_json::from_str(args_s).unwrap_or(Value::Null) },
+                oversized,
             });
+            kept.push(c);
         }
     }
-    // Keep only the fields the API accepts back.
+    // Keep only the fields the API accepts back (and only the calls kept).
     let mut raw = json!({"role": "assistant", "content": msg["content"].clone()});
     if msg.get("tool_calls").map(|t| !t.is_null()).unwrap_or(false) {
-        raw["tool_calls"] = msg["tool_calls"].clone();
+        raw["tool_calls"] = Value::Array(kept);
     }
     Ok(Reply {
         text: msg["content"].as_str().unwrap_or_default().to_string(),
         calls,
+        dropped_calls,
         raw_message: raw,
         model: v["model"].as_str().map(String::from),
         upstream_provider: v["provider"].as_str().map(String::from),
@@ -402,21 +424,37 @@ fn parse_anthropic(resp: &HttpResponse) -> Result<Reply> {
         .ok_or_else(|| anyhow!("response has no content"))?;
     let mut text = String::new();
     let mut calls = Vec::new();
-    for b in &content {
+    let mut kept = Vec::with_capacity(content.len());
+    let mut dropped_calls = 0;
+    for mut b in content {
         match b["type"].as_str() {
             Some("text") => text.push_str(b["text"].as_str().unwrap_or_default()),
-            Some("tool_use") => calls.push(ToolCall {
-                id: b["id"].as_str().unwrap_or_default().to_string(),
-                name: b["name"].as_str().unwrap_or_default().to_string(),
-                args: b["input"].clone(),
-            }),
+            Some("tool_use") if calls.len() >= MAX_CALLS_PER_REPLY => {
+                // Dropped from the conversation too, so it needs no result.
+                dropped_calls += 1;
+                continue;
+            }
+            Some("tool_use") => {
+                let oversized = b["input"].to_string().len() > MAX_CALL_ARGS;
+                if oversized {
+                    b["input"] = json!({});
+                }
+                calls.push(ToolCall {
+                    id: b["id"].as_str().unwrap_or_default().to_string(),
+                    name: b["name"].as_str().unwrap_or_default().to_string(),
+                    args: if oversized { Value::Null } else { b["input"].clone() },
+                    oversized,
+                });
+            }
             _ => {}
         }
+        kept.push(b);
     }
     Ok(Reply {
         text,
         calls,
-        raw_message: Value::Array(content),
+        dropped_calls,
+        raw_message: Value::Array(kept),
         model: v["model"].as_str().map(String::from),
         upstream_provider: None,
         key_owner: resp.header("anthropic-organization-id").map(String::from),

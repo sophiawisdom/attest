@@ -18,6 +18,11 @@ use std::time::Duration;
 pub const DECISION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// What pending calls show of their input, at most.
 const MAX_SHOWN_INPUT: usize = 20_000;
+/// Longest call id kept in the ledger; longer ones are denied.
+pub const MAX_CALL_ID: usize = 256;
+/// Call ids one run's ledger (and withheld set) holds; past it, calls are
+/// denied. The jailed agent asks freely, and this memory isn't in its cgroup.
+const MAX_LEDGER: usize = 20_000;
 /// Harness bookkeeping that reads and changes nothing; approved without asking.
 const INTERNAL: &[&str] = &["TodoWrite", "todowrite", "update_plan", "get_goal", "create_goal", "update_goal"];
 
@@ -169,6 +174,19 @@ impl Gate {
 
     /// Ask the auditee about one call, waiting for the decision.
     pub async fn ask(&self, tool: &str, input: &Value, call_id: Option<&str>) -> Decision {
+        if let Some(cid) = call_id {
+            let refuse = if cid.len() > MAX_CALL_ID {
+                Some(format!("the tool call id is over {MAX_CALL_ID} bytes"))
+            } else if self.ledger.lock().unwrap().len() >= MAX_LEDGER {
+                Some(format!("this run has asked about {MAX_LEDGER} tool calls already"))
+            } else {
+                None
+            };
+            if let Some(reason) = refuse {
+                self.counts.lock().unwrap().denied += 1;
+                return Decision { approve: false, reason };
+            }
+        }
         let d = if INTERNAL.contains(&tool) {
             Decision { approve: true, reason: "harness bookkeeping, approved without asking".into() }
         } else {
@@ -209,7 +227,9 @@ impl Gate {
     }
 
     fn note_withheld(&self, call_id: &str, tool: &str) {
-        if self.withheld_ids.lock().unwrap().insert(call_id.to_string()) {
+        let mut ids = self.withheld_ids.lock().unwrap();
+        if ids.len() < MAX_LEDGER && call_id.len() <= MAX_CALL_ID && ids.insert(call_id.to_string()) {
+            drop(ids);
             self.counts.lock().unwrap().withheld += 1;
             (self.progress)(vec![json!({"type": "error", "content": format!("a {tool} call ran without a decision; the enclave withheld its result from the model")})]);
         }
