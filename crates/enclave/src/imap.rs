@@ -42,6 +42,47 @@ fn quote(s: &str) -> Result<String> {
     Ok(format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
 }
 
+/// The IMAP server for an address at one of the common providers. Other
+/// domains get Gmail's, since a custom domain is most often Google Workspace.
+pub fn server_for(address: &str) -> &'static str {
+    let domain = address.rsplit('@').next().unwrap_or("").trim().to_ascii_lowercase();
+    match domain.as_str() {
+        "icloud.com" | "me.com" | "mac.com" => "imap.mail.me.com",
+        "fastmail.com" | "fastmail.fm" => "imap.fastmail.com",
+        "yahoo.com" | "ymail.com" => "imap.mail.yahoo.com",
+        "aol.com" => "imap.aol.com",
+        _ => "imap.gmail.com",
+    }
+}
+
+/// Google shows app passwords as four groups of four letters; the spaces
+/// aren't part of it.
+pub fn clean_password(host: &str, password: &str) -> String {
+    if host == "imap.gmail.com" {
+        password.chars().filter(|c| !c.is_whitespace()).collect()
+    } else {
+        password.to_string()
+    }
+}
+
+/// Say what to do about a refused login, for the providers whose replies
+/// are known.
+fn login_help(host: &str, reply: &str) -> String {
+    if host != "imap.gmail.com" {
+        return format!("the server refused the login: {reply}");
+    }
+    let r = reply.to_ascii_lowercase();
+    if r.contains("application-specific password required") {
+        "Gmail wants an app password here, not your Google password. Make one at https://myaccount.google.com/apppasswords and paste its 16 letters.".into()
+    } else if r.contains("web login required") || r.contains("log in via your web browser") {
+        "Google blocked this sign-in. Sign in to Gmail in your browser once, then try again with the app password.".into()
+    } else if r.contains("authenticationfailed") || r.contains("invalid credentials") {
+        "Gmail refused the address or app password. Check the address is the account the app password belongs to, and paste the 16-letter app password from https://myaccount.google.com/apppasswords (not your Google password). Google Workspace accounts also need their admin to allow app passwords.".into()
+    } else {
+        format!("Gmail refused the login: {reply}")
+    }
+}
+
 impl Session {
     async fn open(net: &Net, c: &Creds) -> Result<Session> {
         let io = net.stream(&c.host, c.port, c.tls, Duration::from_secs(20)).await?;
@@ -51,7 +92,7 @@ impl Session {
         ensure!(g.starts_with("* OK") || g.starts_with("* PREAUTH"), "the server didn't greet as IMAP: {}", g.trim());
         if !g.starts_with("* PREAUTH") {
             let cmd = format!("LOGIN {} {}", quote(&c.user)?, quote(&c.password)?);
-            s.command(&cmd).await.map_err(|e| anyhow!("the server refused the login: {e}"))?;
+            s.command(&cmd).await.map_err(|e| anyhow!(login_help(&c.host, &e.to_string())))?;
         }
         Ok(s)
     }

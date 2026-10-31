@@ -166,7 +166,13 @@ pub async fn connect(net: &Net, id: u32, v: &Value) -> Result<Connection> {
             (vec![origin_string(&o)], methods, Secret { headers, ..Default::default() }, "api")
         }
         "imap" => {
-            let host = need(v, "host", "the IMAP server (e.g. imap.gmail.com)")?.to_ascii_lowercase();
+            let user = need(v, "username", "your email address")?;
+            // The server can be left out for the common providers; any other
+            // domain is most likely Google Workspace.
+            let host = match text(v, "host") {
+                Some(h) => h.to_ascii_lowercase(),
+                None => crate::imap::server_for(user).to_string(),
+            };
             ensure!(host.len() <= 253 && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'), "the IMAP server is a host name, like imap.gmail.com");
             let port = v["port"].as_u64().unwrap_or(crate::net::IMAPS_PORT as u64) as u16;
             let tls = v["tls"].as_bool().unwrap_or(true);
@@ -175,8 +181,8 @@ pub async fn connect(net: &Net, id: u32, v: &Value) -> Result<Connection> {
                 host: host.clone(),
                 port,
                 tls,
-                user: need(v, "username", "the username (usually the email address)")?.into(),
-                password: need(v, "password", "the password (an app password for most providers)")?.into(),
+                user: user.into(),
+                password: crate::imap::clean_password(&host, need(v, "password", "the app password")?),
             };
             let scheme = if tls { "imaps" } else { "imap" };
             (vec![format!("{scheme}://{host}:{port}")], vec!["read"], Secret { imap: Some(creds), ..Default::default() }, "email")

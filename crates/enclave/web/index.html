@@ -466,18 +466,23 @@ function toolPanes() {
       <div class="grid2">${field("t_plaid_access_token", "Access token", "access-production-…", "password")}<label class="f">Environment<select id="t_plaid_environment"><option>production</option><option>sandbox</option></select></label></div>
       ${nameDesc("plaid", "plaid")}
       <div class="row"><button class="btn primary" data-act="connect" data-kind="plaid">Connect Plaid</button></div>`,
-    imap: `<p class="small muted">The agent searches and reads mail over IMAP. The enclave opens folders read-only and never marks, moves or deletes anything, whatever the password would allow. The mail server accepting the login is what identifies the mailbox in the certificate.</p>
+    imap: `<p class="small muted">The agent searches and reads your mail, read-only: the enclave never marks, moves or deletes anything, whatever the password would allow. The mail server accepting the login is what identifies the mailbox in the certificate.</p>
+      <p><b>Gmail in two steps</b></p>
+      ${steps(`${ext("https://myaccount.google.com/apppasswords", "Create an app password")} (name it anything, e.g. “attest”). If Google says the page isn't available, first turn on ${ext("https://myaccount.google.com/signinoptions/twosv", "2-Step Verification")}.`,
+        `Paste your address and the 16 letters Google shows (spaces don't matter), then connect.`)}
+      <div class="grid2">${field("t_imap_username", "Email address", "you@gmail.com")}${field("t_imap_password", "App password", "abcd efgh ijkl mnop", "password", `Revoke it at ${ext("https://myaccount.google.com/apppasswords", "myaccount.google.com/apppasswords")} when the audit is done.`)}</div>
+      <div class="row"><button class="btn primary" data-act="connect" data-kind="imap">Connect mailbox</button></div>
+      <details class="small"><summary>Other providers, name and description</summary>
+      <p class="small muted">The server is filled in from your address. Google Workspace addresses use Gmail's server (an admin may have to allow app passwords).</p>
       <table class="prov"><tbody>
-        <tr><td><b>Gmail, Google Workspace</b></td><td><code>imap.gmail.com</code></td><td>An ${ext("https://myaccount.google.com/apppasswords", "app password")} (needs 2-Step Verification; a Workspace admin can turn these off).</td></tr>
         <tr><td><b>iCloud</b></td><td><code>imap.mail.me.com</code></td><td>An app-specific password from ${ext("https://account.apple.com")}.</td></tr>
         <tr><td><b>Fastmail</b></td><td><code>imap.fastmail.com</code></td><td>An app password with IMAP access (Settings → Privacy &amp; Security).</td></tr>
         <tr><td><b>Yahoo</b></td><td><code>imap.mail.yahoo.com</code></td><td>An app password (Account security).</td></tr>
         <tr><td><b>Microsoft 365, Outlook.com</b></td><td colspan="2">Microsoft no longer allows passwords over IMAP. Use <b>Any HTTPS API</b> with <code>https://graph.microsoft.com</code> and a <code>Mail.Read</code> token from ${ext("https://developer.microsoft.com/graph/graph-explorer", "Graph Explorer")} (it lasts about an hour).</td></tr>
       </tbody></table>
-      <div class="grid2">${field("t_imap_host", "IMAP server", "imap.gmail.com")}${field("t_imap_username", "Username", "you@example.com")}</div>
-      ${field("t_imap_password", "App password", "", "password", "Revoke it when the audit is done.")}
+      ${field("t_imap_host", "IMAP server", "imap.gmail.com", "text", "Leave empty to use the one for your address.")}
       ${nameDesc("imap", "email")}
-      <div class="row"><button class="btn primary" data-act="connect" data-kind="imap">Connect mailbox</button></div>`,
+      </details>`,
     mcp: `<p class="small muted">A remote MCP server that accepts a token (the Streamable HTTP transport). The enclave lists its tools, you choose which ones the agent may call, and the enclave refuses the rest. Tools the server labels read-only are preselected; that label is the server's word.</p>
       <table class="prov"><tbody>
         <tr><td><b>GitHub</b></td><td><code>https://api.githubcopilot.com/mcp/</code></td><td>A ${ext("https://github.com/settings/personal-access-tokens/new", "fine-grained token")} with read-only permissions.</td></tr>
