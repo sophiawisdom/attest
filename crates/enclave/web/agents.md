@@ -19,14 +19,23 @@ is written for an agent to follow, and takes one script.
 ## Roles and links
 
 - `POST /api/sessions?role=auditor` (or `role=auditee`, the default) creates
-  a session started by that party and returns two links,
-  `https://HOST/s/SESSION_ID#TOKEN`. The starter keeps theirs and sends the
-  other over a channel they already trust (for example Signal). The other
-  link's token is HMAC-SHA256(starter's token, "attest-invite/1") in hex, so
-  the starter can always rebuild it; the view's `creator` names the starter. There are no accounts or long-term keys. Whoever holds a link acts
-  as that party. If `GET /api/info` shows `"open": false`, the server is
-  private: only its operator starts sessions, sending the operator key as
-  the header `x-operator-key`. Anyone given a link takes part.
+  a session started by that party. The starter's link is
+  `https://HOST/s/SESSION_ID#TOKEN`; the other party gets a one-time invite,
+  `https://HOST/s/SESSION_ID#join-INVITE`, which the starter sends over a
+  channel they already trust (for example Signal). `INVITE` is
+  HMAC-SHA256(starter's token, "attest-invite/1") in hex, so the starter's
+  page can always show it. The invite isn't a working link: the invitee
+  trades it once, `POST /api/sessions/ID/join` with
+  `Authorization: Bearer INVITE`, for a token of their own (`token`, `link`
+  in the reply) that the enclave makes and the starter never sees. After
+  that the invite is refused, saying when it was used. So the starter can't
+  act as the other party; and if someone used the invite first, the
+  invitee finds out when they open it (the view's `invite.used_at_ms` says
+  when it was used). The view's `creator` names the starter. There are no
+  accounts or long-term keys. Whoever holds a link acts as that party. If
+  `GET /api/info` shows `"open": false`, the server is private: only its
+  operator starts sessions, sending the operator key as the header
+  `x-operator-key`.
 - Every session call needs `Authorization: Bearer TOKEN`, where `TOKEN` is the
   part of the link after `#`. The token decides the role.
 - Sessions expire after 30 days. They're kept sealed on the parent and survive

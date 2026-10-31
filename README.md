@@ -2,8 +2,9 @@
 
 Prove it without showing it. Give an AI agent access to your information (code, Slack, email, bank data, any API) inside an attested enclave; someone else asks it questions, and every answer goes past you before it's sent.
 
-Either party starts a session and sends the other a private link (over
-Signal or whatever they already use). The **auditor** asks a question. The
+Either party starts a session and sends the other a one-time invite link
+(over Signal or whatever they already use); opening it gives them a link of
+their own that the starter never sees. The **auditor** asks a question. The
 **auditee** accepts it, connects what the agent may look at (Slack, email
 over IMAP, Gmail, bank data through Plaid, a remote MCP server, any HTTPS
 API, or a private repository the enclave fetches from GitHub itself) by

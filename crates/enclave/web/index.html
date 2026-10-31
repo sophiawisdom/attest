@@ -311,19 +311,43 @@ async function inviteToken(token) {
   const sig = await crypto.subtle.sign("HMAC", k, new TextEncoder().encode("attest-invite/1"));
   return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, "0")).join("");
 }
+const when = ms => new Date(ms).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+const joinedKey = () => `attest-joined:${S.sid}:${S.token.slice(0, 16)}`;
 async function renderInvite(v) {
   const box = document.getElementById("invite");
-  box.hidden = !v.creator || v.creator !== v.role;
-  if (box.hidden) return;
-  S.invite ??= await inviteToken(S.token);
   const other = v.role === "auditee" ? "auditor" : "auditee";
-  const joined = other === "auditor" && v.auditor_joined;
+  const creator = v.creator && v.creator === v.role;
+  const used = v.invite?.used_at_ms;
+  // The invitee: their link was made when the invite was used. Say when, so
+  // they notice if someone used the invite before they did.
+  if (!creator) {
+    let here = false; try { here = !!localStorage.getItem(joinedKey()); } catch {}
+    box.hidden = !(v.invite && used);
+    if (box.hidden) return;
+    if (S.justJoined) return patch("invite", `<div class="pad small"><b>This page's address is now your own link.</b> Bookmark it: the invite you opened no longer works, and whoever sent it can't use this one.</div>`);
+    return patch("invite", here
+      ? `<div class="pad small muted">You joined from the invite on ${esc(when(used))}, in this browser.</div>`
+      : `<div class="pad small"><b>This link was made from the invite on ${esc(when(used))}.</b> <span class="muted">If you didn't open the invite yourself then (another browser of yours is fine), whoever did can also act as the ${esc(v.role)}: ask the ${esc(other)} for a new session.</span></div>`);
+  }
+  box.hidden = false;
+  if (used) return patch("invite", `<div class="pad stack" style="gap:6px"><div class="row"><b>The ${other} joined</b><span class="pill ok">${esc(when(used))}</span></div>
+    <span class="small muted">Their invite made them a link of their own, which you never see; the invite no longer works.</span></div>`);
+  S.invite ??= await inviteToken(S.token);
   if (!S.invite) return patch("invite", `<div class="pad small muted">This browser can't compute the ${other}'s link here; open the session over https or with <code>attest open</code>.</div>`);
-  const link = `${ORIGIN}/s/${S.sid}#${S.invite}`;
+  const link = `${ORIGIN}/s/${S.sid}#${v.invite ? "join-" : ""}${S.invite}`;
   patch("invite", `<div class="pad stack" style="gap:8px">
-    <div class="row"><b>Link for the ${other}</b>${joined ? `<span class="pill ok">opened</span>` : ""}</div>
-    <span class="small muted">Send it to them over a channel you already trust, such as Signal. Anyone with this link acts as the ${other}. Keep your own link (this page's address) private.</span>
+    <div class="row"><b>Invite link for the ${other}</b>${v.invite ? `<span class="pill">works once</span>` : ""}</div>
+    <span class="small muted">Send it to them over a channel you already trust, such as Signal. ${v.invite ? `Opening it gives them a link of their own that you never see, and the invite stops working. If someone else opens it first, they'll see when it was used.` : `Anyone with this link acts as the ${other}.`} Keep your own link (this page's address) private.</span>
     <div class="linkbox"><input type="text" readonly value="${esc(link)}"><button class="btn" data-copy="${esc(link)}">Copy</button></div></div>`);
+}
+
+// Trade a one-time invite for a link of our own (sessions.rs join).
+async function joinInvite(invite) {
+  S.token = invite;
+  const r = await api(`/api/sessions/${S.sid}/join`, { method: "POST", body: {} });
+  S.token = r.token; S.justJoined = true;
+  try { localStorage.setItem(joinedKey(), "1"); } catch {}
+  history.replaceState(null, "", `/s/${S.sid}#${r.token}`);
 }
 
 // ---------------------------------------------------------------- session shell
@@ -1014,8 +1038,17 @@ async function pollLoop() {
   if (!m) return landing();
   S.sid = m[1]; S.token = location.hash.slice(1);
   if (!S.token) { $("#app").innerHTML = `<div class="callout bad"><span class="ic">×</span><span>This link is missing its secret part (after the #). Ask for the full link.</span></div>`; return; }
+  const fail = e => { $("#app").innerHTML = `<div class="callout bad"><span class="ic">×</span><span>${esc(e.message)}${/invite/.test(e.message) ? "" : ". If the enclave restarted, sessions were lost and you need a new one"}.</span></div>`; };
+  try {
+    if (S.token.startsWith("join-")) await joinInvite(S.token.slice(5));
+  } catch (e) { return fail(e); }
   sessionShell();
-  try { await refresh(); } catch (e) { $("#app").innerHTML = `<div class="callout bad"><span class="ic">×</span><span>${esc(e.message)}. If the enclave restarted, sessions were lost and you need a new one.</span></div>`; return; }
+  try { await refresh(); } catch (e) {
+    // An invite pasted without its join- prefix.
+    if (/this is an invite link/.test(e.message)) {
+      try { await joinInvite(S.token); await refresh(); } catch (e2) { return fail(e2); }
+    } else return fail(e);
+  }
   pollLoop();
   document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh().catch(() => {}); });
 })();

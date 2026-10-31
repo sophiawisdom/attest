@@ -1018,7 +1018,7 @@ fn create_session(app: &App, req: &Request<hyper::body::Incoming>) -> Result<Res
             "auditee_link": format!("{base}/s/{}#{auditee}", s.id),
             "auditor_link": format!("{base}/s/{}#{auditor}", s.id),
             "creator": creator,
-            "note": "Keep your own link. Send the other party theirs over a channel you trust; your session page keeps showing it. Anyone with a link acts as that party.",
+            "note": "Keep your own link. The other party's link is a one-time invite: send it over a channel you trust. Opening it (POST /api/sessions/ID/join with the invite as the bearer token) gives them a link of their own that you never see, and the invite stops working. Anyone with a link acts as that party.",
         }),
     ))
 }
@@ -1136,6 +1136,25 @@ async fn session_route(
             "send the token from your link as 'Authorization: Bearer <token>'".into(),
         )
     })?;
+    if let ("POST", ["join"]) = (req.method().as_str(), rest) {
+        // The invite link's token, traded once for the invitee's own.
+        let (s, role, token) = ctx
+            .store
+            .join(ctx, id, &token)
+            .map_err(|e| ApiError(StatusCode::NOT_FOUND, e.to_string()))?;
+        s.touch(ctx, role);
+        let base = base_url(app, &req);
+        return Ok(json_resp(
+            StatusCode::OK,
+            &json!({
+                "session_id": s.id,
+                "role": role,
+                "token": token,
+                "link": format!("{base}/s/{}#{token}", s.id),
+                "note": "This is your own link: keep it. The invite link no longer works, and whoever sent it can't use this one.",
+            }),
+        ));
+    }
     let (s, role) = ctx
         .store
         .auth(id, &token)

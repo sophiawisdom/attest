@@ -124,6 +124,13 @@ struct State {
     expired: bool,
     versions: [u64; 2],
     auditor_joined: bool,
+    /// The other party's link is a one-time invite (`join`): their working
+    /// token is made when they open it, so the creator never holds it.
+    /// False only for sessions from before invites, whose invitee used the
+    /// derived token directly.
+    invites: bool,
+    /// When the invite was used, and the hash of the token it gave out.
+    joined: Option<Joined>,
     questions: Vec<Question>,
     code: Option<Arc<Bundle>>,
     affidavit: Option<(String, AffidavitRecord)>,
@@ -474,12 +481,47 @@ fn ri(role: Role) -> usize {
     }
 }
 
-/// The other party's token, derived from the creator's: the creator's page
-/// can always show the link to send, and no plaintext token is stored. The
-/// invitee's token reveals nothing about the creator's.
+/// The other party's invite, derived from the creator's token: the
+/// creator's page can always show the link to send, and no plaintext token
+/// is stored. It works once (`Store::join`), for a token of the invitee's
+/// own that the creator never sees.
 pub fn invite_token(creator_token: &str) -> String {
     let k = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, creator_token.as_bytes());
     hex::encode(ring::hmac::sign(&k, b"attest-invite/1").as_ref())
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Joined {
+    pub token_hash: String,
+    pub at_ms: u64,
+}
+
+fn same_hash(a: &str, b: &str) -> bool {
+    a.len() == b.len() && ring::constant_time::verify_slices_are_equal(a.as_bytes(), b.as_bytes()).is_ok()
+}
+
+/// "2026-10-31 06:31" for a time in ms since the epoch.
+fn fmt_utc(ms: u64) -> String {
+    let secs = ms / 1000;
+    let (days, rem) = ((secs / 86400) as i64, secs % 86400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", rem / 3600, rem % 3600 / 60)
+}
+
+fn other(r: Role) -> Role {
+    match r {
+        Role::Auditee => Role::Auditor,
+        Role::Auditor => Role::Auditee,
+    }
 }
 
 const MAX_CONNECTIONS: usize = 12;
@@ -694,7 +736,7 @@ impl Store {
                 sha256_hex(auditor.as_bytes()),
             ],
             creator: Some(creator),
-            st: Mutex::new(State::default()),
+            st: Mutex::new(State { invites: true, ..State::default() }),
             tx,
             dirty: AtomicBool::new(true),
             written: Mutex::new((0, None)),
@@ -718,14 +760,68 @@ impl Store {
             .filter(|s| !s.expired(now_ms()));
         let h = sha256_hex(token.as_bytes());
         if let Some(s) = s {
-            if h == s.token_hashes[0] {
-                return Ok((s, Role::Auditee));
-            }
-            if h == s.token_hashes[1] {
-                return Ok((s, Role::Auditor));
+            let (invites, joined) = {
+                let st = lock(&s.st);
+                (st.invites, st.joined.clone())
+            };
+            let invitee = s.creator.map(other);
+            for role in [Role::Auditee, Role::Auditor] {
+                let hit = same_hash(&h, &s.token_hashes[ri(role)]);
+                if !invites || Some(role) != invitee {
+                    if hit {
+                        return Ok((s, role));
+                    }
+                    continue;
+                }
+                // The invitee's slot holds the invite; their token is the joined one.
+                if joined.as_ref().is_some_and(|j| same_hash(&h, &j.token_hash)) {
+                    return Ok((s, role));
+                }
+                if hit {
+                    match &joined {
+                        Some(j) => bail!(
+                            "this invite link was already used (at {} UTC); it works only once. If you didn't use it, someone else has this party's access: ask for a new session",
+                            fmt_utc(j.at_ms)
+                        ),
+                        None => bail!("this is an invite link: open it in a browser to join (it gives you a link of your own)"),
+                    }
+                }
             }
         }
         bail!("unknown session or wrong link")
+    }
+
+    /// Use the invite: the invitee gets a token of their own, made here, that
+    /// whoever created the session never sees. The invite then stops working.
+    pub fn join(&self, ctx: &Arc<Ctx>, id: &str, invite: &str) -> Result<(Arc<Session>, Role, String)> {
+        let s = lock(&self.sessions)
+            .get(id)
+            .cloned()
+            .filter(|s| !s.expired(now_ms()))
+            .ok_or_else(|| anyhow!("unknown session or wrong link"))?;
+        let role = s.creator.map(other).ok_or_else(|| anyhow!("this session has no invite"))?;
+        if !same_hash(&sha256_hex(invite.as_bytes()), &s.token_hashes[ri(role)]) {
+            bail!("unknown session or wrong link");
+        }
+        let token = random_hex(32);
+        {
+            let mut st = lock(&s.st);
+            ensure!(st.invites, "this session's links work directly; open it with your link");
+            if let Some(j) = &st.joined {
+                bail!(
+                    "this invite link was already used (at {} UTC); it works only once. If you didn't use it, someone else has this party's access: ask for a new session",
+                    fmt_utc(j.at_ms)
+                );
+            }
+            st.joined = Some(Joined { token_hash: sha256_hex(token.as_bytes()), at_ms: now_ms() });
+            let text = match role {
+                Role::Auditee => "The auditee joined with the invite link.",
+                Role::Auditor => "The auditor joined with the invite link.",
+            };
+            s.event(ctx, &mut st, "joined", text.into(), None, Some(role), false);
+        }
+        s.dirty.store(true, Ordering::SeqCst);
+        Ok((s, role, token))
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<Session>> {
@@ -1766,6 +1862,9 @@ impl Session {
             "version": st.versions[ri(role)],
             "boot_id": ctx.info.boot_id,
             "auditor_joined": st.auditor_joined,
+            // When the other party's one-time invite was used (null: not
+            // yet, or a session from before invites).
+            "invite": if st.invites { json!({"used_at_ms": st.joined.as_ref().map(|j| j.at_ms)}) } else { Value::Null },
             "questions": st.questions,
             "code": st.code.as_ref().map(|b| match role {
                 Role::Auditee => json!(b.info),
