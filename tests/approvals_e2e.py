@@ -100,8 +100,9 @@ def main():
             print(f"   run {run['status']}; errors: {[e[:300] for e in errors][:3]}; outcome: {json.dumps(run.get('outcome'))[:300]}")
             if agent == "builtin":
                 check(any(not d[2] and d[1] == "read_file" for d in mine), "builtin: read_file was sent for approval and denied")
-                tr = json.dumps(entries)
-                check("the auditee denied this tool call: not that file" in tr, "builtin: the model was told it was denied, with the reason")
+                results = [e.get("content", "") for e in entries if e.get("type") == "tool_result"]
+                check("The auditee denied this call." in results, "builtin: the model was told it was denied")
+                check(not any("not that file" in r for r in results), "builtin: the auditee's reason did not reach the model")
                 check(any(e["approved"] for e in appr), "builtin: other calls were approved")
             else:
                 seen = [json.loads(l) for l in open(agent_log) if l.strip()]

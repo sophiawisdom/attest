@@ -507,7 +507,7 @@ async fn handle(up: Arc<Upstream>, req: Request<hyper::body::Incoming>) -> Respo
         return Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/json")
-            .body(Full::new(Bytes::from(json!({"approve": d.approve, "reason": d.reason}).to_string())))
+            .body(Full::new(Bytes::from(json!({"approve": d.approve}).to_string())))
             .unwrap();
     }
     // Each request is visible to the parent as a size and a time; cap how

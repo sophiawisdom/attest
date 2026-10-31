@@ -593,6 +593,7 @@ async fn restore_session(ctx: &Arc<Ctx>, sid: &str, head_ref: &str) -> Result<Ar
         disclosures: snap.disclosures,
         connections: snap.connections,
         tool_approval: snap.tool_approval,
+        next_connection_id: 0,
         auditor_watch: snap.auditor_watch,
         disclosures_in_flight: 0,
     };

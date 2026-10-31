@@ -11,6 +11,8 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 use attest_core::{now_ms, ConnectionRecord};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// What the agent gets back from one request, at most.
@@ -49,7 +51,14 @@ pub struct Connection {
     mcp_server: String,
     #[serde(skip)]
     live: LiveSlot,
+    /// Set when the auditee removes the connection. Shared with the copies
+    /// runs hold, which check it before every request.
+    #[serde(skip)]
+    revoked: Arc<AtomicBool>,
 }
+
+/// What the agent gets when it uses a connection the auditee removed.
+pub const REVOKED: &str = "error: this connection was removed by the auditee";
 
 /// An MCP session lasts one run; copies start without one.
 #[derive(Default)]
@@ -233,6 +242,7 @@ pub async fn connect(net: &Net, id: u32, v: &Value) -> Result<Connection> {
         mcp_tools: vec![],
         mcp_server: String::new(),
         live: LiveSlot::default(),
+        revoked: Default::default(),
     };
     let net = net.scoped(&c.hosts_only());
     c.refresh(&net).await?;
@@ -334,6 +344,9 @@ pub async fn dispatch(conns: &mut [(Connection, Net)], tool: &str, args: &Value)
         "http_request" => match pick(conns, &|c| c.is_http()) {
             Ok(i) => {
                 let (c, n) = &mut conns[i];
+                if c.is_revoked() {
+                    return Some(REVOKED.into());
+                }
                 c.request(n, args).await
             }
             Err(e) => return Some(e),
@@ -341,6 +354,9 @@ pub async fn dispatch(conns: &mut [(Connection, Net)], tool: &str, args: &Value)
         "email" => match pick(conns, &|c| c.rec.kind == "imap") {
             Ok(i) => {
                 let (c, n) = &mut conns[i];
+                if c.is_revoked() {
+                    return Some(REVOKED.into());
+                }
                 c.rec.calls += 1;
                 let creds = c.secret.imap.clone().expect("imap connection");
                 crate::imap::request(n, &creds, args).await.map(|t| c.mask(t))
@@ -350,6 +366,9 @@ pub async fn dispatch(conns: &mut [(Connection, Net)], tool: &str, args: &Value)
         _ => {
             let i = conns.iter().position(|(c, _)| c.mcp_tools.iter().any(|t| crate::mcp::agent_name(&c.rec.name, &t.name) == tool))?;
             let (c, n) = &mut conns[i];
+            if c.is_revoked() {
+                return Some(REVOKED.into());
+            }
             let t = c.mcp_tools.iter().find(|t| crate::mcp::agent_name(&c.rec.name, &t.name) == tool).expect("found").name.clone();
             c.rec.calls += 1;
             let server = c.secret.mcp.clone().expect("mcp connection");
@@ -360,6 +379,16 @@ pub async fn dispatch(conns: &mut [(Connection, Net)], tool: &str, args: &Value)
 }
 
 impl Connection {
+    /// Stop every copy of this connection (in running agents too) from
+    /// making further requests.
+    pub fn revoke(&self) {
+        self.revoked.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_revoked(&self) -> bool {
+        self.revoked.load(Ordering::SeqCst)
+    }
+
     fn is_http(&self) -> bool {
         !matches!(self.rec.kind.as_str(), "imap" | "mcp")
     }
@@ -500,6 +529,7 @@ impl Connection {
         };
         let mut r = self.send(net, &method, 0, &path_q, body.clone()).await?;
         if r.status == 401 && self.secret.refresh.is_some() {
+            ensure!(!self.is_revoked(), "this connection was removed by the auditee");
             self.refresh(net).await?;
             r = self.send(net, &method, 0, &path_q, body).await?;
         }
@@ -589,5 +619,24 @@ mod tests {
         assert!(origin("ftp://x").is_err());
         assert_eq!(clean_name("My API").unwrap(), "my_api");
         assert!(clean_name("").is_err());
+    }
+
+    #[tokio::test]
+    async fn removal_reaches_running_copies() {
+        let c = Connection {
+            rec: ConnectionRecord { id: 1, kind: "http".into(), name: "api".into(), hosts: vec!["https://example.com".into()], methods: vec!["GET".into()], identity: None, description: String::new(), connected_at_ms: 0, calls: 0, tools: vec![] },
+            secret: Secret::default(),
+            mcp_tools: vec![],
+            mcp_server: String::new(),
+            live: LiveSlot::default(),
+            revoked: Default::default(),
+        };
+        let copy = c.clone();
+        c.revoke();
+        let net = crate::net::Net::new(true, String::new()).unwrap();
+        let mut conns = vec![(copy, net)];
+        let out = dispatch(&mut conns, "http_request", &json!({"connection": "api", "path": "/"})).await;
+        assert_eq!(out.as_deref(), Some(REVOKED));
+        assert_eq!(conns[0].0.rec.calls, 0);
     }
 }

@@ -126,11 +126,13 @@ pub async fn agent_loop(
                     }
                     Err(e) => format!("error: {e}"),
                 }
-            } else if let Some(d) = match gate {
+            } else if let Some(_) = match gate {
                 Some(g) => Some(g.ask(&call.name, &call.args, Some(&call.id)).await).filter(|d| !d.approve),
                 None => None,
             } {
-                format!("error: the auditee denied this tool call{}", if d.reason.is_empty() { String::new() } else { format!(": {}", d.reason) })
+                // A fixed text: the auditee's reason stays in its own trace,
+                // so it can't steer the agent unseen by the auditor.
+                crate::approvals::DENIED.to_string()
             } else if let Some(out) = crate::connections::dispatch(&mut conns, &call.name, &call.args).await {
                 out
             } else if !has_code {
@@ -194,7 +196,6 @@ pub fn parse_verdict(args: &Value, format: &AnswerFormat) -> anyhow::Result<Verd
     if let AnswerFormat::Choice { .. } = format {
         let v = Verdict {
             answer: Answer::Inconclusive,
-            confidence: 0.0,
             summary: String::new(),
             clarification_request: None,
             choice: args["choice"].as_str().map(String::from),
@@ -211,7 +212,7 @@ pub fn parse_verdict(args: &Value, format: &AnswerFormat) -> anyhow::Result<Verd
             "answer must be yes, no, answered, inconclusive or needs_clarification (got {other:?})"
         ),
     };
-    let confidence = args["confidence"].as_f64().unwrap_or(0.0).clamp(0.0, 1.0);
+    // Any `confidence` the model sends is dropped.
     let summary: String = args["summary"].as_str().unwrap_or_default().to_string();
     anyhow::ensure!(
         format.is_strict() || !summary.trim().is_empty(),
@@ -227,7 +228,6 @@ pub fn parse_verdict(args: &Value, format: &AnswerFormat) -> anyhow::Result<Verd
     format
         .enforce(Verdict {
             answer,
-            confidence,
             summary,
             clarification_request,
             choice: None,

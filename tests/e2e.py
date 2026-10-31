@@ -318,7 +318,7 @@ def run(work):
         a.post(f"/runs/{v['runs'][-1]['id']}/release", {"release": True, "details": details})
         return o.view()["runs"][-1], hidden
     r, hidden = one_run("Does trainer/train.py compute loss on chain-of-thought tokens?", {"kind": "yes_no"})
-    check(r["verdict"]["answer"] == "yes" and r["verdict"]["summary"] == "" and r["verdict"]["confidence"] == 0, "yes/no format: the auditor gets only the answer")
+    check(r["verdict"]["answer"] == "yes" and r["verdict"]["summary"] == "" and "confidence" not in r["verdict"], "yes/no format: the auditor gets only the answer")
     check(hidden, "yes/no format: the auditor can't see when the run finished (status, events, follow-up errors)")
     m = r["manifest"]
     check(m["detail"] == "verdict_only" and m["activity"]["llm_calls"] == 0 and m["code"]["tree_sha256"] == "" and m["code"]["file_count"] == 0

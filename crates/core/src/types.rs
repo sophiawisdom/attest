@@ -248,7 +248,9 @@ pub enum Answer {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Verdict {
     pub answer: Answer,
-    pub confidence: f64,
+    // No confidence: a model-chosen number would be a channel the auditee's
+    // review can't see through. Stored or signed verdicts that have one
+    // still load; the field is ignored.
     /// Written by the agent for the auditor.
     pub summary: String,
     /// With `needs_clarification`: what the auditor should change.
@@ -387,7 +389,7 @@ pub struct QuestionRecord {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AnswerFormat {
-    /// yes / no / inconclusive. No summary, confidence or other text.
+    /// yes / no / inconclusive. No summary or other text.
     YesNo,
     /// Exactly one of these options. No other text.
     Choice { options: Vec<String> },
@@ -431,7 +433,6 @@ impl AnswerFormat {
                 }
                 Ok(Verdict {
                     answer: v.answer,
-                    confidence: 0.0,
                     summary: String::new(),
                     clarification_request: None,
                     choice: None,
@@ -450,7 +451,6 @@ impl AnswerFormat {
                 }
                 Ok(Verdict {
                     answer: Answer::Inconclusive,
-                    confidence: 0.0,
                     summary: String::new(),
                     clarification_request: None,
                     choice: Some(c),

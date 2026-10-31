@@ -704,6 +704,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v.answer, Answer::No);
+        let out = serde_json::to_string(&v).unwrap();
+        assert!(!out.contains("confidence"), "a model's confidence is dropped: {out}");
+        // Verdicts stored or signed with a confidence still load.
+        let old: Verdict = serde_json::from_str(r#"{"answer":"yes","confidence":0.9,"summary":"s","clarification_request":null}"#).unwrap();
+        assert!(!serde_json::to_string(&old).unwrap().contains("confidence"));
         assert!(parse_verdict("{\"answer\": \"maybe\", \"summary\": \"s\"}", &text).is_err());
         let yn = parse_verdict(
             "{\"answer\": \"yes\", \"summary\": \"secret code here\"}",
