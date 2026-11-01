@@ -692,6 +692,7 @@ function traceHtml(entries) {
   for (const e of entries) {
     if (e.type === "system") out.push(`<div class="raw"><details><summary>fixed system prompt</summary><pre class="out">${esc(e.content)}</pre></details></div>`);
     else if (e.type === "user") out.push(`<div class="l"><span class="dot dim">&gt;</span><span>${esc(e.content)}</span></div>`);
+    else if (e.type === "auditee_message") out.push(`<div class="l"><span class="dot dim">&gt;</span><span><b>You (revision request):</b> ${esc(e.content)}</span></div>`);
     else if (e.type === "auditor_message") out.push(`<div class="l"><span class="dot dim">&gt;</span><span><b>Auditor:</b> ${e.blinded ? `<span class="pill warn">blinded message: hidden from you</span>` : esc(e.content)}</span></div>`);
     else if (e.type === "assistant") {
       if (e.text) out.push(say(e.text));
@@ -746,7 +747,9 @@ function runHtml(v, r) {
   const meta = `<div class="row" style="justify-content:space-between"><div class="row" style="gap:8px"><b>Run ${r.number}</b>${statusPill(r.status)}${parent ? `<span class="faint small">follow-up to run ${parent.number}</span>` : `<span class="faint small">Q${r.question_version}</span>`}</div>
     <span class="faint small">${esc(r.model?.provider)} / ${esc(r.model?.model)} · ${esc(ago(r.started_at_ms))}</span></div>`;
   const msgs = (r.messages || []).filter((m, i, all) => !parent || i >= (parent.messages || []).length);
-  const msgHtml = msgs.map(m => `<div class="callout info"><span class="ic">✉</span><span>${m.blinded ? "<b>Blinded</b> message" : "Message"} from the auditor${m.text ? `: ${esc(m.text)}` : (isAuditee() ? " (hidden from you)" : "")}</span></div>`).join("");
+  const msgHtml = msgs.map(m => m.from === "auditee"
+    ? `<div class="callout info"><span class="ic">✎</span><span><b>Revision requested by the auditee</b>${m.text ? `: ${esc(m.text)}` : ""}${isAuditee() ? "" : `<br><span class="faint small">The answer it replaced was never released.</span>`}</span></div>`
+    : `<div class="callout info"><span class="ic">✉</span><span>${m.blinded ? "<b>Blinded</b> message" : "Message"} from the auditor${m.text ? `: ${esc(m.text)}` : (isAuditee() ? " (hidden from you)" : "")}</span></div>`).join("");
   let main = "";
   if (isAuditee()) {
     if (r.status === "running") main += `<div class="row"><i class="spin" style="color:var(--accent)"></i><span>The agent is working${r.steps ? ` · ${r.steps} model call${r.steps === 1 ? "" : "s"}` : ""}</span></div>`;
@@ -755,7 +758,11 @@ function runHtml(v, r) {
       <p class="small muted">Read the answer and the transcript. Releasing sends the auditor a signed certificate with the verdict (and summary, if the format has one). Declining tells them you declined.</p>
       <label class="check"><input type="checkbox" id="det-${r.id}"><span>Also release the run details<br><span class="faint small">Run times, the code's tree hash, size and file counts, activity counts (model calls, files read, tokens) and instruction-scan counts. Off: the certificate carries the verdict and the agreed setup only.</span></span></label>
       <label class="f">Note to the auditor (optional)<input type="text" id="note-${r.id}"></label>
-      <div class="row"><button class="btn primary" data-act="release" data-run="${r.id}">Release to auditor</button><button class="btn danger" data-act="decline" data-run="${r.id}">Decline</button></div></div>`;
+      <div class="row"><button class="btn primary" data-act="release" data-run="${r.id}">Release to auditor</button><button class="btn danger" data-act="decline" data-run="${r.id}">Decline</button></div>
+      <details data-keep="rv-${r.id}"><summary>Ask the agent to revise this answer</summary><div class="stack" style="margin-top:10px">
+        <span class="faint small">The auditor never sees this answer. They see your message and the revised answer, which you again release or decline.</span>
+        <textarea id="rv-${r.id}" placeholder="e.g. Be less specific: no names, dates or amounts, just whether it holds."></textarea>
+        <div class="row"><button class="btn" data-act="revise" data-run="${r.id}">Send to the agent</button></div></div></details></div>`;
     if (r.status === "released" || r.status === "declined") main += `<p class="small faint">You ${r.status} this ${esc(ago(r.decided_at_ms))}${r.decision_note ? `: “${esc(r.decision_note)}”` : ""}.</p>`;
     main += `<details ${r.status === "running" ? "open" : ""} data-keep="txd-${r.id}-${r.status === "running" ? "live" : "done"}"><summary>Transcript (only you can see this)</summary><div class="tx cc" id="tx-${r.id}"></div></details>`;
   } else {
@@ -917,6 +924,7 @@ document.addEventListener("click", async (e) => {
     "m-reject": () => sapi(`/models/${b.dataset.id}/decision`, { method: "POST", body: { approve: false } }),
     "release": () => sapi(`/runs/${b.dataset.run}/release`, { method: "POST", body: { release: true, details: !!$("#det-" + b.dataset.run)?.checked, note: val("note-" + b.dataset.run) } }),
     "decline": () => sapi(`/runs/${b.dataset.run}/release`, { method: "POST", body: { release: false, note: val("note-" + b.dataset.run) } }),
+    "revise": () => sapi(`/runs/${b.dataset.run}/revise`, { method: "POST", body: { text: val("rv-" + b.dataset.run) } }),
     "followup": () => sapi(`/runs/${b.dataset.run}/followup`, { method: "POST", body: { text: val("fu-" + b.dataset.run) } }),
     "notify": () => sapi("/notify", { method: "POST", body: { email: val("nEmail") } }),
   };

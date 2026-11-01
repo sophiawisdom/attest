@@ -126,15 +126,20 @@ pub fn supports(agent: &str, target: &crate::llm::Target) -> anyhow::Result<()> 
 pub fn agent_prompt(
     question: &str,
     format: &AnswerFormat,
-    previous: Option<(&Verdict, &str)>,
+    previous: Option<(&Verdict, &str, bool)>,
 ) -> String {
     let mut p = format!(
         "{}\n\nYou are running as a command-line coding agent with a shell. The repository is at /repo (read-only, your working directory). /work and /tmp are writable scratch space, 20 MB each. There is no network access except to your model; do not try to install anything.\n\nQuestion from the auditor:\n<question>\n{question}\n</question>\n",
         attest_core::harness::SYSTEM_PROMPT.split("\n\nTools:").next().unwrap_or("")
     );
-    if let Some((v, msg)) = previous {
+    if let Some((v, msg, from_auditee)) = previous {
+        let label = if from_auditee {
+            "Revision request from the auditee (the auditor has not seen your previous answer and never will; they will see this message and your revised answer, which must stand on its own)"
+        } else {
+            "Follow-up message from the auditor"
+        };
         p.push_str(&format!(
-            "\nYour previous verdict was: {}.\nPrevious summary:\n{}\n\nFollow-up message from the auditor:\n<message>\n{msg}\n</message>\n",
+            "\nYour previous verdict was: {}.\nPrevious summary:\n{}\n\n{label}:\n<message>\n{msg}\n</message>\n",
             serde_json::to_string(&v.answer).unwrap_or_default(),
             v.summary
         ));

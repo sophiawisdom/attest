@@ -1285,6 +1285,9 @@ async fn session_route(
         ("POST", ["followup", "decision"]) => {
             ok(s.decide_followup(ctx, role, &body_json(req).await?)?)
         }
+        ("POST", ["runs", rid, "revise"]) => {
+            ok(s.revise(ctx, role, rid, &body_json(req).await?)?)
+        }
         ("POST", ["runs", rid, "followup"]) => {
             ok(s.followup(ctx, role, rid, &body_json(req).await?)?)
         }

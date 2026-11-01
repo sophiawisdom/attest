@@ -1353,6 +1353,59 @@ impl Session {
         Ok(json!({"ok": true}))
     }
 
+    /// The auditee asks the agent to revise an answer it hasn't released.
+    /// The auditor never sees that answer (the run counts as declined); they
+    /// see this message, on the new run, and whatever the auditee releases.
+    pub fn revise(
+        self: &Arc<Self>,
+        ctx: &Arc<Ctx>,
+        role: Role,
+        run_id: &str,
+        v: &Value,
+    ) -> Result<Value> {
+        ensure!(role == Role::Auditee, "only the auditee asks for revisions");
+        let text = clean(v["text"].as_str()).ok_or_else(|| anyhow!("text is required"))?;
+        ensure!(text.chars().count() <= MAX_MESSAGE_CHARS, "message is too long");
+        crate::budget::ensure_room(SESSION_ALLOWANCE)?;
+        let mut st = lock(&self.st);
+        let r = st
+            .runs
+            .iter_mut()
+            .find(|r| r.id == run_id)
+            .ok_or_else(|| anyhow!("no such run"))?;
+        ensure!(r.status == "awaiting_release", "run {} is {}", r.number, r.status);
+        // Check it can be continued before deciding anything.
+        r.status = "declined";
+        let number = match followup_parent(&st, run_id) {
+            Ok(n) => n,
+            Err(e) => {
+                st.runs.iter_mut().find(|r| r.id == run_id).unwrap().status = "awaiting_release";
+                return Err(e);
+            }
+        };
+        let r = st.runs.iter_mut().find(|r| r.id == run_id).unwrap();
+        r.decided_at_ms = Some(now_ms());
+        r.decision_note = Some("Not released: the auditee asked the agent to revise it.".into());
+        let parent = st.runs.iter().find(|r| r.id == run_id).unwrap();
+        let rec = MessageRecord {
+            sent_at_ms: now_ms(),
+            blinded: false,
+            text_sha256: sha256_hex(text.as_bytes()),
+            text: Some(text.clone()),
+            from: Some("auditee".into()),
+        };
+        let spec = RunSpec {
+            question_version: parent.question_version,
+            model_id: parent.model_id,
+            parent: Some(parent.id.clone()),
+            message: Some((rec, text.clone())),
+        };
+        let msg = format!("The auditee asked the agent to revise run {number} before releasing it: \"{text}\"");
+        self.event(ctx, &mut st, "revision_requested", msg, None, Some(role), true);
+        let id = self.start_run(ctx, &mut st, spec)?;
+        Ok(json!({"run_id": id}))
+    }
+
     /// The auditor proposes a follow-up to a decided run. It runs only once
     /// the auditee accepts it (`decide_followup`); a newer one replaces it.
     pub fn followup(
@@ -1433,6 +1486,7 @@ impl Session {
             blinded: false,
             text_sha256: sha256_hex(f.text.as_bytes()),
             text: Some(f.text.clone()),
+            from: None,
         };
         let spec = RunSpec {
             question_version: parent.question_version,
@@ -1659,10 +1713,15 @@ impl Session {
             }
         }
         if let Some((rec, text)) = &spec.message {
-            trace.push(
-                json!({"type": "auditor_message", "blinded": rec.blinded, "content": rec.text}),
-            );
-            turns.push(Turn::User(harness::followup_prompt(text)));
+            if rec.from_auditee() {
+                trace.push(json!({"type": "auditee_message", "content": rec.text}));
+                turns.push(Turn::User(harness::revision_prompt(text)));
+            } else {
+                trace.push(
+                    json!({"type": "auditor_message", "blinded": rec.blinded, "content": rec.text}),
+                );
+                turns.push(Turn::User(harness::followup_prompt(text)));
+            }
             messages.push((rec.clone(), text.clone()));
         }
 
@@ -1794,7 +1853,8 @@ impl Session {
                 &q.answer_format,
                 previous_verdict
                     .as_ref()
-                    .zip(messages.last().map(|(_, t)| t.as_str())),
+                    .zip(messages.last().map(|(r, t)| (t.as_str(), r.from_auditee())))
+                    .map(|(v, (t, a))| (v, t, a)),
             ),
             harness_job,
         };
@@ -2706,7 +2766,7 @@ fn run_view(r: &RunState, role: Role, st: &State) -> Value {
             v["messages"] = json!(r
                 .messages
                 .iter()
-                .map(|(m, t)| json!({"sent_at_ms": m.sent_at_ms, "blinded": m.blinded, "text": t}))
+                .map(|(m, t)| json!({"sent_at_ms": m.sent_at_ms, "blinded": m.blinded, "text": t, "from": m.from}))
                 .collect::<Vec<_>>());
         }
     }

@@ -515,6 +515,16 @@ pub struct MessageRecord {
     /// Present only for messages that were not blinded. The auditor can
     /// check a blinded message against its hash.
     pub text: Option<String>,
+    /// "auditee" for a revision the auditee asked for (the auditor never saw
+    /// the answer it replaced); absent for the auditor's own messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+}
+
+impl MessageRecord {
+    pub fn from_auditee(&self) -> bool {
+        self.from.as_deref() == Some("auditee")
+    }
 }
 
 /// Confirmed by the holder of the auditee link.

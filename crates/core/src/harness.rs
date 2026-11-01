@@ -66,6 +66,14 @@ pub fn user_prompt(
     )
 }
 
+/// The auditee asked for a revision before releasing anything: the auditor
+/// never sees the answer being replaced, only this message and the new one.
+pub fn revision_prompt(message: &str) -> String {
+    format!(
+        "Revision request from the auditee. The auditor has not seen your previous answer and never will; they will see this message and your revised answer:\n\n<message>\n{message}\n</message>\n\nRevise your answer accordingly (investigate further only if needed), then call submit_verdict with a complete verdict that stands on its own."
+    )
+}
+
 pub fn followup_prompt(message: &str) -> String {
     format!(
         "Follow-up message from the auditor:\n\n<message>\n{message}\n</message>\n\nInvestigate further as needed, then call submit_verdict with a complete, updated verdict."

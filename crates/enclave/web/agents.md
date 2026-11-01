@@ -221,6 +221,11 @@ is written for an agent to follow, and takes one script.
    auditor sees that it was declined, and the note. A new run doesn't start
    while one awaits this decision. The auditee can fetch a certificate of
    the full record at any time from the same `certificate` route.
+   Instead of deciding, the auditee can ask the agent to revise the answer:
+   `POST /api/sessions/ID/runs/RUN_ID/revise` `{"text": "..."}`. The run
+   counts as declined (the auditor never sees that answer), and a new run
+   continues the conversation with the message. The auditor sees the message
+   on the new run, and the certificate records it (`from: "auditee"`).
 8. After that decision, the auditor can send a follow-up message that
    continues the same conversation: `POST /api/sessions/ID/runs/RUN_ID/followup`
    `{"text": "..."}`. It waits (`pending_followup` in the session view; a
