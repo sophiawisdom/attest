@@ -60,7 +60,7 @@ is written for an agent to follow, and takes one script.
    Services: `POST /api/sessions/ID/connections` with a `kind` and its
    credentials, plus optional `name` (what the agent calls it) and
    `description` (shown to the agent):
-   - `{"kind": "slack", "token": "xoxb-..."}` (Slack Web API, GET and POST)
+   - `{"kind": "slack", "token": "xoxb-..."}` (Slack Web API, read methods only: the enclave refuses anything that posts, edits, deletes or reacts)
    - `{"kind": "gmail", "refresh_token": "...", "client_id": "...",
      "client_secret": "..."}` or `{"kind": "gmail", "access_token": "..."}`
      (Gmail API, GET only; needs the gmail.readonly scope)

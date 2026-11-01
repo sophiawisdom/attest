@@ -445,7 +445,7 @@ function toolPanes() {
         `Under <b>OAuth &amp; Permissions</b> → User Token Scopes, add only read scopes: <code>channels:read</code>, <code>channels:history</code>, <code>groups:read</code>, <code>groups:history</code>, <code>users:read</code>, <code>search:read</code> (and <code>im:history</code>, <code>mpim:history</code> for direct messages).`,
         `<b>Install to Workspace</b> (an admin may have to approve it), copy the <b>User OAuth Token</b> (<code>xoxp-…</code>) and paste it below. A bot token (<code>xoxb-…</code>) also works but sees only channels the bot was added to.`,
         `Afterwards, uninstall the app or revoke the token.`)}
-      ${field("t_slack_token", "Token", "xoxp-… or xoxb-…", "password", `The scopes are the hard limit; the agent is also told never to post or change anything.`)}
+      ${field("t_slack_token", "Token", "xoxp-… or xoxb-…", "password", `The enclave lets the agent call only Slack's read methods (listing channels, reading history and threads, search, users), so it can't post, edit, delete or react, whatever the token's scopes allow. Read-only scopes are still a good idea.`)}
       ${nameDesc("slack", "slack")}
       <div class="row"><button class="btn primary" data-act="connect" data-kind="slack">Connect Slack</button></div>`,
     gmail: `<p class="small muted">The agent can search and read mail through the Gmail API, read-only. The enclave asks Google which address the mailbox is, and the certificate says so.</p>

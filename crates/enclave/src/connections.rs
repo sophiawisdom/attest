@@ -20,6 +20,18 @@ const MAX_RESPONSE_CHARS: usize = 40_000;
 const TIMEOUT: Duration = Duration::from_secs(30);
 pub const KINDS: &[&str] = &["slack", "gmail", "plaid", "github_api", "http", "imap", "mcp"];
 const METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"];
+
+/// The only Slack Web API methods the agent may call: reads. Slack sends
+/// reads as POST too, so the method name is what's checked, whatever the
+/// token's scopes would allow (no posting, editing, deleting or reacting).
+pub const SLACK_READ_METHODS: &[&str] = &[
+    "auth.test", "team.info", "team.profile.get", "bots.info", "emoji.list",
+    "users.list", "users.info", "users.lookupByEmail", "users.profile.get", "users.conversations",
+    "usergroups.list", "usergroups.users.list",
+    "conversations.list", "conversations.info", "conversations.history", "conversations.replies", "conversations.members",
+    "search.messages", "search.files", "search.all",
+    "files.list", "files.info", "pins.list", "reactions.get", "reactions.list", "bookmarks.list", "chat.getPermalink",
+];
 /// Longest identity (from the service's own answer) kept.
 const MAX_IDENTITY_CHARS: usize = 500;
 
@@ -507,6 +519,14 @@ impl Connection {
         ensure!(self.rec.methods.contains(&method), "{} allows only {}", self.rec.name, self.rec.methods.join(", "));
         let path = args["path"].as_str().unwrap_or("/");
         ensure!(path.starts_with('/') && !path.starts_with("//") && path.len() <= 2000 && !path.chars().any(|c| c.is_whitespace() || c == '#'), "path must start with / (no scheme or host)");
+        if self.rec.kind == "slack" {
+            let api = path.split('?').next().unwrap_or("").strip_prefix("/api/").unwrap_or("");
+            ensure!(
+                SLACK_READ_METHODS.contains(&api),
+                "Slack is read-only here: /api/{api} isn't allowed. Allowed: {}",
+                SLACK_READ_METHODS.join(", ")
+            );
+        }
         let mut path_q = path.to_string();
         if let Some(q) = args["query"].as_object() {
             let mut ser = url::form_urlencoded::Serializer::new(String::new());
@@ -585,7 +605,7 @@ impl Connection {
             "- {} ({}): {}; methods {}",
             self.rec.name,
             match self.rec.kind.as_str() {
-                "slack" => "the Slack Web API",
+                "slack" => "the Slack Web API, read-only (POST /api/METHOD for read methods only: conversations.list, conversations.history, conversations.replies, search.messages, users.list, ...)",
                 "gmail" => "the Gmail API, read-only",
                 "plaid" => "the Plaid API; the access token is added to every request body",
                 "github_api" => "the GitHub REST API",
