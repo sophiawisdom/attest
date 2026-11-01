@@ -77,7 +77,7 @@ if [ -n "$STANDBY_FOR" ]; then
   [ -n "$NAME_SET" ] || NAME="$STANDBY_FOR-standby"
 fi
 [[ "$NAME" =~ ^[a-z0-9-]{1,48}$ ]] || { echo "--name must be lowercase letters, digits and dashes" >&2; exit 2; }
-say() { printf '\n== %s\n' "$*"; }
+say() { printf '\n== [%dm%02ds] %s\n' $((SECONDS/60)) $((SECONDS%60)) "$*"; }
 # Region-scoped AWS CLI. (Not `command aws` in conditions: macOS bash 3.2
 # exits under set -e when a `command` builtin fails inside `if !`.)
 awsr() { aws --region "$REGION" "$@"; }
@@ -442,7 +442,7 @@ PY" || true)
   # The new primary starts by taking the sessions from the promoted standby.
   "${SSH[@]}" "sudo python3 -c 'import json,sys; c=json.load(open(\"/etc/attest/host.json\")); c.update(peer=sys.argv[1], standby=False); open(\"/etc/attest/host.json\",\"w\").write(json.dumps(c))' '$SB_PRIV:443'"
 fi
-say "starting the service$([ -n "$UPGRADE" ] && echo " (taking the sessions from the standby)" || echo " (this ends any sessions on the previous version)")"
+say "starting the service$(if [ -n "$UPGRADE" ]; then echo " (taking the sessions from the standby)"; elif [ -n "$STANDBY_FOR" ]; then echo " as the standby"; else echo " (this ends any sessions on the previous version)"; fi)"
 "${SSH[@]}" "cd attest-src && CPUS=$ENC_CPUS MEM_MIB=$ENC_MIB S3_BUCKET='$BUCKET' S3_REGION='$REGION' deploy/run.sh >/dev/null; for i in \$(seq 40); do curl -sk -m 10 https://127.0.0.1/healthz | grep -q '\"ok\":true' && exit 0; sleep 6; done; exit 1" \
   || { echo "service did not come up; see ~/attest-host.log on the instance" >&2; exit 1; }
 [ -n "$UPGRADE" ] && echo "sessions moved: $("${SSH[@]}" "curl -sk -m 5 https://127.0.0.1/api/health" | head -c 300). Add the standby again: deploy/self-host.sh --standby-for $NAME"
