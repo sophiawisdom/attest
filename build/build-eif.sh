@@ -58,6 +58,10 @@ V=$(nitro-cli --version 2>&1 | head -1)
 rm -f "$OUT/attest.eif"
 nitro-cli build-enclave --docker-uri "$TAG" --output-file "$OUT/attest.eif" > "$OUT/pcrs.json"
 cat "$OUT/pcrs.json"
+# The EIF is what runs; drop the docker copy so old images don't fill the
+# disk (a full disk makes docker evict the compile cache).
+docker rmi "$TAG" >/dev/null 2>&1 || true
+rm -f "$OUT/enclave-image.tar"
 cat > "$OUT/build-info.json" <<JSON
 {"git_sha": "$GIT_SHA", "nitro_cli": "$V", "eif_sha256": "$(sha256sum "$OUT/attest.eif" | cut -d' ' -f1)"}
 JSON
