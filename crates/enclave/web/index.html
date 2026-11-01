@@ -162,10 +162,13 @@ details > summary { cursor: pointer; color: var(--ink-2); }
 .steps3 .s b { display: block; margin-bottom: 4px; }
 .foot { color: var(--ink-3); font-size: 12.5px; display: flex; gap: 14px; flex-wrap: wrap; justify-content: center; margin-top: 30px; }
 [hidden] { display: none !important; }
-.testbanner { background: var(--warn-soft); color: color-mix(in srgb, var(--warn) 75%, var(--ink)); border-bottom: 1px solid color-mix(in srgb, var(--warn) 35%, transparent); padding: 10px 16px; font-size: 14px; text-align: center; }
+.pinned { position: sticky; top: 0; z-index: 10; }
+.pinned .top { position: static; }
+.testbanner { background: var(--warn-soft); color: color-mix(in srgb, var(--warn) 75%, var(--ink)); border-bottom: 1px solid color-mix(in srgb, var(--warn) 35%, transparent); padding: 6px 16px; font-size: 13px; text-align: center; }
 </style>
 </head>
 <body>
+<div class="pinned">
 <header class="top">
   <a class="brand" href="/"><span class="mark">a</span>attest</a>
   <span id="who"></span>
@@ -173,6 +176,7 @@ details > summary { cursor: pointer; color: var(--ink-2); }
   <button class="chip" id="encChip" data-act="show-verify"><i class="dot"></i><span class="t">…</span></button>
 </header>
 <div id="testBanner" class="testbanner" hidden><b>Test mode.</b> The operator can upgrade this server to new code without ending sessions, which also means a new version could read them. Use it for trying things out; don't connect anything you couldn't show the operator.</div>
+</div>
 <main class="wrap" id="app"></main>
 <div id="toastHost"></div>
 <script>
