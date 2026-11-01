@@ -33,7 +33,8 @@ case "${ARCH:-$(uname -m)}" in
   *) echo "unsupported architecture" >&2; exit 1 ;;
 esac
 echo "== platform $PLATFORM"
-COMMON=(--builder "$BUILDER" --file build/Dockerfile --build-arg SOURCE_DATE_EPOCH=0 --build-arg "ATTEST_GIT_SHA=$GIT_SHA" --platform "$PLATFORM")
+COMMON=(--builder "$BUILDER" --file build/Dockerfile --build-arg SOURCE_DATE_EPOCH=0 --build-arg "ATTEST_GIT_SHA=$GIT_SHA" --build-arg "ATTEST_TEST_MODE=${TEST_MODE:-}" --platform "$PLATFORM")
+[ "${TEST_MODE:-}" = 1 ] && echo "== TEST MODE build: hands sessions to any test build (upgrades keep sessions)"
 if [ -n "${FRESH:-}" ]; then
   COMMON+=(--no-cache --build-arg "CACHE_ID=fresh-$(date +%s)-$$")
   echo "== from scratch (no caches)"

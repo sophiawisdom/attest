@@ -6,6 +6,13 @@
 //! to the attestation document, so the web page and API come from the
 //! measured image. See web/agents.md for the protocol.
 
+/// Built with ATTEST_TEST_MODE=1 (see `EnclaveInfo::test_mode`). Part of the
+/// image, so it is covered by PCR0 like everything else.
+pub const TEST_MODE: bool = match option_env!("ATTEST_TEST_MODE") {
+    Some(s) => s.len() == 1 && s.as_bytes()[0] == b'1',
+    None => false,
+};
+
 mod acme;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod aws;
@@ -412,6 +419,7 @@ async fn service() -> Result<()> {
             agents: harnesses::available(),
         },
         lineage: Some(lineage.clone()),
+        test_mode: TEST_MODE,
     };
     let info_json = serde_json::to_string(&info)?;
     let boot_doc = attester.attest(

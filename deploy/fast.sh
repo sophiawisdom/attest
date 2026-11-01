@@ -37,7 +37,8 @@ SHA=$(git rev-parse HEAD)
 [ -z "$(git status --porcelain --untracked-files=no)" ] || SHA="$SHA-dirty"
 export PATH="$HOME/.local/zigvenv/bin:$PATH"
 step "compiling $SHA for arm64"
-ATTEST_GIT_SHA=$SHA RUSTFLAGS="-C target-feature=+crt-static" \
+TEST_MODE=$( (source "$STATE_DIR/$NAME.env"; printf %s "${TEST_MODE:-}") )
+ATTEST_TEST_MODE=$TEST_MODE ATTEST_GIT_SHA=$SHA RUSTFLAGS="-C target-feature=+crt-static" \
   cargo zigbuild -q --release --target aarch64-unknown-linux-musl -p attest-enclave -p attest-host
 OUT=target/aarch64-unknown-linux-musl/release
 TMP=$(mktemp -d)

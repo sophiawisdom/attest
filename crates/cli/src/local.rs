@@ -41,6 +41,12 @@ struct State {
 /// published in `measurements_repo` for the commit the server names. (The
 /// server's claim only picks which file to fetch; the attestation is what
 /// gets checked against it.) Also says where the measurements came from.
+/// Where a commit's measurements are published: test builds (which differ
+/// from real ones) as `COMMIT.test.pcrs.json`.
+pub fn measurements_path(commit: &str, test_mode: bool) -> String {
+    format!("measurements/{commit}{}.pcrs.json", if test_mode { ".test" } else { "" })
+}
+
 pub async fn expected_policy(conn: &mut Conn, measurements_repo: &str, args: &PolicyArgs) -> Result<(EnclavePolicy, String)> {
     let mut policy = args.policy()?;
     let mut source = match &args.pcrs {
@@ -57,7 +63,8 @@ pub async fn expected_policy(conn: &mut Conn, measurements_repo: &str, args: &Po
             bail!("the server reported no source commit; pass --pcrs");
         }
         let url = format!(
-            "https://raw.githubusercontent.com/{measurements_repo}/main/measurements/{commit}.pcrs.json"
+            "https://raw.githubusercontent.com/{measurements_repo}/main/{}",
+            measurements_path(commit, info["test_mode"].as_bool().unwrap_or(false))
         );
         let body = https_get(&url)
             .await

@@ -317,6 +317,8 @@ Do this before uploading code or trusting a result.
    reproducible, so you get the same `pcrs.json`. Published values are in
    `measurements/` in the repository.
 
+Test builds: if `/api/info` shows `"test_mode": true`, the server hands its sessions (and keys) to any other genuine test build, so the operator can upgrade the code without ending sessions, and a new version could read them. Its measurements are published as `measurements/COMMIT.test.pcrs.json`. Real builds hand off only to the identical image.
+
 The CLI does all of this: `attest verify-service https://HOST` (it fetches the measurements published for the commit the server names; `--pcrs FILE` uses your own; `--rebuild` checks out the server's commit, builds the image with `build/build-eif.sh` (docker and nitro-cli 1.5.0; the image is arm64), and checks against that build, also saying whether the published measurements match it). This shows which code runs, not that the code keeps its promises: that takes reading the source.
 
 **If a person will use the web app,** checking the service yourself doesn't

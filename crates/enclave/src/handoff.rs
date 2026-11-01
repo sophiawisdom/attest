@@ -5,7 +5,9 @@
 //! all stored state, the long-term signing key, and the hash of each
 //! session's latest state record. It moves only between enclaves that each
 //! prove, with a fresh Nitro attestation, the same PCR0-2 as themselves, so
-//! neither the operator nor a different build can obtain it.
+//! neither the operator nor a different build can obtain it. (A test build,
+//! `crate::TEST_MODE`, accepts any genuine test build instead, so upgrades
+//! keep sessions; real builds and test builds never hand off to each other.)
 //!
 //!   R (receiver, new)                         G (giver, running)
 //!   POST /api/internal/handoff/challenge  ->  nG (fresh, single use, bound
@@ -138,7 +140,15 @@ fn check_peer(
     };
     let doc = b64().decode(doc_b64.context("the other enclave sent no attestation")?)?;
     let d = attest_core::nitro::verify_document(&doc)?;
-    for (i, want) in mine.iter().enumerate() {
+    // A test build takes any genuine (non-debug) Nitro enclave as its peer:
+    // that's what lets an upgrade keep sessions. Real builds never accept a
+    // different image, so the two kinds never share a lineage.
+    let same_image_required = !crate::TEST_MODE;
+    ensure!(
+        !(0..3).all(|i| d.pcr_hex(i).chars().all(|c| c == '0')),
+        "the other enclave runs in debug mode"
+    );
+    for (i, want) in mine.iter().enumerate().filter(|_| same_image_required) {
         ensure!(
             &d.pcr_hex(i) == want,
             "the other enclave runs a different image (PCR{i} {} vs ours {want})",

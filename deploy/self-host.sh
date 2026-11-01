@@ -7,6 +7,14 @@
 #                       [--acme-staging] [--bucket NAME | --no-s3] [--open]
 #   deploy/self-host.sh --standby-for NAME [--name NAME-standby] [--type ...]
 #
+# --test-mode builds a test image (kept for later runs of NAME): it hands
+# its sessions to any other test build, so redeploying new code keeps them.
+# With a standby, a redeploy then upgrades in place: the old primary stops,
+# the standby (old code) is promoted, the new primary takes the sessions from
+# it, and the standby is added again on the new code. The site shows a
+# test-mode banner. Real builds (no --test-mode) hand off only to the
+# identical image, so every new version starts empty.
+#
 # Only AWS is needed. Without --domain the server gets a Let's Encrypt
 # certificate for its Elastic IP. --email-from turns on email notifications
 # through Amazon SES (you confirm that address once). --acme-staging uses
@@ -43,7 +51,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-NAME=attest REGION=us-west-2 TYPE=m7g.xlarge DOMAIN="" OPERATOR="" COMMIT="" REPO="" EMAIL_FROM="" BUCKET_ARG="" NO_S3="" STANDBY_FOR="" NAME_SET="" OPEN=""
+NAME=attest REGION=us-west-2 TYPE=m7g.xlarge DOMAIN="" OPERATOR="" COMMIT="" REPO="" EMAIL_FROM="" BUCKET_ARG="" NO_S3="" STANDBY_FOR="" NAME_SET="" OPEN="" ARG_TEST_MODE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --name) NAME=$2; NAME_SET=1; shift 2 ;;
@@ -59,6 +67,7 @@ while [ $# -gt 0 ]; do
     --bucket) BUCKET_ARG=$2; shift 2 ;;
     --no-s3) NO_S3=1; shift ;;
     --open) OPEN=1; shift ;;
+    --test-mode) ARG_TEST_MODE=1; shift ;;
     -h|--help) sed -n '2,39p' "$0"; exit 0 ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
@@ -81,6 +90,7 @@ ARG_STANDBY_FOR=$STANDBY_FOR
 # shellcheck disable=SC1090
 [ -f "$STATE" ] && source "$STATE"
 STANDBY_FOR=$ARG_STANDBY_FOR
+TEST_MODE=${ARG_TEST_MODE:-${TEST_MODE:-}}
 BASE=${STANDBY_FOR:-$NAME}  # the deployment whose role, key and group this machine uses
 if [ -n "$STANDBY_FOR" ]; then
   PSTATE="$STATE_DIR/$STANDBY_FOR.env"
@@ -88,7 +98,7 @@ if [ -n "$STANDBY_FOR" ]; then
   # shellcheck disable=SC1090
   pv() { ( source "$PSTATE"; eval "printf %s \"\${$1:-}\"" ); }
   P_INSTANCE=$(pv INSTANCE) P_IP=$(pv IP) P_ALLOC=$(pv ALLOC)
-  REGION=$(pv REGION) SG=$(pv SG) ALLOC=$P_ALLOC BUCKET=$(pv BUCKET) HANDOFF_TOKEN=$(pv HANDOFF_TOKEN) OPERATOR_KEY=$(pv OPERATOR_KEY)
+  REGION=$(pv REGION) SG=$(pv SG) ALLOC=$P_ALLOC BUCKET=$(pv BUCKET) HANDOFF_TOKEN=$(pv HANDOFF_TOKEN) OPERATOR_KEY=$(pv OPERATOR_KEY) TEST_MODE=$(pv TEST_MODE)
   [ -n "$P_INSTANCE" ] && [ -n "$HANDOFF_TOKEN" ] && [ -n "$P_ALLOC" ] || { echo "$STANDBY_FOR has no instance, Elastic IP or handoff token yet" >&2; exit 1; }
   KEY="$STATE_DIR/$STANDBY_FOR-key.pem"
   PSSH=(ssh -i "$KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$STATE_DIR/$STANDBY_FOR.known_hosts" -o ConnectTimeout=10 -o BatchMode=yes "ec2-user@$P_IP")
@@ -99,7 +109,7 @@ BUCKET=${BUCKET_ARG:-${BUCKET:-}}
 HANDOFF_TOKEN=${HANDOFF_TOKEN:-$(openssl rand -hex 24)}
 # Starts sessions on a private server (see --open). Made once, kept here.
 OPERATOR_KEY=${OPERATOR_KEY:-$(openssl rand -hex 16)}
-save() { printf 'REGION=%q\nINSTANCE=%q\nSG=%q\nALLOC=%q\nIP=%q\nBUCKET=%q\nHANDOFF_TOKEN=%q\nSTANDBY_FOR=%q\n' "$REGION" "${INSTANCE:-}" "${SG:-}" "${ALLOC:-}" "${IP:-}" "${BUCKET:-}" "$HANDOFF_TOKEN" "${STANDBY_FOR:-}" > "$STATE"; printf 'OPERATOR_KEY=%q\n' "$OPERATOR_KEY" >> "$STATE"; chmod 600 "$STATE"; }
+save() { printf 'REGION=%q\nINSTANCE=%q\nSG=%q\nALLOC=%q\nIP=%q\nBUCKET=%q\nHANDOFF_TOKEN=%q\nSTANDBY_FOR=%q\n' "$REGION" "${INSTANCE:-}" "${SG:-}" "${ALLOC:-}" "${IP:-}" "${BUCKET:-}" "$HANDOFF_TOKEN" "${STANDBY_FOR:-}" > "$STATE"; printf 'OPERATOR_KEY=%q\nTEST_MODE=%q\n' "$OPERATOR_KEY" "${TEST_MODE:-}" >> "$STATE"; chmod 600 "$STATE"; }
 
 # Enclave size per instance type: the parent keeps the rest.
 case "$TYPE" in
@@ -125,6 +135,7 @@ fi
 if [ -z "$COMMIT" ] && [ -n "$STANDBY_FOR" ]; then
   # The primary's image: a standby must run the same one.
   COMMIT=$("${PSSH[@]}" 'cat attest-src/build/out/built-commit')
+  COMMIT=${COMMIT%-test}
 fi
 if [ -z "$COMMIT" ]; then
   # The newest published build, so the PCRs can be checked against measurements/.
@@ -335,8 +346,10 @@ fi
 # instance builds from scratch). A built image is also put in the bucket
 # (images/COMMIT/), where a standby takes it instead of building its own:
 # its PCR0 is checked against the published measurements either way.
+# A test image differs from the real one for the same commit.
+BUILD_ID="$COMMIT${TEST_MODE:+-test}"
 IMAGES=""
-[ -n "$BUCKET" ] && IMAGES="s3://$BUCKET/images/$COMMIT"
+[ -n "$BUCKET" ] && IMAGES="s3://$BUCKET/images/$BUILD_ID"
 "${SSH[@]}" "set -euo pipefail
   if [ -d attest-src/.git ]; then
     cd attest-src && git fetch -q origin && git checkout -q --detach '$COMMIT'
@@ -344,17 +357,17 @@ IMAGES=""
     git clone -q '$REPO' attest-src && cd attest-src && git checkout -q '$COMMIT'
   fi
   mkdir -p build/out/bin
-  if [ \"\$(cat build/out/built-commit 2>/dev/null)\" = '$COMMIT' ]; then
-    echo 'enclave image for $COMMIT already built; reusing it'
+  if [ \"\$(cat build/out/built-commit 2>/dev/null)\" = '$BUILD_ID' ]; then
+    echo 'enclave image for $BUILD_ID already built; reusing it'
   elif [ -n '$IMAGES' ] && aws s3 cp --quiet '$IMAGES/attest.eif' build/out/attest.eif.new 2>/dev/null \
        && aws s3 cp --quiet '$IMAGES/attest-host' build/out/bin/attest-host.new; then
     mv build/out/attest.eif.new build/out/attest.eif && mv build/out/bin/attest-host.new build/out/bin/attest-host && chmod +x build/out/bin/attest-host
     nitro-cli describe-eif --eif-path build/out/attest.eif | python3 -c 'import json,sys; print(json.dumps({\"Measurements\": json.load(sys.stdin)[\"Measurements\"]}))' > build/out/pcrs.json
-    echo '$COMMIT' > build/out/built-commit
-    echo 'took the image for $COMMIT from the bucket'
+    echo '$BUILD_ID' > build/out/built-commit
+    echo 'took the image for $BUILD_ID from the bucket'
   else
-    nice -n 5 build/build-eif.sh > ~/build-eif.log 2>&1 || { tail -30 ~/build-eif.log; exit 1; }
-    echo '$COMMIT' > build/out/built-commit
+    TEST_MODE='${TEST_MODE:-}' nice -n 5 build/build-eif.sh > ~/build-eif.log 2>&1 || { tail -30 ~/build-eif.log; exit 1; }
+    echo '$BUILD_ID' > build/out/built-commit
     if [ -n '$IMAGES' ]; then
       aws s3 cp --quiet build/out/attest.eif '$IMAGES/attest.eif' && aws s3 cp --quiet build/out/bin/attest-host '$IMAGES/attest-host' || echo 'note: couldn'\''t store the image in the bucket'
     fi
@@ -362,7 +375,7 @@ IMAGES=""
   sudo mkdir -p /etc/attest && echo '$(printf '%s' "$CONFIG" | base64 | tr -d '\n')' | base64 -d | sudo tee /etc/attest/host.json >/dev/null
   cat build/out/pcrs.json"
 PCR0=$("${SSH[@]}" "python3 -c 'import json; print(json.load(open(\"attest-src/build/out/pcrs.json\"))[\"Measurements\"][\"PCR0\"])'")
-PUBLISHED="measurements/$COMMIT.pcrs.json"
+PUBLISHED="measurements/$COMMIT${TEST_MODE:+.test}.pcrs.json"
 if [ -f "$PUBLISHED" ] || git show "$COMMIT:$PUBLISHED" >/dev/null 2>&1 || git show "HEAD:$PUBLISHED" >/dev/null 2>&1; then
   WANT=$( (cat "$PUBLISHED" 2>/dev/null || git show "HEAD:$PUBLISHED") | python3 -c 'import json,sys; print(json.load(sys.stdin)["Measurements"]["PCR0"])')
   if [ "$WANT" = "$PCR0" ]; then echo "PCR0 matches the published measurements for $COMMIT"
@@ -375,13 +388,25 @@ else
 fi
 
 SB_STATE="$STATE_DIR/$NAME-standby.env"
+UPGRADE=""
 if [ -z "$STANDBY_FOR" ] && [ -f "$SB_STATE" ]; then
-  # A new image here starts a new lineage; the standby holds the old one's
-  # keys and would take over. Stop it (add it again afterwards).
   SB_IP=$( ( source "$SB_STATE"; printf %s "${IP:-}" ) )
-  say "stopping the standby at $SB_IP (rerun with --standby-for $NAME afterwards)"
-  ssh -i "$KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$STATE_DIR/$NAME-standby.known_hosts" -o ConnectTimeout=10 -o BatchMode=yes "ec2-user@$SB_IP" \
-    'sudo systemctl disable --now attest-pair.timer attest-watchdog.timer >/dev/null 2>&1; nitro-cli terminate-enclave --all >/dev/null 2>&1; true' || true
+  SB_INSTANCE=$( ( source "$SB_STATE"; printf %s "${INSTANCE:-}" ) )
+  SBSSH=(ssh -i "$KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$STATE_DIR/$NAME-standby.known_hosts" -o ConnectTimeout=10 -o BatchMode=yes "ec2-user@$SB_IP")
+  # Test builds keep sessions across upgrades: the standby (old code, test
+  # build too) is promoted and hands them to the new primary.
+  if [ -n "$TEST_MODE" ] && "${SSH[@]}" "curl -sk -m 5 https://127.0.0.1/api/info" 2>/dev/null | grep -q '"test_mode":true' \
+     && "${SBSSH[@]}" "curl -sk -m 5 https://127.0.0.1/api/health" 2>/dev/null | grep -q '"standby":true'; then
+    UPGRADE=1
+    SB_PRIV=$(awsr ec2 describe-instances --instance-ids "$SB_INSTANCE" --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)
+    say "test mode: upgrading in place; sessions move through the standby at $SB_IP"
+    "${SBSSH[@]}" 'sudo systemctl disable --now attest-pair.timer attest-watchdog.timer >/dev/null 2>&1; true'
+  else
+    # A new image here starts a new lineage; the standby holds the old one's
+    # keys and would take over. Stop it (add it again afterwards).
+    say "stopping the standby at $SB_IP (rerun with --standby-for $NAME afterwards)"
+    "${SBSSH[@]}" 'sudo systemctl disable --now attest-pair.timer attest-watchdog.timer >/dev/null 2>&1; nitro-cli terminate-enclave --all >/dev/null 2>&1; true' || true
+  fi
 fi
 if [ -n "$STANDBY_FOR" ]; then
   "${SSH[@]}" "printf 'PEER=%s\nALLOC=%s\nREGION=%s\n' '$P_PRIV' '$ALLOC' '$REGION' | sudo tee /etc/attest/pair.env >/dev/null"
@@ -389,9 +414,38 @@ else
   "${SSH[@]}" "sudo rm -f /etc/attest/pair.env /var/lib/attest/promoted"
 fi
 
-say "starting the service (this ends any sessions on the previous version)"
-"${SSH[@]}" "cd attest-src && CPUS=$ENC_CPUS MEM_MIB=$ENC_MIB S3_BUCKET='$BUCKET' S3_REGION='$REGION' deploy/run.sh >/dev/null && sleep 8 && curl -sk -m 10 https://127.0.0.1/healthz" | grep -q '"ok":true' \
+if [ -n "$UPGRADE" ]; then
+  say "stopping the old primary enclave, then promoting the standby (old code) to hold the sessions"
+  "${SSH[@]}" 'sudo systemctl disable --now attest-pair.timer attest-watchdog.timer >/dev/null 2>&1; nitro-cli terminate-enclave --all >/dev/null 2>&1; true'
+  sleep 25
+  PROMOTED=""
+  for _ in $(seq 12); do
+    R=$("${SBSSH[@]}" "TOKEN=\$(python3 -c 'import json; print(json.load(open(\"/etc/attest/host.json\"))[\"handoff_token\"])') python3 - <<'PY'
+import hashlib, hmac, json, os, ssl, struct, urllib.request, urllib.error
+p = b'attest-replica-promote/1'
+h = hashlib.sha256(struct.pack('<Q', len(p)) + p).digest()
+mac = hmac.new(os.environ['TOKEN'].encode(), h, hashlib.sha256).hexdigest()
+req = urllib.request.Request('https://127.0.0.1/api/internal/replica/promote', data=json.dumps({'mac': mac}).encode(), headers={'Content-Type': 'application/json'}, method='POST')
+ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+try:
+    print(urllib.request.urlopen(req, context=ctx, timeout=600).read().decode())
+except urllib.error.HTTPError as e:
+    print('HTTP %d %s' % (e.code, e.read().decode(errors='replace')))
+except Exception as e:
+    print('error %s' % e)
+PY" || true)
+    echo "promote: $R"
+    grep -q '"promoted":true\|already serving' <<<"$R" && { PROMOTED=1; break; }
+    sleep 10
+  done
+  [ -n "$PROMOTED" ] || { echo "the standby couldn't be promoted; the old sessions are still on it (see its ~/attest-host.log)" >&2; exit 1; }
+  # The new primary starts by taking the sessions from the promoted standby.
+  "${SSH[@]}" "sudo python3 -c 'import json,sys; c=json.load(open(\"/etc/attest/host.json\")); c.update(peer=sys.argv[1], standby=False); open(\"/etc/attest/host.json\",\"w\").write(json.dumps(c))' '$SB_PRIV:443'"
+fi
+say "starting the service$([ -n "$UPGRADE" ] && echo " (taking the sessions from the standby)" || echo " (this ends any sessions on the previous version)")"
+"${SSH[@]}" "cd attest-src && CPUS=$ENC_CPUS MEM_MIB=$ENC_MIB S3_BUCKET='$BUCKET' S3_REGION='$REGION' deploy/run.sh >/dev/null; for i in \$(seq 40); do curl -sk -m 10 https://127.0.0.1/healthz | grep -q '\"ok\":true' && exit 0; sleep 6; done; exit 1" \
   || { echo "service did not come up; see ~/attest-host.log on the instance" >&2; exit 1; }
+[ -n "$UPGRADE" ] && echo "sessions moved: $("${SSH[@]}" "curl -sk -m 5 https://127.0.0.1/api/health" | head -c 300). Add the standby again: deploy/self-host.sh --standby-for $NAME"
 
 if [ -n "$STANDBY_FOR" ]; then
   say "pairing: the standby took the keys; the primary now names it as its peer"

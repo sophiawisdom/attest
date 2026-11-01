@@ -127,6 +127,12 @@ pub struct EnclaveInfo {
     /// this boot belongs to. Absent on enclaves from before lineages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage: Option<LineageInfo>,
+    /// A test build: it hands its sessions (and keys) to any genuine Nitro
+    /// enclave that is also a test build, whatever its code, so the operator
+    /// can upgrade without ending sessions, and could read them that way.
+    /// Real builds hand off only to the identical image.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub test_mode: bool,
 }
 
 /// Enclaves of one lineage share sessions and the signing key: each took

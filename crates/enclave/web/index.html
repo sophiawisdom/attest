@@ -162,6 +162,7 @@ details > summary { cursor: pointer; color: var(--ink-2); }
 .steps3 .s b { display: block; margin-bottom: 4px; }
 .foot { color: var(--ink-3); font-size: 12.5px; display: flex; gap: 14px; flex-wrap: wrap; justify-content: center; margin-top: 30px; }
 [hidden] { display: none !important; }
+.testbanner { background: var(--warn-soft); color: color-mix(in srgb, var(--warn) 75%, var(--ink)); border-bottom: 1px solid color-mix(in srgb, var(--warn) 35%, transparent); padding: 10px 16px; font-size: 14px; text-align: center; }
 </style>
 </head>
 <body>
@@ -171,6 +172,7 @@ details > summary { cursor: pointer; color: var(--ink-2); }
   <span class="spacer"></span>
   <button class="chip" id="encChip" data-act="show-verify"><i class="dot"></i><span class="t">…</span></button>
 </header>
+<div id="testBanner" class="testbanner" hidden><b>Test mode.</b> The operator can upgrade this server to new code without ending sessions, which also means a new version could read them. Use it for trying things out; don't connect anything you couldn't show the operator.</div>
 <main class="wrap" id="app"></main>
 <div id="toastHost"></div>
 <script>
@@ -234,6 +236,7 @@ function patch(id, html) {
 async function loadInfo() {
   try { S.info = await api("/api/info"); } catch { S.info = null; }
   const i = S.info, chip = $("#encChip");
+  $("#testBanner").hidden = !i?.test_mode;
   if (!i) { chip.innerHTML = `<i class="dot bad"></i><span class="t">Enclave unreachable</span>`; return; }
   const dev = i.mode === "dev";
   if (LOCAL && !dev) { chip.innerHTML = `<i class="dot ok"></i><span class="t">Checked by attest open · PCR0 ${esc((LOCAL.pcr0 || "").slice(0, 8))}</span>`; return; }
@@ -248,7 +251,7 @@ function verifyPanel() {
   const line = (cmd) => `<div class="linkbox"><input type="text" readonly value="${esc(cmd)}"><button class="btn" data-copy="${esc(cmd)}">Copy</button></div>`;
   const how = i.mode === "dev" ? `<div class="callout warn"><span class="ic">!</span><span>Dev mode: nothing is attested. For testing only.</span></div>`
     : LOCAL ? `<div class="callout info"><span class="ic">✓</span><span>Verified. You opened this through <code>attest open</code>, which checked the enclave against the measurements ${esc(LOCAL.measurements || "you gave it")}. Every request from this page goes over a connection it checked ends inside the enclave.</span></div>`
-    : `<p class="small muted">This server runs in an AWS Nitro enclave: a sealed machine that can prove which software it runs. Nobody can see inside it, including whoever operates it. You can check that proof yourself:</p>
+    : `<p class="small muted">This server runs in an AWS Nitro enclave: a sealed machine that can prove which software it runs. Nobody can see inside it, including whoever operates it. You can check that proof yourself:</p>${i.test_mode ? `<div class="callout warn"><span class="ic">!</span><span>This is a <b>test build</b>: it hands its sessions to any other test build, so the operator can deploy new code that keeps (and could read) them. Real builds hand sessions only to the identical image.</span></div>` : ""}
     <ol class="steps small">
       <li>Install the client (needs <a href="https://rustup.rs" target="_blank" rel="noopener">Rust</a>):${line(install)}</li>
       <li>Check the server. This confirms it runs the build published for commit <code>${esc(commit.slice(0, 7))}</code>, and that connections to it end inside the enclave. Add <code>--rebuild</code> to build that commit yourself instead of trusting the published build (needs Docker and nitro-cli; easiest on an arm64 Linux machine):${line(check)}</li>

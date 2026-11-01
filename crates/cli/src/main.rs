@@ -400,6 +400,10 @@ fn print_enclave(v: &VerifiedEnclave) {
         None => println!("DEV MODE: nothing is attested"),
     }
     println!("source    {} @ {}", i.source_repo, i.source_commit);
+    if i.test_mode {
+        println!("TEST MODE the operator can upgrade this server to any code without ending sessions,");
+        println!("          and a new version could read them. Don't connect anything you couldn't show the operator.");
+    }
     println!(
         "boot      {} ({} ms since epoch)",
         i.boot_id, i.booted_at_ms
@@ -434,11 +438,12 @@ async fn main() -> Result<()> {
                 if commit.len() != 40 || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
                     bail!("the server reported no source commit to rebuild");
                 }
-                let path = rebuild::build(&source_repo, &commit, fresh)?;
+                let test_mode = info["test_mode"].as_bool().unwrap_or(false);
+                let path = rebuild::build(&source_repo, &commit, fresh, test_mode)?;
                 let mine = rebuild::pcrs(&std::fs::read_to_string(&path)?)?;
                 // Also say whether what was published matches, so a mismatch
                 // points at the publisher or at the build.
-                let url = format!("https://raw.githubusercontent.com/{measurements_repo}/main/measurements/{commit}.pcrs.json");
+                let url = format!("https://raw.githubusercontent.com/{measurements_repo}/main/{}", local::measurements_path(&commit, test_mode));
                 let published = match local::https_get(&url).await {
                     Ok(b) => match rebuild::pcrs(std::str::from_utf8(&b)?) {
                         Ok(p) if p == mine => "the published measurements match this build".to_string(),

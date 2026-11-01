@@ -19,7 +19,7 @@ fn run(cmd: &mut Command) -> Result<()> {
 /// the path of the pcrs.json it wrote. Builds go under ~/.cache/attest so a
 /// rerun reuses the checkout (the docker builder keeps its own cache unless
 /// `fresh`).
-pub fn build(repo: &str, commit: &str, fresh: bool) -> Result<PathBuf> {
+pub fn build(repo: &str, commit: &str, fresh: bool, test_mode: bool) -> Result<PathBuf> {
     if Command::new("nitro-cli").arg("--version").output().is_err() {
         bail!(
             "--rebuild needs docker (with buildx) and nitro-cli 1.5.0 on Linux. The image is arm64 \
@@ -44,6 +44,9 @@ pub fn build(repo: &str, commit: &str, fresh: bool) -> Result<PathBuf> {
     b.env("ARCH", std::env::var("ATTEST_ARCH").unwrap_or_else(|_| "aarch64".into()));
     if fresh {
         b.env("FRESH", "1");
+    }
+    if test_mode {
+        b.env("TEST_MODE", "1");
     }
     run(&mut b)?;
     Ok(dir.join("build/out/pcrs.json"))
