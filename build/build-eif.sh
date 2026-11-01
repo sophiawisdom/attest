@@ -47,7 +47,7 @@ cat "$OUT/bin/SHA256SUMS"
 
 echo "== enclave image"
 docker buildx build "${COMMON[@]}" --target enclave \
-  --output "type=docker,name=$TAG,rewrite-timestamp=true,dest=$OUT/enclave-image.tar" .
+  --output "type=docker,name=$TAG,rewrite-timestamp=true,compression=uncompressed,dest=$OUT/enclave-image.tar" .
 docker load -i "$OUT/enclave-image.tar"
 
 echo "== EIF"
